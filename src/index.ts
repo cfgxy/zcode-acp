@@ -190,6 +190,11 @@ export async function main(): Promise<void> {
       updateRuntimeModelConfig(server, ctx.params),
     )
     .onRequest("session/setModel", extParams, (ctx) => setModel(server, ctx.params))
+    // Legacy snake_case spelling of the model switch (`modelId` param — the
+    // same shape the camelCase extension takes). Multica's kimi-family ACP
+    // backend sends exactly this shape and fails every model-pinned task
+    // with -32601 when it is not routed.
+    .onRequest("session/set_model", extParams, (ctx) => setModel(server, ctx.params))
     .onRequest("session/setMode", extParams, (ctx) =>
       setMode(server, ctx.params, server.clients.broadcast()),
     )
