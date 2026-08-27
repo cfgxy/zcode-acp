@@ -159,6 +159,19 @@ export class ZcodeAcpServer {
   /** Last mode id advertised to the client (acp_sid → modeId), for change detection. */
   readonly lastMode = new Map<string, string>();
   /**
+   * Raw token buckets captured by the latest completed turn (acp_sid →
+   * EventTranslator.lastRawUsage). Written by the turn's event pipeline and
+   * read once by the session/prompt response wrapper, which forwards them as
+   * a top-level `usage` object for metering clients (Multica's ACP client
+   * bills from exactly that field). One-shot: the wrapper deletes the entry
+   * after reading, so a turn without usage events reports nothing instead of
+   * replaying the previous turn's numbers.
+   */
+  readonly turnUsage = new Map<
+    string,
+    { inputTokens?: number; totalTokens?: number; contextWindow?: number }
+  >();
+  /**
    * Timestamp of the last cancel (user stop or preempt), keyed by zcodeSid.
    * Set in cancel() and preemptInFlightTurn(); read in runEventTurn's stall
    * reconciliation to fast-fail turns that collide with the backend's

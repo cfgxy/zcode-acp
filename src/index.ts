@@ -19,6 +19,7 @@ import { z } from "zod";
 
 import { accountUsageStats } from "./handlers/account.js";
 import {
+  attachTurnUsage,
   cancel,
   listSessions,
   loadSession,
@@ -167,7 +168,7 @@ export async function main(): Promise<void> {
         ctx.params,
         server.clients.broadcast(),
         ctx.requestId as number | string,
-      );
+      ).then((resp) => attachTurnUsage(server, ctx.params.sessionId, resp));
     })
     .onRequest("session/set_config_option", (ctx) =>
       setConfigOptionHandler(server, ctx.params, server.clients.broadcast()),

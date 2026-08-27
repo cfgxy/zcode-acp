@@ -1377,7 +1377,10 @@ async function runEventTurn(
   preempted: boolean,
 ): Promise<acp.PromptResponse> {
   const backend = server.ensureBackend();
-  const translator = new EventTranslator();
+  // Mirror raw usage buckets into server.turnUsage as they arrive, so the
+  // session/prompt response wrapper can forward the final numbers to
+  // metering clients (see attachTurnUsage).
+  const translator = new EventTranslator((u) => server.turnUsage.set(acpSid, u));
   differ.resetTurn();
   const NO_PROGRESS_MS = 120_000;
   let lastProgress = Date.now();
@@ -1912,4 +1915,58 @@ export async function dispatchPlanIfChanged(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// ---------- turn usage forwarding (Multica metering) ----------
+
+export interface TurnUsageBuckets {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  contextWindow?: number;
+}
+
+/**
+ * Derive metering buckets from the raw usage the backend actually reports:
+ * `session.updated` carries cumulative inputTokens, `turn.completed` carries
+ * totalTokens — no outputTokens, no cache split. outputTokens is therefore
+ * derived as totalTokens − inputTokens (floored at 0), matching the
+ * totalTokens == input + output convention Multica's usage normalizer
+ * already expects. Returns null when the turn produced no usage at all, so
+ * the response stays untouched rather than advertising zero-valued buckets.
+ */
+export function turnUsageBuckets(
+  raw: { inputTokens?: number; totalTokens?: number; contextWindow?: number } | undefined,
+): TurnUsageBuckets | null {
+  if (!raw) return null;
+  const inputTokens = raw.inputTokens ?? 0;
+  const totalTokens = raw.totalTokens ?? 0;
+  if (inputTokens <= 0 && totalTokens <= 0) return null;
+  const outputTokens = Math.max(0, totalTokens - inputTokens);
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    ...(raw.contextWindow && raw.contextWindow > 0 ? { contextWindow: raw.contextWindow } : {}),
+  };
+}
+
+/**
+ * Attach the captured turn usage to the session/prompt response.
+ *
+ * Multica's kimi-family ACP backend bills from a top-level `usage` object on
+ * the prompt result; without it the turn is accounted as zero tokens. Read
+ * once — the entry is deleted so a later turn without usage events (cancelled
+ * before the first backend response) cannot replay stale numbers.
+ */
+export function attachTurnUsage(
+  server: ZcodeAcpServer,
+  acpSid: string,
+  resp: acp.PromptResponse,
+): acp.PromptResponse {
+  const raw = server.turnUsage.get(acpSid);
+  server.turnUsage.delete(acpSid);
+  const usage = turnUsageBuckets(raw);
+  if (!usage) return resp;
+  return { ...resp, usage } as acp.PromptResponse;
 }

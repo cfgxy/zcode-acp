@@ -46,6 +46,33 @@ export class EventTranslator {
   turnResultType: string | null = null;
   turnError: Record<string, unknown> | null = null;
   /**
+   * Raw token buckets from the latest backend usage events, for metering
+   * clients that read `usage` off the session/prompt response. The context
+   * bar's UsageDelta collapses these to a single occupancy figure, which is
+   * not enough for token accounting, so the raw buckets are retained here:
+   * `session.updated` refreshes inputTokens (plus contextWindow);
+   * `turn.completed` sets totalTokens (preferring usage.totalTokens over
+   * payload tokenCount, same precedence as the UsageDelta path). Buckets the
+   * backend never reported stay undefined — the consumer decides what to
+   * derive (e.g. outputTokens = totalTokens − inputTokens).
+   */
+  lastRawUsage: {
+    inputTokens?: number;
+    totalTokens?: number;
+    contextWindow?: number;
+  } = {};
+  /**
+   * Invoked after every raw-usage update with the live `lastRawUsage` object
+   * (by reference — later mutations are visible to the holder). The turn
+   * loop passes one that mirrors into `server.turnUsage` so the
+   * session/prompt response wrapper can forward the final buckets.
+   */
+  private readonly onRawUsage?: (usage: EventTranslator["lastRawUsage"]) => void;
+
+  constructor(onRawUsage?: (usage: EventTranslator["lastRawUsage"]) => void) {
+    this.onRawUsage = onRawUsage;
+  }
+  /**
    * True while inside a background-task notification turn
    * (`turn.started {inputSource:"background_task"}`). Set on its turn.started,
    * cleared on the next user-initiated turn.started. While true, `translate`
@@ -122,6 +149,9 @@ export class EventTranslator {
       const size = (payload["contextWindow"] as number) ?? 0;
       if (typeof used === "number") {
         results.push({ kind: "UsageDelta", used, size });
+        this.lastRawUsage.inputTokens = used;
+        if (size > 0) this.lastRawUsage.contextWindow = size;
+        this.onRawUsage?.(this.lastRawUsage);
       }
     } else if (etype === "state.updated") {
       // Session settings changed (model/mode/thoughtLevel switch, incl.
@@ -305,7 +335,10 @@ export class EventTranslator {
     // (0 / undefined) falls back to tokenCount, then to 0. With ?? a 0 would
     // be kept as-is and never fall back, diverging from the Python reference.
     const used = (usage["totalTokens"] as number) || (payload["tokenCount"] as number) || 0;
+    if (used > 0) this.lastRawUsage.totalTokens = used;
     const size = (usage["contextWindow"] as number) || 0;
+    if (size > 0) this.lastRawUsage.contextWindow = size;
+    if (used > 0 || size > 0) this.onRawUsage?.(this.lastRawUsage);
     return [{ kind: "UsageDelta", used, size }];
   }
 }
