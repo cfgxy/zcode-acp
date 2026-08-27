@@ -22,6 +22,11 @@ describe("resolveInvocation", () => {
 
   it("maps each subcommand, passing through trailing args", () => {
     expect(resolveInvocation("cli.js", ["server"])).toEqual({ kind: "server" });
+    // Compat alias for launchers that append a protocol token (`<cmd> acp`,
+    // e.g. Multica runtime profiles on an ACP family); extra argv is dropped
+    // exactly as for `server`.
+    expect(resolveInvocation("cli.js", ["acp"])).toEqual({ kind: "server" });
+    expect(resolveInvocation("cli.js", ["acp", "--model", "x"])).toEqual({ kind: "server" });
     expect(resolveInvocation("cli.js", ["hub"])).toEqual({ kind: "hub" });
     expect(resolveInvocation("cli.js", ["quota"])).toEqual({ kind: "quota", args: [] });
     expect(resolveInvocation("cli.js", ["quota", "-w", "glm"])).toEqual({

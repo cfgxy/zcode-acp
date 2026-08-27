@@ -45,6 +45,10 @@ export function resolveInvocation(invokedAs: string, argv: readonly string[]): I
   if (sub === "-h" || sub === "--help" || sub === "help") {
     return { kind: "help" };
   }
+  // `acp` is a compat alias for launchers that append a protocol token to the
+  // command name (Multica's `<cmd> acp` convention); extra argv is dropped
+  // exactly as for `server`.
+  if (sub === "acp") return { kind: "server" };
   switch (sub) {
     case "server":
       return { kind: "server" };
@@ -72,6 +76,8 @@ Commands:
   server            The editor-facing ACP bridge over stdio (was
                     zcode-acp-server; editors normally launch it via the bin
                     alias without this subcommand).
+  acp               Alias for "server", for launchers that spell the bridge
+                    as "<command> acp".
   -h, --help        Show this help.
   --version         Show the package version.
 
