@@ -62,7 +62,8 @@ multica 所有 ACP 族 backend 都硬编码厂商 token(`mcode acp`、`hermes ac
 - **runtime**:`<runtime-id>` "ZCode (ACP) (<this-host>)",online
 - **agent**:`<agent-id>` "ZCode Dev",model=`GLM-5.3-Flash`
 - 冒烟 issue:<ws>-85、<ws>-86(均 completed,<ws>-86 回复 "OK" 且 task_usage 有记录)
-- 注意:<desktop-host> 也拉到了 profile 注册成 offline runtime;那台要用需同样装桥,不用可忽略
+- **第二工作空间已复刻**(配置同构,另一套 profile/runtime/agent ID,agent 同名 "ZCode Dev"):同样的 profile → 自动注册 → 派任务流程,回复 "OK GLM-5.3-Flash" 且 task_usage 入库成功。新工作空间接入照此三步即可,无需任何代码改动。
+- 注意:<desktop-host> 在**两个** workspace 都拉到了 profile 并注册成 offline runtime;那台要用需同样装桥,不用可忽略
 
 ## 6. 已验证 / 未验证
 
