@@ -112,9 +112,14 @@ export async function main(): Promise<void> {
   }
   // Zed disconnects by closing the bridge's stdin.
   process.stdin.on("close", () => void shutdown("stdin closed"));
-  // Backend reader died (zcode subprocess exited) — bridge is useless without it.
+  // Backend reader died (zcode subprocess exited) — shut down ONLY when no
+  // supervised heal is trying to recover it: the bridge is the Session
+  // Authority and can restart + reload + complete in-flight work, so a
+  // transient backend death must not tear down the editor link (or fail a
+  // Multica task). Once a heal is exhausted the classified error has already
+  // reached the client and a dead-useless bridge may exit.
   const backendDeathInterval = setInterval(() => {
-    if (server.backend?.isDead) void shutdown("backend dead");
+    if (server.backend?.isDead && !server.backendHealing) void shutdown("backend dead");
   }, 2000);
   backendDeathInterval.unref();
 

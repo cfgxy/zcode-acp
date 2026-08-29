@@ -4,6 +4,14 @@ export { ZcodeBackend, type ServerRequest, type EventListener } from "./client.j
 export { EventStreamListener, TurnMonitor, type NextId } from "./listener.js";
 export { resolveZcodeCommand } from "./resolve.js";
 export { loadZcodeCredentials, mergeEnvWithCreds, type ZcodeCredentials } from "./credentials.js";
+export {
+  BACKEND_DEAD_MARKER,
+  BACKEND_DEAD_TURN_CODE,
+  BACKEND_RESTARTING_MARKER,
+  classified,
+  isBackendDeadMessage,
+  isSessionLostMessage,
+} from "./supervise.js";
 export type {
   ZcodeRequest,
   ZcodeNotification,

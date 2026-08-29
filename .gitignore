@@ -25,3 +25,4 @@ coverage/
 # npm pack output
 *.tgz
 .zcode
+scripts/usage-probe-events.jsonl

@@ -13,6 +13,7 @@
  */
 
 import { log, warn } from "../utils.js";
+import { logUsageEvent } from "./usage-debug.js";
 import {
   buildResultContent,
   extractLocations,
@@ -47,18 +48,26 @@ export class EventTranslator {
   turnError: Record<string, unknown> | null = null;
   /**
    * Raw token buckets from the latest backend usage events, for metering
-   * clients that read `usage` off the session/prompt response. The context
-   * bar's UsageDelta collapses these to a single occupancy figure, which is
-   * not enough for token accounting, so the raw buckets are retained here:
-   * `session.updated` refreshes inputTokens (plus contextWindow);
-   * `turn.completed` sets totalTokens (preferring usage.totalTokens over
-   * payload tokenCount, same precedence as the UsageDelta path). Buckets the
-   * backend never reported stay undefined — the consumer decides what to
-   * derive (e.g. outputTokens = totalTokens − inputTokens).
+   * clients that read `usage` off the session/prompt response. Semantics
+   * (verified empirically against zcode 0.16.5, see tests/fixtures/
+   * usage-probe-events.jsonl):
+   *   - `session.updated` fires per model API call and its usage object is
+   *     THAT call's buckets (inputTokens = context sent, real outputTokens,
+   *     cacheRead/cacheWrite).
+   *   - `turn.completed` fires once per turn and its usage object is the
+   *     turn AGGREGATE: inputTokens/outputTokens summed over the turn's calls
+   *     (`modelRequestCount`), totalTokens = in+out. Resets every turn —
+   *     never session-cumulative.
+   * Mid-turn this object holds the latest per-call snapshot; once the turn
+   * completes it holds the aggregate. contextWindow comes from
+   * session.updated. Buckets the backend never reported stay undefined.
    */
   lastRawUsage: {
     inputTokens?: number;
+    outputTokens?: number;
     totalTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
     contextWindow?: number;
   } = {};
   /**
@@ -68,9 +77,18 @@ export class EventTranslator {
    * session/prompt response wrapper can forward the final buckets.
    */
   private readonly onRawUsage?: (usage: EventTranslator["lastRawUsage"]) => void;
+  /**
+   * Label for the ZACP_USAGE_DEBUG tap (acp session id, or a composite with
+   * the zcode sid). Purely diagnostic — unset outside probe runs.
+   */
+  private readonly debugLabel?: string;
 
-  constructor(onRawUsage?: (usage: EventTranslator["lastRawUsage"]) => void) {
+  constructor(
+    onRawUsage?: (usage: EventTranslator["lastRawUsage"]) => void,
+    debugLabel?: string,
+  ) {
     this.onRawUsage = onRawUsage;
+    this.debugLabel = debugLabel;
   }
   /**
    * True while inside a background-task notification turn
@@ -110,6 +128,16 @@ export class EventTranslator {
   translate(event: ZcodeEventPayload): InternalEvent[] {
     const etype = event.type ?? "";
     const payload = event.payload ?? {};
+    // Full-payload tap for usage-semantics evidence (ZACP_USAGE_DEBUG=<path>).
+    // Runs before any filtering so background_task turns are captured too.
+    if (
+      etype === "session.updated" ||
+      etype === "turn.started" ||
+      etype === "turn.completed" ||
+      etype === "turn.failed"
+    ) {
+      logUsageEvent(this.debugLabel, etype, payload);
+    }
     const results: InternalEvent[] = [];
 
     if (etype === "turn.started") {
@@ -149,7 +177,22 @@ export class EventTranslator {
       const size = (payload["contextWindow"] as number) ?? 0;
       if (typeof used === "number") {
         results.push({ kind: "UsageDelta", used, size });
+        // Per-call snapshot (see lastRawUsage semantics note): each of the
+        // backend's session.updated variants repeats the same values, so
+        // mirroring both is idempotent.
         this.lastRawUsage.inputTokens = used;
+        if (typeof usage["outputTokens"] === "number") {
+          this.lastRawUsage.outputTokens = usage["outputTokens"];
+        }
+        if (typeof usage["totalTokens"] === "number") {
+          this.lastRawUsage.totalTokens = usage["totalTokens"];
+        }
+        if (typeof usage["cacheReadTokens"] === "number") {
+          this.lastRawUsage.cacheReadTokens = usage["cacheReadTokens"];
+        }
+        if (typeof usage["cacheWriteTokens"] === "number") {
+          this.lastRawUsage.cacheWriteTokens = usage["cacheWriteTokens"];
+        }
         if (size > 0) this.lastRawUsage.contextWindow = size;
         this.onRawUsage?.(this.lastRawUsage);
       }
@@ -335,10 +378,48 @@ export class EventTranslator {
     // (0 / undefined) falls back to tokenCount, then to 0. With ?? a 0 would
     // be kept as-is and never fall back, diverging from the Python reference.
     const used = (usage["totalTokens"] as number) || (payload["tokenCount"] as number) || 0;
-    if (used > 0) this.lastRawUsage.totalTokens = used;
     const size = (usage["contextWindow"] as number) || 0;
-    if (size > 0) this.lastRawUsage.contextWindow = size;
-    if (used > 0 || size > 0) this.onRawUsage?.(this.lastRawUsage);
-    return [{ kind: "UsageDelta", used, size }];
+    // Context-bar occupancy, captured BEFORE the aggregate merge below
+    // overwrites inputTokens with the Σ-turn input: turn.completed's
+    // totalTokens is gross volume across all of the turn's API calls, NOT
+    // the context occupancy the bar renders — after a multi-call turn it
+    // would inflate the bar ~n×. The final occupancy is the last
+    // session.updated's inputTokens; fall back to totalTokens only when none
+    // arrived (legacy backends / snapshotless turns).
+    const occupancy = this.lastRawUsage.inputTokens;
+    // turn.completed's usage is the turn AGGREGATE (Σ over the turn's model
+    // requests) — replace the per-call snapshot wholesale so the mirrored
+    // buckets describe the whole turn. Only fields the backend actually
+    // reported are touched, preserving a session.updated value when the
+    // completion event omits it (version drift).
+    let mutated = false;
+    if (used > 0) {
+      this.lastRawUsage.totalTokens = used;
+      mutated = true;
+    }
+    if (size > 0) {
+      this.lastRawUsage.contextWindow = size;
+      mutated = true;
+    }
+    for (const key of [
+      "inputTokens",
+      "outputTokens",
+      "cacheReadTokens",
+      "cacheWriteTokens",
+    ] as const) {
+      const v = usage[key];
+      if (typeof v === "number") {
+        this.lastRawUsage[key] = v;
+        mutated = true;
+      }
+    }
+    if (mutated) this.onRawUsage?.(this.lastRawUsage);
+    return [
+      {
+        kind: "UsageDelta",
+        used: occupancy ?? used,
+        size: size || this.lastRawUsage.contextWindow || 0,
+      },
+    ];
   }
 }

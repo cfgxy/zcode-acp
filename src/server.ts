@@ -169,7 +169,14 @@ export class ZcodeAcpServer {
    */
   readonly turnUsage = new Map<
     string,
-    { inputTokens?: number; totalTokens?: number; contextWindow?: number }
+    {
+      inputTokens?: number;
+      outputTokens?: number;
+      totalTokens?: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+      contextWindow?: number;
+    }
   >();
   /**
    * Timestamp of the last cancel (user stop or preempt), keyed by zcodeSid.
@@ -216,6 +223,30 @@ export class ZcodeAcpServer {
     const env = mergeEnvWithCreds(loadZcodeCredentials());
     const argv = resolveZcodeCommand();
     this.backend = new ZcodeBackend(argv, env);
+    return this.backend;
+  }
+
+  /**
+   * True while a supervised self-heal is restarting the backend. Read by the
+   * index.ts lifecycle poller: a dead backend must NOT shut the bridge down
+   * while a heal may still recover it — the editor link (and Multica's task)
+   * survives backend death now. Set/cleared by the heal orchestration in
+   * handlers/session.ts around its restart+reload loops.
+   */
+  backendHealing = false;
+
+  /**
+   * Supervised restart for the self-heal path (backend died mid-task): re-execs
+   * the backend IN PLACE — every existing reference (turn loops, listeners,
+   * monitors) keeps working — and invalidates the backend-loaded session marks
+   * so the next use of any session re-loads it via zcode session/resume instead
+   * of trusting a verification from the dead process. Callers must reload the
+   * session they're operating on and re-subscribe their event listeners.
+   */
+  async restartBackend(): Promise<ZcodeBackend> {
+    if (!this.backend) return this.ensureBackend();
+    await this.backend.restart("session-authority self-heal");
+    this.backendLoadedSessions.clear();
     return this.backend;
   }
 
