@@ -29,6 +29,10 @@ src/
 ├── server.ts             ZcodeAcpServer — shared state + handler registration
 ├── backend/              ZCode subprocess client (JSON-RPC over stdio)
 │   ├── client.ts         Spawns + communicates with zcode app-server
+│   │                     (in-place `restart()` keeps listener refs valid)
+│   ├── supervise.ts      Self-heal classifiers + stable error prefixes
+│   │                     (zcode_backend_dead_after_retry / _session_lost /
+│   │                     _spawn_failed — wire contract with Multica retry)
 │   ├── credentials.ts    Reads ~/.zcode/v2/config.json for GLM API key
 │   ├── listener.ts       EventStreamListener — subscribes to session/events
 │   └── types.ts          ZCode protocol types
@@ -51,6 +55,7 @@ src/
 ├── translators/          ZCode event → ACP translation
 │   ├── event-translator.ts  Stream event → InternalEvent
 │   ├── projection-differ.ts  Snapshot diff for turn-completion reconciliation
+│   ├── usage-debug.ts        ZACP_USAGE_DEBUG full-payload tap (JSONL evidence)
 │   └── tool-helpers.ts       Diff builder, location extractor
 ├── interaction/          Permission, ExitPlanMode, AskUserQuestion handling
 ├── remote/               Remote access (opt-in via ZCODE_ACP_REMOTE=1)
@@ -131,6 +136,20 @@ ZCode protocol types into ACP notifications directly — always translate.
 - **REPL render state lives in run.ts, not React**: App re-renders from fresh
   snapshots; anything that must persist across them (prompt-line editor,
   queue, entries) belongs to run.ts's external store passed via snapshot props.
+- **Backend death must stay observable**: a dead zcode subprocess is healed by
+  the supervised path (`healBackendAndReload` in handlers/session.ts:
+  restart in place → re-push provider registry → reload session → repair
+  model → resend). Never call `ensureBackend()` in a context that might be
+  mid-turn — the respawn hides the death and the turn stalls to the 120s
+  timeout (runEventTurn uses `server.backend ?? ensureBackend()` for exactly
+  this reason). The index.ts death poller only shuts the bridge down when
+  `server.backendHealing` is false.
+- **Usage bucket semantics (verified, zcode 0.16.5)**: `turn.completed` usage
+  is the per-turn aggregate (real input/output sums + cache split) — that's
+  what the prompt-response `usage` forwards; `session.updated` usage is
+  per-model-request and feeds the context bar. Don't mix them; evidence lives
+  in `tests/fixtures/usage-probe-events.jsonl`, re-collect with
+  `scripts/usage-semantics-probe.mjs` when the backend version drifts.
 
 ## Docs to read before sensitive changes
 
