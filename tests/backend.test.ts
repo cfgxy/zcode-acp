@@ -11,7 +11,7 @@
  * against the real zcode binary in CI.
  */
 
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 import { ZcodeBackend, type EventListener } from "../src/backend/client.js";
 import type { ZcodeEvent, ZcodeInbound } from "../src/backend/types.js";
@@ -227,5 +227,79 @@ describe("ZcodeBackend spawn failure (ENOENT)", () => {
     const resp = await b.request(1, "ping", {}, 500);
     expect(resp.error).toBeDefined();
     await b.close();
+  });
+});
+
+describe("ZcodeBackend spawn environment", () => {
+  it("reloads the environment for the initial spawn and every restart", async () => {
+    const resolveEnv = vi.fn(() => ({ PATH: process.env.PATH }));
+    const backend = new ZcodeBackend(
+      [process.execPath, "-e", "process.stdin.resume()"],
+      {},
+      resolveEnv,
+    );
+    expect(resolveEnv).toHaveBeenCalledTimes(1);
+    await backend.restart("profile-test");
+    expect(resolveEnv).toHaveBeenCalledTimes(2);
+    await backend.close();
+  });
+});
+
+describe("ZcodeBackend diagnostic logging", () => {
+  it("records launch and RPC shapes without logging environment or payload values", async () => {
+    const previousDebug = process.env.ZCODE_ACP_DEBUG;
+    const writes: string[] = [];
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      writes.push(String(chunk));
+      return true;
+    });
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+
+    try {
+      process.env.ZCODE_ACP_DEBUG = "1";
+      const backend = new ZcodeBackend(
+        [process.execPath, "-e", "process.stdin.resume()", "app-server", "--stdio", "argv-secret"],
+        {
+          ...process.env,
+          ZCODE_SERVICE_AUTHORITY_MODE: "desktop-attached-remote",
+          ZCODE_WORKSPACE_IDENTITY: "workspace-secret",
+        },
+      );
+
+      backend.notify("workspace/updateProviderRegistry", {
+        apiKey: "provider-secret",
+        provider: { token: "nested-secret" },
+      });
+      (backend as unknown as { route(msg: ZcodeInbound): void }).route({
+        id: "server-1",
+        method: "session/requestRuntimePreferences",
+        params: { token: "inbound-secret" },
+      });
+      await backend.restart("diagnostic-test");
+      await backend.close();
+
+      const output = writes.join("");
+      expect(output).toContain('"ZCODE_SERVICE_AUTHORITY_MODE":true');
+      expect(output).toContain('"ZCODE_WORKSPACE_IDENTITY":true');
+      expect(output).toContain(
+        '"args":["<redacted>","<redacted>","app-server","--stdio","<redacted>"]',
+      );
+      expect(output).toContain('"sequence":1');
+      expect(output).toContain('"sequence":2');
+      expect(output).toContain('"method":"workspace/updateProviderRegistry"');
+      expect(output).toContain('"payloadKeys":["apiKey","provider"]');
+      expect(output).toContain('"paramKeys":["token"]');
+      expect(output).not.toContain("workspace-secret");
+      expect(output).not.toContain("provider-secret");
+      expect(output).not.toContain("nested-secret");
+      expect(output).not.toContain("inbound-secret");
+      expect(output).not.toContain("argv-secret");
+      expect(stdout).not.toHaveBeenCalled();
+    } finally {
+      if (previousDebug === undefined) delete process.env.ZCODE_ACP_DEBUG;
+      else process.env.ZCODE_ACP_DEBUG = previousDebug;
+      stderr.mockRestore();
+      stdout.mockRestore();
+    }
   });
 });

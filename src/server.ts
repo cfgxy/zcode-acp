@@ -9,12 +9,8 @@
 
 import type * as acp from "@agentclientprotocol/sdk";
 
-import {
-  loadZcodeCredentials,
-  mergeEnvWithCreds,
-  resolveZcodeCommand,
-  ZcodeBackend,
-} from "./backend/index.js";
+import { loadZcodeCredentials, resolveZcodeCommand, ZcodeBackend } from "./backend/index.js";
+import { loadDesktopChildEnvWithRefresh } from "./desktop-profile.js";
 import { BackgroundTaskListener } from "./handlers/background-tasks.js";
 import { enqueueSessionSend } from "./handlers/io.js";
 import { ClientRegistry } from "./remote/broadcast.js";
@@ -42,6 +38,21 @@ export interface PendingTurn {
    * and compressing an in-flight task's context would destroy the work.
    */
   stallRecovered?: boolean;
+}
+
+export function loadDesktopBackendEnv(profileEnv = loadDesktopChildEnvWithRefresh()): NodeJS.ProcessEnv {
+  // Merge both worlds. The daemon-injected process env is the base: it carries
+  // the task-scoped MULTICA_* credentials (token, agent/task ids) that exist
+  // nowhere else, and losing them makes agent tool shells fail their own
+  // credential gate while the CLI would have worked. The desktop profile
+  // overlays with highest priority on conflicts — its identity markers are
+  // what keep the backend recognized by the free-tier plan. Credentials stay
+  // on top of both.
+  const env: NodeJS.ProcessEnv = { ...process.env, ...profileEnv };
+  const credentials = loadZcodeCredentials();
+  if (credentials.ANTHROPIC_API_KEY) env.ANTHROPIC_API_KEY = credentials.ANTHROPIC_API_KEY;
+  if (credentials.ZCODE_MODEL) env.ZCODE_MODEL = credentials.ZCODE_MODEL;
+  return env;
 }
 
 /**
@@ -159,6 +170,26 @@ export class ZcodeAcpServer {
   /** Last mode id advertised to the client (acp_sid → modeId), for change detection. */
   readonly lastMode = new Map<string, string>();
   /**
+   * Raw token buckets captured by the latest completed turn (acp_sid →
+   * EventTranslator.lastRawUsage). Written by the turn's event pipeline and
+   * read once by the session/prompt response wrapper, which forwards them as
+   * a top-level `usage` object for metering clients (Multica's ACP client
+   * bills from exactly that field). One-shot: the wrapper deletes the entry
+   * after reading, so a turn without usage events reports nothing instead of
+   * replaying the previous turn's numbers.
+   */
+  readonly turnUsage = new Map<
+    string,
+    {
+      inputTokens?: number;
+      outputTokens?: number;
+      totalTokens?: number;
+      cacheReadTokens?: number;
+      cacheWriteTokens?: number;
+      contextWindow?: number;
+    }
+  >();
+  /**
    * Timestamp of the last cancel (user stop or preempt), keyed by zcodeSid.
    * Set in cancel() and preemptInFlightTurn(); read in runEventTurn's stall
    * reconciliation to fast-fail turns that collide with the backend's
@@ -200,9 +231,39 @@ export class ZcodeAcpServer {
   /** Lazily spawn the zcode backend on first use (initialize doesn't need it). */
   ensureBackend(): ZcodeBackend {
     if (this.backend && !this.backend.isDead) return this.backend;
-    const env = mergeEnvWithCreds(loadZcodeCredentials());
-    const argv = resolveZcodeCommand();
-    this.backend = new ZcodeBackend(argv, env);
+    const profileEnv = loadDesktopChildEnvWithRefresh();
+    const env = loadDesktopBackendEnv(profileEnv);
+    const resolverEnv = {
+      ...profileEnv,
+      ...(process.env.ZCODE_BIN ? { ZCODE_BIN: process.env.ZCODE_BIN } : {}),
+      ...(process.env.ZCODE_NODE ? { ZCODE_NODE: process.env.ZCODE_NODE } : {}),
+    };
+    const argv = resolveZcodeCommand(resolverEnv);
+    this.backend = new ZcodeBackend(argv, env, () => loadDesktopBackendEnv());
+    return this.backend;
+  }
+
+  /**
+   * True while a supervised self-heal is restarting the backend. Read by the
+   * index.ts lifecycle poller: a dead backend must NOT shut the bridge down
+   * while a heal may still recover it — the editor link (and Multica's task)
+   * survives backend death now. Set/cleared by the heal orchestration in
+   * handlers/session.ts around its restart+reload loops.
+   */
+  backendHealing = false;
+
+  /**
+   * Supervised restart for the self-heal path (backend died mid-task): re-execs
+   * the backend IN PLACE — every existing reference (turn loops, listeners,
+   * monitors) keeps working — and invalidates the backend-loaded session marks
+   * so the next use of any session re-loads it via zcode session/resume instead
+   * of trusting a verification from the dead process. Callers must reload the
+   * session they're operating on and re-subscribe their event listeners.
+   */
+  async restartBackend(): Promise<ZcodeBackend> {
+    if (!this.backend) return this.ensureBackend();
+    await this.backend.restart("session-authority self-heal");
+    this.backendLoadedSessions.clear();
     return this.backend;
   }
 

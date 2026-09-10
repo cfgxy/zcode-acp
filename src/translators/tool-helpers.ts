@@ -389,6 +389,9 @@ const TRANSIENT_CAUSE_CODES = new Set([
   "ETIMEDOUT",
   "ENOTFOUND",
   "fetch_failed",
+  // Backend process died mid-turn — retried via the supervised self-heal path
+  // (restart + session reload + resend), not a model-side failure.
+  "zcode_backend_dead",
 ]);
 
 /**

@@ -17,6 +17,15 @@ import type * as acp from "@agentclientprotocol/sdk";
 import { RequestError } from "@agentclientprotocol/sdk";
 
 import { EventStreamListener, TurnMonitor } from "../backend/listener.js";
+import {
+  BACKEND_DEAD_TURN_CODE,
+  classified,
+  ERR_BACKEND_DEAD_AFTER_RETRY,
+  ERR_SESSION_LOST,
+  ERR_SPAWN_FAILED,
+  isBackendDeadMessage,
+  isSessionLostMessage,
+} from "../backend/supervise.js";
 import type { ZcodeCreateResult, ZcodeListResult, ZcodeSnapshot } from "../backend/types.js";
 import {
   buildModes,
@@ -164,6 +173,54 @@ export async function newSession(
 }
 
 /**
+ * zcode `session/create` with supervised self-heal: a dead backend (died
+ * between spawn and create, or crash-looping — the P4 evidence) is restarted
+ * in place and the create retried, up to HEAL_ATTEMPTS times. Terminal
+ * failures throw with the stable classification prefixes.
+ */
+async function createBackendSessionWithHeal(
+  server: ZcodeAcpServer,
+  createParams: Record<string, unknown>,
+): Promise<ZcodeCreateResult> {
+  const tryCreate = () =>
+    server.ensureBackend().request(server.nextId(), "session/create", createParams, 15000);
+  let resp = await tryCreate();
+  if (!resp.error) return (resp.result ?? {}) as ZcodeCreateResult;
+  const first = resp.error.message ?? "";
+  if (!isBackendDeadMessage(first)) throw new Error(`zcode create failed: ${first}`);
+  warn(`session/create hit a dead backend (${first}) — supervised self-heal starting`);
+  server.backendHealing = true;
+  try {
+    for (let attempt = 1; attempt <= HEAL_ATTEMPTS; attempt++) {
+      await sleep(healBackoffMs(attempt));
+      try {
+        await server.restartBackend();
+      } catch (e) {
+        warn(
+          `heal: restart threw (attempt ${attempt}/${HEAL_ATTEMPTS}): ` +
+            `${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      resp = await tryCreate();
+      if (!resp.error) return (resp.result ?? {}) as ZcodeCreateResult;
+      const msg = resp.error.message ?? "";
+      if (!isBackendDeadMessage(msg)) throw new Error(`zcode create failed: ${msg}`);
+      warn(`heal: create retry ${attempt}/${HEAL_ATTEMPTS} failed: ${msg}`);
+    }
+  } finally {
+    server.backendHealing = false;
+  }
+  const death = server.backend?.deathReason ?? "unknown";
+  const prefix = death.startsWith("spawn failed") ? ERR_SPAWN_FAILED : ERR_BACKEND_DEAD_AFTER_RETRY;
+  throw new Error(
+    classified(
+      prefix,
+      `zcode create failed after ${HEAL_ATTEMPTS} supervised restarts (${death})`,
+    ),
+  );
+}
+
+/**
  * Materialize a lazy `session/new` placeholder into a real backend session on
  * first use (prompt / set_config_option / extension methods). Idempotent:
  * returns the existing mapping for already-created sessions, and concurrent
@@ -218,7 +275,6 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
   // The create body runs synchronously up to its first await, so the `creating`
   // promise is stored before any concurrent caller can observe the entry.
   const creating = (async () => {
-    const backend = server.ensureBackend();
     // Push the provider registry BEFORE session/create: the backend resolves
     // the session's default model against the registry, and without the
     // provider's reasoning/model definitions it falls back to the bare
@@ -240,11 +296,7 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
       createParams.mcpServers = pending.mcpServers;
       log(`session/create carrying ${pending.mcpServers.length} client MCP server(s)`);
     }
-    const resp = await backend.request(server.nextId(), "session/create", createParams, 15000);
-    if (resp.error) {
-      throw new Error(`zcode create failed: ${resp.error.message ?? ""}`);
-    }
-    const result = (resp.result ?? {}) as ZcodeCreateResult;
+    const result = await createBackendSessionWithHeal(server, createParams);
     const session = result.session ?? {};
     const sid = session.sessionId;
     if (!sid) throw new Error("zcode create returned no sessionId");
@@ -421,7 +473,7 @@ export async function resumeSession(
     // third-party model in its history, and the backend needs the provider
     // registered to even process the resume turn.
     await syncProviderRegistry(server, cwd);
-    const resumeResult = await resumePreservingModel(server, zcParams);
+    const resumeResult = await resumePreservingModel(server, zcParams, { acpSid, zcodeSid });
     // The resume RPC succeeded — the session is now loaded in this backend.
     server.markBackendLoaded(acpSid);
     // The session kept its own model — repair it only if it's no longer enabled.
@@ -480,7 +532,7 @@ export async function loadSession(
     // third-party model in its history, and the backend needs the provider
     // registered to process it.
     await syncProviderRegistry(server, cwd);
-    const resumeResult = await resumePreservingModel(server, zcParams);
+    const resumeResult = await resumePreservingModel(server, zcParams, { acpSid, zcodeSid });
     // The resume RPC succeeded — the session is now loaded in this backend.
     server.markBackendLoaded(acpSid);
     // The session kept its own model — repair it only if it's no longer enabled.
@@ -760,6 +812,11 @@ export async function prompt(
           : { sessionId: zcodeSid, content: sendText };
       const sendT0 = Date.now();
       let sendAttempt = 0;
+      // Budget of supervised heals inside the send loop (backend dying right
+      // at/before the send): each heal restarts + reloads + resubscribes,
+      // then the send is retried. Bounded separately from the busy-retry
+      // timeout so a heal's restart time doesn't eat into it.
+      let sendHealBudget = HEAL_ATTEMPTS;
       while (true) {
         if (turn.cancelled) {
           stopBackendTurn(server, zcodeSid);
@@ -786,6 +843,18 @@ export async function prompt(
           const accepted = (sendResp.result ?? {}) as { accepted?: boolean };
           if (accepted.accepted) break; // backend took it → turn starts
           throw new Error("zcode send not accepted");
+        }
+        // Dead backend at send time: supervised heal (restart + reload +
+        // resubscribe), then resend. Classified error once the budget is gone.
+        const rawSendErr = sendResp.error.message ?? "";
+        if (isBackendDeadMessage(rawSendErr)) {
+          if (sendHealBudget-- > 0) {
+            warn(`prompt: backend dead at send (${rawSendErr}) — supervised self-heal starting`);
+            await healBackendAndReload(server, params.sessionId, zcodeSid, rawSendErr);
+            await listener.resubscribe(() => server.nextId());
+            continue;
+          }
+          throw new Error(classified(ERR_BACKEND_DEAD_AFTER_RETRY, `zcode send failed: ${rawSendErr}`));
         }
         const sendErrCode = sendResp.error.code;
         const sendErrMsg = (sendResp.error.message ?? "").toLowerCase();
@@ -839,6 +908,29 @@ export async function prompt(
 
         return result;
       } catch (e) {
+        // Mid-turn backend death: heal (restart + reload + resubscribe) and
+        // resend via the retry iteration below. Runs BEFORE the generic
+        // transient path so the resend targets a live backend rather than
+        // burning an attempt against a dead one. A heal that itself fails
+        // throws a classified error (zcode_session_lost /
+        // zcode_backend_dead_after_retry) which propagates to the client
+        // instead of degrading into a graceful end_turn — infra failures must
+        // stay distinguishable from model failures.
+        const deadCause =
+          e instanceof TurnFailedError &&
+          (e.turnError as { cause?: { code?: string } })?.cause?.code === BACKEND_DEAD_TURN_CODE;
+        if (deadCause && !turn.cancelled) {
+          warn("prompt: backend died mid-turn — supervised self-heal + resend");
+          await healBackendAndReload(
+            server,
+            params.sessionId,
+            zcodeSid,
+            e instanceof Error ? e.message : String(e),
+          );
+          await listener.resubscribe(() => server.nextId());
+          lastTurnError = e.turnError;
+          continue;
+        }
         // Only a transient TurnFailedError is retryable; everything else (send
         // failures, non-transient turn errors, exhausted retries, cancellation)
         // propagates to the caller.
@@ -980,7 +1072,13 @@ class TurnFailedError extends Error {
  */
 function stopBackendTurn(server: ZcodeAcpServer, zcodeSid: string): void {
   try {
-    server.ensureBackend().send("session/stop", { sessionId: zcodeSid });
+    // A dead backend can't take a stop — and respawning just to fire one at
+    // a fresh process that can't know the session is wasted work. Death
+    // recovery belongs to the supervision paths; keep the death observable.
+    const current = server.backend;
+    if (current?.isDead) return;
+    const backend = current ?? server.ensureBackend();
+    backend.send("session/stop", { sessionId: zcodeSid });
   } catch (e) {
     log(
       `  [stop] session/stop send failed (ignored): ${e instanceof Error ? e.message : String(e)}`,
@@ -1230,7 +1328,82 @@ function fileUriToPath(uri: string): string {
  * Returns the response's result object on success — callers extract the
  * backend-authoritative session workspace from it. Throws on failure.
  */
-async function resumeBackendSession(
+/**
+ * Self-heal budget/backoff: how many supervised restarts we attempt before
+ * surfacing a classified error, and the exponential base between attempts
+ * (1s, 4s — capped shape 1s/4s/4s for 3 attempts). Overridable for tests.
+ */
+const HEAL_ATTEMPTS = 3;
+const HEAL_BACKOFF_MS = Number(process.env["ZCODE_ACP_HEAL_BACKOFF_MS"] ?? 1000) || 1000;
+
+const healBackoffMs = (attempt: number): number =>
+  attempt <= 1 ? 0 : HEAL_BACKOFF_MS * 4 ** (attempt - 2);
+
+/**
+ * Supervised backend restart + reload of the affected session (the Session
+ * Authority self-heal core): restart the zcode subprocess in place with backoff
+ * (HEAL_ATTEMPTS times), reloading `zcodeSid` via zcode session/resume after
+ * each restart — the reload doubles as the liveness probe for the fresh
+ * process. Throws classified errors upward:
+ *   zcode_session_lost             — the session file is gone (resume says
+ *                                    "Session not found"); no restart helps.
+ *   zcode_spawn_failed             — the zcode binary itself won't start.
+ *   zcode_backend_dead_after_retry — restarts exhausted.
+ */
+async function healBackendAndReload(
+  server: ZcodeAcpServer,
+  acpSid: string,
+  zcodeSid: string,
+  reason: string,
+): Promise<void> {
+  // Suspend the index.ts backend-death shutdown while a heal may recover.
+  server.backendHealing = true;
+  try {
+    for (let attempt = 1; attempt <= HEAL_ATTEMPTS; attempt++) {
+      await sleep(healBackoffMs(attempt));
+      try {
+        await server.restartBackend();
+      } catch (e) {
+        warn(
+          `heal: restart threw (attempt ${attempt}/${HEAL_ATTEMPTS}): ` +
+            `${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      try {
+        // Fresh process = empty provider registry: re-push it BEFORE the
+        // reload or the backend cannot resolve the session's persisted model
+        // and the very next send fails with "model unavailable" (verified in
+        // the live kill -9 smoke). Mirrors the resumeSession recovery sequence
+        // (registry → resume → repair).
+        await syncProviderRegistry(server, server.sessionCwds.get(acpSid) ?? process.cwd());
+        await reloadBackendSession(server, acpSid, zcodeSid);
+        await repairUnavailableModel(server, zcodeSid);
+        log(`heal: backend restarted, session ${zcodeSid} reloaded (attempt ${attempt})`);
+        return;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (isSessionLostMessage(msg)) throw new Error(classified(ERR_SESSION_LOST, msg));
+        warn(`heal: reload failed (attempt ${attempt}/${HEAL_ATTEMPTS}): ${msg}`);
+      }
+    }
+    const death = server.backend?.deathReason ?? "unknown";
+    if (death.startsWith("spawn failed")) throw new Error(classified(ERR_SPAWN_FAILED, death));
+    throw new Error(
+      classified(
+        ERR_BACKEND_DEAD_AFTER_RETRY,
+        `backend did not recover after ${HEAL_ATTEMPTS} supervised restarts (${reason})`,
+      ),
+    );
+  } finally {
+    server.backendHealing = false;
+  }
+}
+
+/**
+ * zcode `session/resume` RPC only — no self-heal, no session-lost prefixing.
+ * Retries once on a plain timeout (backend cold-start window).
+ */
+async function resumeRawBackendSession(
   server: ZcodeAcpServer,
   zcParams: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
@@ -1255,6 +1428,32 @@ async function resumeBackendSession(
     await sleep(1000);
   }
   throw new Error("zcode resume failed: exhausted retries");
+}
+
+/**
+ * zcode `session/resume` with supervised self-heal. With `healCtx` (the ACP +
+ * zcode sids of the session being resumed), a dead-backend failure triggers
+ * restart + reload instead of surfacing raw; a "Session not found" failure is
+ * prefixed zcode_session_lost either way (a healthy backend + missing session
+ * file is unrecoverable and must not be retried as infrastructure).
+ */
+async function resumeBackendSession(
+  server: ZcodeAcpServer,
+  zcParams: Record<string, unknown>,
+  healCtx?: { acpSid: string; zcodeSid: string },
+): Promise<Record<string, unknown>> {
+  try {
+    return await resumeRawBackendSession(server, zcParams);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (isSessionLostMessage(msg)) throw new Error(classified(ERR_SESSION_LOST, msg));
+    if (!healCtx || !isBackendDeadMessage(msg)) throw err;
+    warn(`session/resume hit a dead backend (${msg}) — supervised self-heal starting`);
+    await healBackendAndReload(server, healCtx.acpSid, healCtx.zcodeSid, msg);
+    // The heal reloaded the session into the fresh process; resume again
+    // (idempotent) to fetch the result payload.
+    return await resumeRawBackendSession(server, zcParams);
+  }
 }
 
 /**
@@ -1288,16 +1487,27 @@ async function reloadBackendSession(
 async function resumePreservingModel(
   server: ZcodeAcpServer,
   zcParams: Record<string, unknown>,
+  healCtx?: { acpSid: string; zcodeSid: string },
 ): Promise<unknown> {
   try {
-    return await resumeBackendSession(server, zcParams);
+    return await resumeBackendSession(server, zcParams, healCtx);
   } catch (err) {
+    // A classified terminal failure (session lost / dead after retry) must
+    // not be masked by the model-overlay fallback — that retry cannot fix it.
+    if (
+      err instanceof Error &&
+      (err.message.startsWith(ERR_SESSION_LOST) ||
+        err.message.startsWith(ERR_BACKEND_DEAD_AFTER_RETRY) ||
+        err.message.startsWith(ERR_SPAWN_FAILED))
+    ) {
+      throw err;
+    }
     const overlay = buildResumeRuntimeModel();
     if (overlay === null) throw err;
     warn(
       `resume failed (${err instanceof Error ? err.message : String(err)}); retrying with default-model overlay`,
     );
-    return resumeBackendSession(server, { ...zcParams, runtimeModel: overlay });
+    return resumeBackendSession(server, { ...zcParams, runtimeModel: overlay }, healCtx);
   }
 }
 
@@ -1376,8 +1586,19 @@ async function runEventTurn(
   turn: PendingTurn,
   preempted: boolean,
 ): Promise<acp.PromptResponse> {
-  const backend = server.ensureBackend();
-  const translator = new EventTranslator();
+  // Do NOT ensureBackend() here: a mid-turn backend death must be OBSERVED
+  // (the isDead fast-fail in the poll loop routes the turn into the
+  // supervised heal path). Respawning here would hand the loop a fresh
+  // backend that knows nothing about this session — events would never
+  // arrive and the turn would stall to the 120s no-progress timeout.
+  const backend = server.backend ?? server.ensureBackend();
+  // Mirror raw usage buckets into server.turnUsage as they arrive, so the
+  // session/prompt response wrapper can forward the final numbers to
+  // metering clients (see attachTurnUsage).
+  const translator = new EventTranslator(
+    (u) => server.turnUsage.set(acpSid, u),
+    `${acpSid}·${turn.zcodeSid.slice(0, 8)}`,
+  );
   differ.resetTurn();
   const NO_PROGRESS_MS = 120_000;
   let lastProgress = Date.now();
@@ -1428,6 +1649,18 @@ async function runEventTurn(
 
     const ev = await listener.pollEvent(500);
     if (ev === null) {
+      // Backend process died mid-turn: fail fast into the supervised heal
+      // path (restart + reload + resend) instead of sitting out the full
+      // 120s no-progress timeout and returning max_turn_requests. The poll
+      // timeout guarantees detection within ~500ms of the queue draining.
+      if (backend.isDead && !turn.cancelled) {
+        throw new TurnFailedError({
+          cause: {
+            code: BACKEND_DEAD_TURN_CODE,
+            message: backend.deathReason ?? "backend dead",
+          },
+        });
+      }
       // Thinking-phase hint: if the turn has started but produced no output
       // yet (no text/reasoning/tool streamed), and we've been silent longer
       // than the threshold, emit a single "thinking" thought chunk so the
@@ -1912,4 +2145,89 @@ export async function dispatchPlanIfChanged(
 
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// ---------- turn usage forwarding (Multica metering) ----------
+
+export interface TurnUsageBuckets {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  contextWindow?: number;
+}
+
+/**
+ * Derive metering buckets from the raw usage the backend actually reports.
+ *
+ * Verified semantics (zcode 0.16.5, evidence in tests/fixtures/usage-probe-
+ * events.jsonl): `turn.completed` carries the turn AGGREGATE with real
+ * buckets — inputTokens/outputTokens summed over the turn's model requests,
+ * plus cacheReadTokens/cacheWriteTokens. When both real buckets are present
+ * they are forwarded verbatim (totalTokens defaults to in+out, satisfying
+ * Multica's total=in+out normalization).
+ *
+ * Degraded fallback (older backends that report only totalTokens): derive
+ * outputTokens as totalTokens − inputTokens (floored at 0), where
+ * inputTokens is the session context occupancy from session.updated. For
+ * multi-request turns that difference miscounts intermediate request inputs
+ * as output — kept only as a fallback, never preferred.
+ *
+ * Returns null when the turn produced no usage at all, so the response stays
+ * untouched rather than advertising zero-valued buckets.
+ */
+export function turnUsageBuckets(
+  raw: {
+    inputTokens?: number;
+    outputTokens?: number;
+    totalTokens?: number;
+    cacheReadTokens?: number;
+    cacheWriteTokens?: number;
+    contextWindow?: number;
+  } | undefined,
+): TurnUsageBuckets | null {
+  if (!raw) return null;
+  const ctx = raw.contextWindow && raw.contextWindow > 0 ? { contextWindow: raw.contextWindow } : {};
+  if (typeof raw.inputTokens === "number" && typeof raw.outputTokens === "number") {
+    const inputTokens = raw.inputTokens;
+    const outputTokens = raw.outputTokens;
+    const totalTokens = raw.totalTokens ?? inputTokens + outputTokens;
+    if (inputTokens <= 0 && outputTokens <= 0 && totalTokens <= 0) return null;
+    return {
+      inputTokens,
+      outputTokens,
+      totalTokens,
+      ...(typeof raw.cacheReadTokens === "number" ? { cacheReadTokens: raw.cacheReadTokens } : {}),
+      ...(typeof raw.cacheWriteTokens === "number"
+        ? { cacheWriteTokens: raw.cacheWriteTokens }
+        : {}),
+      ...ctx,
+    };
+  }
+  const inputTokens = raw.inputTokens ?? 0;
+  const totalTokens = raw.totalTokens ?? 0;
+  if (inputTokens <= 0 && totalTokens <= 0) return null;
+  const outputTokens = Math.max(0, totalTokens - inputTokens);
+  return { inputTokens, outputTokens, totalTokens, ...ctx };
+}
+
+/**
+ * Attach the captured turn usage to the session/prompt response.
+ *
+ * Multica's kimi-family ACP backend bills from a top-level `usage` object on
+ * the prompt result; without it the turn is accounted as zero tokens. Read
+ * once — the entry is deleted so a later turn without usage events (cancelled
+ * before the first backend response) cannot replay stale numbers.
+ */
+export function attachTurnUsage(
+  server: ZcodeAcpServer,
+  acpSid: string,
+  resp: acp.PromptResponse,
+): acp.PromptResponse {
+  const raw = server.turnUsage.get(acpSid);
+  server.turnUsage.delete(acpSid);
+  const usage = turnUsageBuckets(raw);
+  if (!usage) return resp;
+  return { ...resp, usage } as acp.PromptResponse;
 }

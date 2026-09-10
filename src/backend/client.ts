@@ -20,6 +20,7 @@ import { createInterface } from "node:readline";
 import process from "node:process";
 
 import { log, warn } from "../utils.js";
+import { BACKEND_RESTARTING_MARKER } from "./supervise.js";
 import type {
   ZcodeEvent,
   ZcodeInbound,
@@ -47,8 +48,36 @@ export interface EventListener {
   handleEvent(event: ZcodeEvent): void;
 }
 
+const DIAGNOSTIC_ENV_KEYS = [
+  "ZCODE_APP_VERSION",
+  "ZCODE_BASE_URL",
+  "ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED",
+  "ZCODE_ENV",
+  "ZCODE_RUNTIME_ENV",
+  "ZCODE_SERVICE_AUTHORITY_MODE",
+  "ZCODE_WORKSPACE_IDENTITY",
+] as const;
+
+const SAFE_DIAGNOSTIC_ARGS = new Set(["app-server", "--stdio", "--surface", "desktop"]);
+
+function topLevelKeys(value: unknown): string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.keys(value as Record<string, unknown>).sort();
+}
+
+function diagnosticEnvPresence(env: NodeJS.ProcessEnv): Record<string, boolean> {
+  return Object.fromEntries(DIAGNOSTIC_ENV_KEYS.map((key) => [key, Boolean(env[key])])) as Record<
+    string,
+    boolean
+  >;
+}
+
+function diagnosticArgs(argv: string[]): string[] {
+  return argv.slice(1).map((arg) => (SAFE_DIAGNOSTIC_ARGS.has(arg) ? arg : "<redacted>"));
+}
+
 export class ZcodeBackend {
-  readonly proc: ChildProcess;
+  private proc: ChildProcess;
   private readonly pending = new Map<number, PendingRequest>();
   private readonly serverRequests: ServerRequest[] = [];
   // Per-session listener SET so a long-lived session listener (e.g. background
@@ -56,26 +85,60 @@ export class ZcodeBackend {
   // is delivered to every registered listener for the session.
   private readonly listeners = new Map<string, Set<EventListener>>();
   private readerDead = false;
+  /**
+   * Why the reader died ("stdout closed", "spawn failed: …"), or null while
+   * alive. Read by the supervision path to classify restart failures
+   * (zcode_spawn_failed vs zcode_backend_dead_after_retry).
+   */
+  deathReason: string | null = null;
+  /** Spawn command + env, retained so restart() can re-exec the same backend. */
+  private readonly argv: string[];
+  private env: NodeJS.ProcessEnv;
+  private readonly resolveEnv?: () => NodeJS.ProcessEnv;
+  private spawnSequence = 0;
   /** Monotonic id for fire-and-forget sends (send()). Uses a high range to
    *  avoid collisions with the server's request ids (low range). */
   private sendIdCounter = 1_000_000_000;
   /** Watchdog process that kills the zcode group if this bridge dies (SIGKILL). */
   private watchdog: ChildProcess | null = null;
 
-  constructor(argv: string[], env: NodeJS.ProcessEnv) {
-    this.proc = spawn(argv[0]!, argv.slice(1), {
+  constructor(argv: string[], env: NodeJS.ProcessEnv, resolveEnv?: () => NodeJS.ProcessEnv) {
+    this.argv = argv;
+    this.env = env;
+    this.resolveEnv = resolveEnv;
+    this.proc = this.spawnProcess();
+    log(`backend: started zcode app-server (pid=${this.proc.pid})`);
+  }
+
+  /**
+   * Spawn the zcode subprocess and wire its failure surfaces. Split out of
+   * the constructor so restart() can re-exec in place.
+   */
+  private spawnProcess(): ChildProcess {
+    if (this.resolveEnv) this.env = this.resolveEnv();
+    const sequence = ++this.spawnSequence;
+    log(
+      `backend: launch ${JSON.stringify({
+        argumentCount: this.argv.length - 1,
+        args: diagnosticArgs(this.argv),
+        cwd: process.cwd(),
+        env: diagnosticEnvPresence(this.env),
+        sequence,
+      })}`,
+    );
+    const proc = spawn(this.argv[0]!, this.argv.slice(1), {
       stdio: ["pipe", "pipe", "ignore"],
-      env,
+      env: this.env,
       detached: true, // own process group → kill(-pid) reaps the whole tree
     });
     // Spawn failures (ENOENT when the CLI can't be resolved) arrive here
     // asynchronously — without a listener the bridge dies on an unhandled
     // 'error' event. Mark the backend dead so requests fail with a JSON-RPC
     // error instead of crashing the whole process.
-    this.proc.on("error", (err) => {
+    proc.on("error", (err) => {
       const hint =
         (err as NodeJS.ErrnoException).code === "ENOENT"
-          ? `${this.proc.spawnfile} not found — install the zcode CLI, put it on PATH, or set ZCODE_BIN`
+          ? `${proc.spawnfile} not found — install the zcode CLI, put it on PATH, or set ZCODE_BIN`
           : err.message;
       this.markReaderDead(`spawn failed: ${hint}`);
     });
@@ -83,13 +146,14 @@ export class ZcodeBackend {
     // 'error' events, NOT thrown synchronously — without a listener the process
     // crashes with an unhandled 'error' event. Catch them here and mark the
     // reader dead so the rest of the bridge stops talking to a gone backend.
-    this.proc.stdin?.on("error", (err) => {
+    proc.stdin?.on("error", (err) => {
       this.readerDead = true;
+      this.deathReason = `stdin error: ${err.message}`;
       warn(`backend: stdin error: ${err.message}`);
     });
-    this.startReader();
-    this.startWatchdog();
-    log(`backend: started zcode app-server (pid=${this.proc.pid})`);
+    this.startReader(proc);
+    this.startWatchdog(proc);
+    return proc;
   }
 
   /**
@@ -108,9 +172,9 @@ export class ZcodeBackend {
    * kills. It self-terminates as soon as the zcode process exits, so a normal
    * shutdown leaves no lingering watchdog.
    */
-  private startWatchdog(): void {
+  private startWatchdog(proc: ChildProcess): void {
     const bridgePid = process.pid;
-    const zcodePid = this.proc.pid;
+    const zcodePid = proc.pid;
     if (!bridgePid || !zcodePid) return;
     // Inline script: poll bridge liveness, kill zcode group on bridge death.
     const script = `
@@ -133,14 +197,15 @@ export class ZcodeBackend {
     this.watchdog = spawn(process.execPath, ["-e", script], {
       stdio: "ignore",
       detached: true, // own process group, not part of the zcode group
+      env: {},
     });
     this.watchdog.unref();
   }
 
   // ---------- read loop ----------
 
-  private startReader(): void {
-    const stdout = this.proc.stdout;
+  private startReader(proc: ChildProcess): void {
+    const stdout = proc.stdout;
     if (!stdout) {
       this.markReaderDead("no stdout");
       return;
@@ -163,6 +228,7 @@ export class ZcodeBackend {
   private route(msg: ZcodeInbound): void {
     const method = msg.method;
     const id = msg.id;
+    this.logInboundRpc(id, method, msg.params);
     if (id !== undefined && method === undefined) {
       // Response (id, no method) → resolve pending request.
       this.resolvePending(id, msg as unknown as ZcodeResponse);
@@ -246,6 +312,7 @@ export class ZcodeBackend {
   private markReaderDead(reason: string): void {
     if (this.readerDead) return;
     this.readerDead = true;
+    this.deathReason = reason;
     warn(`backend: reader exited (${reason})`);
     for (const [, p] of this.pending) {
       clearTimeout(p.timer);
@@ -255,6 +322,35 @@ export class ZcodeBackend {
       });
     }
     this.pending.clear();
+  }
+
+  /**
+   * Supervised in-place restart: kill the old process group, re-exec the same
+   * command, and keep this object (and every reference to it — turn loops,
+   * listeners, monitors) valid. Listener registrations survive; their backend
+   * side subscriptions do NOT (the new process never saw them) — callers must
+   * re-subscribe and reload sessions via zcode `session/resume` after this.
+   *
+   * In-flight requests are resolved with a `zcode backend restarting` error so
+   * waiters fail fast with a marker the supervision classifiers recognise as
+   * "heal in progress", not "unrecoverable".
+   */
+  async restart(reason: string): Promise<void> {
+    warn(`backend: supervised restart (${reason})`);
+    await this.close();
+    for (const [, p] of this.pending) {
+      clearTimeout(p.timer);
+      p.resolve({
+        id: 0,
+        error: { message: `${BACKEND_RESTARTING_MARKER} (${reason})` },
+      });
+    }
+    this.pending.clear();
+    this.serverRequests.length = 0;
+    this.readerDead = false;
+    this.deathReason = null;
+    this.proc = this.spawnProcess();
+    log(`backend: restarted zcode app-server (pid=${this.proc.pid})`);
   }
 
   // ---------- listeners / server requests ----------
@@ -301,6 +397,7 @@ export class ZcodeBackend {
     // Write errors (EPIPE) are delivered via the stdin 'error' listener
     // installed in the constructor (synchronous try/catch cannot catch them);
     // no try/catch needed here.
+    this.logOutboundRpc("reply", id, undefined, result);
     stdin.write(JSON.stringify({ id, result }) + "\n");
   }
 
@@ -311,6 +408,7 @@ export class ZcodeBackend {
       warn("backend: sendError dropped (stdin closed)");
       return;
     }
+    this.logOutboundRpc("error", id, undefined, { code, message });
     stdin.write(JSON.stringify({ id, error: { code, message } }) + "\n");
   }
 
@@ -323,6 +421,7 @@ export class ZcodeBackend {
       warn("backend: notify dropped (stdin closed)");
       return;
     }
+    this.logOutboundRpc("notification", undefined, method, params);
     stdin.write(JSON.stringify({ method, params }) + "\n");
   }
 
@@ -340,6 +439,7 @@ export class ZcodeBackend {
       return;
     }
     const id = this.sendIdCounter++;
+    this.logOutboundRpc("send", id, method, params);
     stdin.write(JSON.stringify({ id, method, params: params ?? {} }) + "\n");
   }
 
@@ -370,6 +470,7 @@ export class ZcodeBackend {
     try {
       const stdin = this.proc.stdin;
       if (!stdin || stdin.destroyed) throw new Error("stdin closed");
+      this.logOutboundRpc("request", id, method, params);
       stdin.write(JSON.stringify({ id, method, params: params ?? {} }) + "\n");
     } catch (e) {
       this.pending.delete(id);
@@ -382,6 +483,34 @@ export class ZcodeBackend {
       };
     }
     return promise;
+  }
+
+  private logInboundRpc(id: unknown, method: unknown, params: unknown): void {
+    log(
+      `backend: rpc ${JSON.stringify({
+        direction: "inbound",
+        id: id ?? null,
+        method: typeof method === "string" ? method : null,
+        paramKeys: topLevelKeys(params),
+      })}`,
+    );
+  }
+
+  private logOutboundRpc(
+    kind: "error" | "notification" | "reply" | "request" | "send",
+    id: number | string | undefined,
+    method: string | undefined,
+    payload: unknown,
+  ): void {
+    log(
+      `backend: rpc ${JSON.stringify({
+        direction: "outbound",
+        id: id ?? null,
+        kind,
+        method: method ?? null,
+        payloadKeys: topLevelKeys(payload),
+      })}`,
+    );
   }
 
   // ---------- lifecycle ----------

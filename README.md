@@ -92,11 +92,34 @@ most setups need no `ZCODE_BIN` at all — set it only for custom installs:
 | `ZCODE_BASE_URL`                   | _(from config)_     | Override the provider base URL                                                                                                                                                                                                                                                                                                                                                               |
 | `ZCODE_ACP_AUTO_COMPACT_THRESHOLD` | _(unset)_           | Absolute token count that triggers automatic context compaction. After each successful turn (`end_turn`), if `contextUsed >= threshold`, the server invokes `session/compact` to free up context before the next prompt. Set to `0` or leave unset to disable (default). Example: `240000` triggers compaction at 240K tokens. The compaction target itself is decided by the ZCode backend. |
 | `ZCODE_ACP_DEBUG`                  | _(unset)_           | Set to `1` to enable verbose diagnostic logs (event flow, probe loops, status updates). Default is quiet — only warnings (backend pipe errors, command/permission failures, lock timeouts) are emitted. Enable this when diagnosing bridge issues; the logs appear in `Zed.log` prefixed with `[zcode-acp]`.                                                                                 |
+| `ZACP_USAGE_DEBUG`                 | _(unset)_           | Set to a file path to append one JSON line per usage-bearing backend event (`session.updated`, `turn.started/completed/failed`) with the FULL payload — the instrumentation for verifying token-bucket semantics (see `scripts/usage-semantics-probe.mjs` and `tests/fixtures/usage-probe-events.jsonl`). No effect on the protocol stream.                                                       |
+| `ZCODE_ACP_HEAL_BACKOFF_MS`        | `1000`              | Base backoff between supervised backend self-heal restarts (1s, then ×4 per attempt). The bridge restarts a dead zcode subprocess in place, reloads the session via `session/resume`, and re-sends the interrupted turn; only unrecoverable failures surface with `zcode_backend_dead_after_retry` / `zcode_session_lost` / `zcode_spawn_failed` prefixes.                                       |
 | `ZCODE_ACP_REMOTE`                 | _(unset)_           | Set to `1` to enable [remote access](#remote-access) — serve the same sessions to additional ACP clients over WebSocket.                                                                                                                                                                                                                                                                     |
 | `ZCODE_ACP_REMOTE_TOKEN`           | _(unset)_           | Auth token for remote access. **Mandatory** when `ZCODE_ACP_REMOTE=1`; remote stays disabled without it.                                                                                                                                                                                                                                                                                     |
 | `ZCODE_ACP_HUB_PORT`               | `8377`              | Port of the machine-level hub daemon. Map exactly this one port in your tunnel.                                                                                                                                                                                                                                                                                                              |
 | `ZCODE_ACP_HUB_HOST`               | `127.0.0.1`         | Hub bind address. `0.0.0.0` exposes a token-only, unencrypted surface — only for a containerized tunnel agent on a private interface (see [Remote Access](#remote-access)).                                                                                                                                                                                                                  |
 | `ZCODE_ACP_REMOTE_PORT`            | `8378`              | First loopback port for the bridge's ACP endpoint. Each bridge (each editor window) auto-increments to the next free port.                                                                                                                                                                                                                                                                   |
+
+## Token metering
+
+The `session/prompt` response carries a top-level `usage` object
+(`inputTokens`, `outputTokens`, `totalTokens`, plus `cacheReadTokens` /
+`cacheWriteTokens` and `contextWindow` when reported) for metering clients —
+Multica's ACP backend bills from exactly that field. Semantics (verified
+against zcode 0.16.5 with `ZACP_USAGE_DEBUG`; evidence in
+`tests/fixtures/usage-probe-events.jsonl`):
+
+- `turn.completed` usage is the **turn aggregate**: input/output summed over
+  the turn's model requests (`modelRequestCount`), reset every turn — never
+  session-cumulative. These are the buckets forwarded.
+- `session.updated` usage is **per model request** (inputTokens = the context
+  sent on that call). The editor context bar renders this occupancy, NOT the
+  turn total — after a multi-request turn the total (gross volume) would
+  inflate the bar ~n×.
+- The backend **does** provide cache split buckets (`cacheReadTokens` /
+  `cacheWriteTokens`) on both events; they are forwarded verbatim. Nothing is
+  synthesized: buckets the backend didn't report are omitted, and a turn with
+  no usage events gets no `usage` object at all.
 
 ## Remote Access
 

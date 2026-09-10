@@ -17,6 +17,21 @@ export default [
   },
   js.configs.recommended,
   {
+    // Node globals for the plain-JS scripts (smoke/probe drivers) — they run
+    // under plain node with no tsc pass, so no-undef must see the globals.
+    files: ["scripts/**/*.mjs"],
+    languageOptions: {
+      globals: {
+        console: "readonly",
+        process: "readonly",
+        setTimeout: "readonly",
+        setInterval: "readonly",
+        clearTimeout: "readonly",
+        clearInterval: "readonly",
+      },
+    },
+  },
+  {
     files: ["src/**/*.ts", "tests/**/*.ts"],
     languageOptions: {
       parser: tsparser,
