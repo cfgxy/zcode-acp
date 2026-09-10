@@ -40,8 +40,15 @@ export interface PendingTurn {
   stallRecovered?: boolean;
 }
 
-function loadDesktopBackendEnv(profileEnv = loadDesktopChildEnvWithRefresh()): NodeJS.ProcessEnv {
-  const env = { ...profileEnv };
+export function loadDesktopBackendEnv(profileEnv = loadDesktopChildEnvWithRefresh()): NodeJS.ProcessEnv {
+  // Merge both worlds. The daemon-injected process env is the base: it carries
+  // the task-scoped MULTICA_* credentials (token, agent/task ids) that exist
+  // nowhere else, and losing them makes agent tool shells fail their own
+  // credential gate while the CLI would have worked. The desktop profile
+  // overlays with highest priority on conflicts — its identity markers are
+  // what keep the backend recognized by the free-tier plan. Credentials stay
+  // on top of both.
+  const env: NodeJS.ProcessEnv = { ...process.env, ...profileEnv };
   const credentials = loadZcodeCredentials();
   if (credentials.ANTHROPIC_API_KEY) env.ANTHROPIC_API_KEY = credentials.ANTHROPIC_API_KEY;
   if (credentials.ZCODE_MODEL) env.ZCODE_MODEL = credentials.ZCODE_MODEL;
