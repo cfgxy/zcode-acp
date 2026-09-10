@@ -9,12 +9,8 @@
 
 import type * as acp from "@agentclientprotocol/sdk";
 
-import {
-  loadZcodeCredentials,
-  mergeEnvWithCreds,
-  resolveZcodeCommand,
-  ZcodeBackend,
-} from "./backend/index.js";
+import { loadZcodeCredentials, resolveZcodeCommand, ZcodeBackend } from "./backend/index.js";
+import { loadDesktopChildEnvWithRefresh } from "./desktop-profile.js";
 import { BackgroundTaskListener } from "./handlers/background-tasks.js";
 import { enqueueSessionSend } from "./handlers/io.js";
 import { ClientRegistry } from "./remote/broadcast.js";
@@ -42,6 +38,14 @@ export interface PendingTurn {
    * and compressing an in-flight task's context would destroy the work.
    */
   stallRecovered?: boolean;
+}
+
+function loadDesktopBackendEnv(profileEnv = loadDesktopChildEnvWithRefresh()): NodeJS.ProcessEnv {
+  const env = { ...profileEnv };
+  const credentials = loadZcodeCredentials();
+  if (credentials.ANTHROPIC_API_KEY) env.ANTHROPIC_API_KEY = credentials.ANTHROPIC_API_KEY;
+  if (credentials.ZCODE_MODEL) env.ZCODE_MODEL = credentials.ZCODE_MODEL;
+  return env;
 }
 
 /**
@@ -220,9 +224,15 @@ export class ZcodeAcpServer {
   /** Lazily spawn the zcode backend on first use (initialize doesn't need it). */
   ensureBackend(): ZcodeBackend {
     if (this.backend && !this.backend.isDead) return this.backend;
-    const env = mergeEnvWithCreds(loadZcodeCredentials());
-    const argv = resolveZcodeCommand();
-    this.backend = new ZcodeBackend(argv, env);
+    const profileEnv = loadDesktopChildEnvWithRefresh();
+    const env = loadDesktopBackendEnv(profileEnv);
+    const resolverEnv = {
+      ...profileEnv,
+      ...(process.env.ZCODE_BIN ? { ZCODE_BIN: process.env.ZCODE_BIN } : {}),
+      ...(process.env.ZCODE_NODE ? { ZCODE_NODE: process.env.ZCODE_NODE } : {}),
+    };
+    const argv = resolveZcodeCommand(resolverEnv);
+    this.backend = new ZcodeBackend(argv, env, () => loadDesktopBackendEnv());
     return this.backend;
   }
 

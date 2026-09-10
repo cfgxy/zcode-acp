@@ -16,10 +16,11 @@ import { execFileSync } from "node:child_process";
 import { log } from "../utils.js";
 
 /** `which bin` — resolve a binary on PATH without external deps. */
-function whichSync(bin: string): string | null {
+function whichSync(bin: string, env: NodeJS.ProcessEnv): string | null {
   try {
     const out = execFileSync("which", [bin], {
       encoding: "utf8",
+      env,
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
     return out || null;
@@ -49,12 +50,12 @@ function zedBundledNodes(): string[] {
  * Candidate Node binaries in priority order. Deduped, order-preserving.
  * Falls back to the Zed-bundled Node glob as a last resort.
  */
-function candidateNodeBinaries(): string[] {
+function candidateNodeBinaries(env: NodeJS.ProcessEnv): string[] {
   const cands: string[] = [];
-  const envNode = process.env.ZCODE_NODE;
+  const envNode = env.ZCODE_NODE;
   if (envNode) cands.push(envNode);
   cands.push("/opt/homebrew/bin/node", "/usr/local/bin/node");
-  const whichNode = whichSync("node");
+  const whichNode = whichSync("node", env);
   if (whichNode) cands.push(whichNode);
   cands.push(...zedBundledNodes());
   const seen = new Set<string>();
@@ -70,10 +71,11 @@ function candidateNodeBinaries(): string[] {
  * lacks the module and would crash). Uses `new DatabaseSync(...)` because a
  * bare reference would mis-detect support.
  */
-function nodeSupportsSqlite(nodeBin: string): boolean {
+function nodeSupportsSqlite(nodeBin: string, env: NodeJS.ProcessEnv): boolean {
   if (!nodeBin || !existsSync(nodeBin)) return false;
   try {
     execFileSync(nodeBin, ["-e", "new (require('node:sqlite').DatabaseSync)(':memory:')"], {
+      env,
       stdio: ["ignore", "ignore", "ignore"],
       timeout: 5000,
     });
@@ -108,8 +110,8 @@ function bundledZcodeCandidates(): string[] {
  * the desktop-app bundle locations. `null` when nothing is found — the caller
  * falls back to the bare name and lets spawn surface the failure.
  */
-function discoverZcodeBin(): string | null {
-  const onPath = whichSync("zcode");
+function discoverZcodeBin(env: NodeJS.ProcessEnv): string | null {
+  const onPath = whichSync("zcode", env);
   if (onPath) return onPath;
   for (const c of bundledZcodeCandidates()) {
     if (existsSync(c)) return c;
@@ -117,33 +119,50 @@ function discoverZcodeBin(): string | null {
   return null;
 }
 
-/** Resolve the full argv to launch `zcode app-server --stdio`. */
-export function resolveZcodeCommand(): string[] {
-  const zcodeBin = process.env.ZCODE_BIN ?? discoverZcodeBin() ?? "zcode";
+/** Replace any existing surface selection with exactly one desktop surface. */
+export function withDesktopSurface(argv: string[]): string[] {
+  const result: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === "--surface") {
+      i++;
+      continue;
+    }
+    if (arg.startsWith("--surface=")) continue;
+    result.push(arg);
+  }
+  result.push("--surface", "desktop");
+  return result;
+}
+
+/** Resolve the full argv to launch `zcode app-server --stdio --surface desktop`. */
+export function resolveZcodeCommand(env: NodeJS.ProcessEnv = process.env): string[] {
+  const zcodeBin = env.ZCODE_BIN ?? discoverZcodeBin(env) ?? "zcode";
   // Non-JS bin (e.g. a `zcode` command or wrapper) → use as-is, rely on its own shebang.
   if (!/\.(cjs|mjs|js)$/.test(zcodeBin)) {
-    return [zcodeBin, "app-server", "--stdio"];
+    return withDesktopSurface([zcodeBin, "app-server", "--stdio"]);
   }
   // JS file → launch with an explicit sqlite-capable Node to bypass the shebang.
-  for (const nodeBin of candidateNodeBinaries()) {
-    if (nodeSupportsSqlite(nodeBin)) {
+  for (const nodeBin of candidateNodeBinaries(env)) {
+    if (nodeSupportsSqlite(nodeBin, env)) {
       let ver = "?";
       try {
         // argv form (no shell, space-safe); capture stderr so it doesn't leak.
         ver = execFileSync(nodeBin, ["--version"], {
           encoding: "utf8",
+          env,
           stdio: ["ignore", "pipe", "pipe"],
         }).trim();
       } catch {
         // keep "?"
       }
       log(`resolve: launching zcode with node ${nodeBin} (${ver})`);
-      return [nodeBin, zcodeBin, "app-server", "--stdio"];
+      return withDesktopSurface([nodeBin, zcodeBin, "app-server", "--stdio"]);
     }
   }
   log(
     "resolve: no sqlite-capable node found; falling back to PATH-resolved zcode shebang " +
       "(may fail under GUI launch)",
   );
-  return [zcodeBin, "app-server", "--stdio"];
+  return withDesktopSurface([zcodeBin, "app-server", "--stdio"]);
 }

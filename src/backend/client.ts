@@ -48,6 +48,34 @@ export interface EventListener {
   handleEvent(event: ZcodeEvent): void;
 }
 
+const DIAGNOSTIC_ENV_KEYS = [
+  "ZCODE_APP_VERSION",
+  "ZCODE_BASE_URL",
+  "ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED",
+  "ZCODE_ENV",
+  "ZCODE_RUNTIME_ENV",
+  "ZCODE_SERVICE_AUTHORITY_MODE",
+  "ZCODE_WORKSPACE_IDENTITY",
+] as const;
+
+const SAFE_DIAGNOSTIC_ARGS = new Set(["app-server", "--stdio", "--surface", "desktop"]);
+
+function topLevelKeys(value: unknown): string[] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return [];
+  return Object.keys(value as Record<string, unknown>).sort();
+}
+
+function diagnosticEnvPresence(env: NodeJS.ProcessEnv): Record<string, boolean> {
+  return Object.fromEntries(DIAGNOSTIC_ENV_KEYS.map((key) => [key, Boolean(env[key])])) as Record<
+    string,
+    boolean
+  >;
+}
+
+function diagnosticArgs(argv: string[]): string[] {
+  return argv.slice(1).map((arg) => (SAFE_DIAGNOSTIC_ARGS.has(arg) ? arg : "<redacted>"));
+}
+
 export class ZcodeBackend {
   private proc: ChildProcess;
   private readonly pending = new Map<number, PendingRequest>();
@@ -65,16 +93,19 @@ export class ZcodeBackend {
   deathReason: string | null = null;
   /** Spawn command + env, retained so restart() can re-exec the same backend. */
   private readonly argv: string[];
-  private readonly env: NodeJS.ProcessEnv;
+  private env: NodeJS.ProcessEnv;
+  private readonly resolveEnv?: () => NodeJS.ProcessEnv;
+  private spawnSequence = 0;
   /** Monotonic id for fire-and-forget sends (send()). Uses a high range to
    *  avoid collisions with the server's request ids (low range). */
   private sendIdCounter = 1_000_000_000;
   /** Watchdog process that kills the zcode group if this bridge dies (SIGKILL). */
   private watchdog: ChildProcess | null = null;
 
-  constructor(argv: string[], env: NodeJS.ProcessEnv) {
+  constructor(argv: string[], env: NodeJS.ProcessEnv, resolveEnv?: () => NodeJS.ProcessEnv) {
     this.argv = argv;
     this.env = env;
+    this.resolveEnv = resolveEnv;
     this.proc = this.spawnProcess();
     log(`backend: started zcode app-server (pid=${this.proc.pid})`);
   }
@@ -84,6 +115,17 @@ export class ZcodeBackend {
    * the constructor so restart() can re-exec in place.
    */
   private spawnProcess(): ChildProcess {
+    if (this.resolveEnv) this.env = this.resolveEnv();
+    const sequence = ++this.spawnSequence;
+    log(
+      `backend: launch ${JSON.stringify({
+        argumentCount: this.argv.length - 1,
+        args: diagnosticArgs(this.argv),
+        cwd: process.cwd(),
+        env: diagnosticEnvPresence(this.env),
+        sequence,
+      })}`,
+    );
     const proc = spawn(this.argv[0]!, this.argv.slice(1), {
       stdio: ["pipe", "pipe", "ignore"],
       env: this.env,
@@ -155,6 +197,7 @@ export class ZcodeBackend {
     this.watchdog = spawn(process.execPath, ["-e", script], {
       stdio: "ignore",
       detached: true, // own process group, not part of the zcode group
+      env: {},
     });
     this.watchdog.unref();
   }
@@ -185,6 +228,7 @@ export class ZcodeBackend {
   private route(msg: ZcodeInbound): void {
     const method = msg.method;
     const id = msg.id;
+    this.logInboundRpc(id, method, msg.params);
     if (id !== undefined && method === undefined) {
       // Response (id, no method) → resolve pending request.
       this.resolvePending(id, msg as unknown as ZcodeResponse);
@@ -353,6 +397,7 @@ export class ZcodeBackend {
     // Write errors (EPIPE) are delivered via the stdin 'error' listener
     // installed in the constructor (synchronous try/catch cannot catch them);
     // no try/catch needed here.
+    this.logOutboundRpc("reply", id, undefined, result);
     stdin.write(JSON.stringify({ id, result }) + "\n");
   }
 
@@ -363,6 +408,7 @@ export class ZcodeBackend {
       warn("backend: sendError dropped (stdin closed)");
       return;
     }
+    this.logOutboundRpc("error", id, undefined, { code, message });
     stdin.write(JSON.stringify({ id, error: { code, message } }) + "\n");
   }
 
@@ -375,6 +421,7 @@ export class ZcodeBackend {
       warn("backend: notify dropped (stdin closed)");
       return;
     }
+    this.logOutboundRpc("notification", undefined, method, params);
     stdin.write(JSON.stringify({ method, params }) + "\n");
   }
 
@@ -392,6 +439,7 @@ export class ZcodeBackend {
       return;
     }
     const id = this.sendIdCounter++;
+    this.logOutboundRpc("send", id, method, params);
     stdin.write(JSON.stringify({ id, method, params: params ?? {} }) + "\n");
   }
 
@@ -422,6 +470,7 @@ export class ZcodeBackend {
     try {
       const stdin = this.proc.stdin;
       if (!stdin || stdin.destroyed) throw new Error("stdin closed");
+      this.logOutboundRpc("request", id, method, params);
       stdin.write(JSON.stringify({ id, method, params: params ?? {} }) + "\n");
     } catch (e) {
       this.pending.delete(id);
@@ -434,6 +483,34 @@ export class ZcodeBackend {
       };
     }
     return promise;
+  }
+
+  private logInboundRpc(id: unknown, method: unknown, params: unknown): void {
+    log(
+      `backend: rpc ${JSON.stringify({
+        direction: "inbound",
+        id: id ?? null,
+        method: typeof method === "string" ? method : null,
+        paramKeys: topLevelKeys(params),
+      })}`,
+    );
+  }
+
+  private logOutboundRpc(
+    kind: "error" | "notification" | "reply" | "request" | "send",
+    id: number | string | undefined,
+    method: string | undefined,
+    payload: unknown,
+  ): void {
+    log(
+      `backend: rpc ${JSON.stringify({
+        direction: "outbound",
+        id: id ?? null,
+        kind,
+        method: method ?? null,
+        payloadKeys: topLevelKeys(payload),
+      })}`,
+    );
   }
 
   // ---------- lifecycle ----------

@@ -2,7 +2,7 @@
 
 export { ZcodeBackend, type ServerRequest, type EventListener } from "./client.js";
 export { EventStreamListener, TurnMonitor, type NextId } from "./listener.js";
-export { resolveZcodeCommand } from "./resolve.js";
+export { resolveZcodeCommand, withDesktopSurface } from "./resolve.js";
 export { loadZcodeCredentials, mergeEnvWithCreds, type ZcodeCredentials } from "./credentials.js";
 export {
   BACKEND_DEAD_MARKER,

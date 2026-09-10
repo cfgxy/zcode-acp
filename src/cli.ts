@@ -18,6 +18,7 @@ import process from "node:process";
 import { main as runHub } from "./bin/hub.js";
 import { main as runQuota } from "./bin/quota.js";
 import { main as runServer } from "./index.js";
+import { DesktopProfileError, refreshDesktopProfile } from "./desktop-profile.js";
 import { runRepl } from "./repl/run.js";
 import { AGENT_INFO } from "./utils.js";
 
@@ -27,6 +28,7 @@ export type Invocation =
   | { kind: "repl"; explicit: boolean }
   | { kind: "server" }
   | { kind: "hub" }
+  | { kind: "profile-refresh" }
   | { kind: "quota"; args: string[] }
   | { kind: "unknown"; sub: string };
 
@@ -56,6 +58,10 @@ export function resolveInvocation(invokedAs: string, argv: readonly string[]): I
       return { kind: "hub" };
     case "quota":
       return { kind: "quota", args: argv.slice(1) };
+    case "profile":
+      return argv[1] === "refresh" && argv.length === 2
+        ? { kind: "profile-refresh" }
+        : { kind: "unknown", sub: argv.join(" ") };
     default:
       return { kind: "unknown", sub };
   }
@@ -73,6 +79,7 @@ Commands:
                     -i <sec>, -d detail, -p plain, provider glm|go.
   hub               Run the remote-access hub daemon (was zcode-acp-hub;
                     usually auto-spawned by bridges, rarely run by hand).
+  profile refresh   Capture the active Linux ZCode Desktop profile.
   server            The editor-facing ACP bridge over stdio (was
                     zcode-acp-server; editors normally launch it via the bin
                     alias without this subcommand).
@@ -84,6 +91,7 @@ Commands:
 Examples:
   zcode-acp                                # chat interactively in this repo
   zcode-acp quota -w                       # live usage monitor
+  zcode-acp profile refresh                # refresh desktop attachment
   zcode-acp server                         # stdio bridge (for testing)`;
 
 async function main(): Promise<void> {
@@ -116,6 +124,16 @@ async function main(): Promise<void> {
       return;
     case "hub":
       await runHub();
+      return;
+    case "profile-refresh":
+      try {
+        process.stdout.write(`${refreshDesktopProfile()}\n`);
+      } catch (error) {
+        process.stderr.write(
+          `zcode-acp: ${error instanceof DesktopProfileError ? error.message : "desktop profile invalid"}\n`,
+        );
+        process.exitCode = 1;
+      }
       return;
     case "quota":
       await runQuota(invocation.args);
