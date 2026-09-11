@@ -52,6 +52,19 @@ export function isSessionLostMessage(message: string): boolean {
   return /session not found/i.test(message);
 }
 
+/**
+ * Whether an error means the desktop identity snapshot no longer matches the
+ * running desktop app — the verified shape is `desktop profile missing`
+ * (observed 2026-09-10 when the desktop app restarted: the persisted profile
+ * recorded the old app process, validation marked it stale, and the refresh
+ * raced the app coming back up). Healable: the supervised restart re-resolves
+ * the backend env through loadDesktopBackendEnv, whose refresh captures the
+ * NEW app's identity — once the app is back, later attempts succeed.
+ */
+export function isDesktopProfileMissingMessage(message: string): boolean {
+  return /desktop profile missing/i.test(message);
+}
+
 /** Prefix an error message with a stable classification marker. */
 export function classified(prefix: string, message: string): string {
   return message.startsWith(prefix) ? message : `${prefix}: ${message}`;
