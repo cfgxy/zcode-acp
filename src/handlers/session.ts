@@ -24,6 +24,7 @@ import {
   ERR_SESSION_LOST,
   ERR_SPAWN_FAILED,
   isBackendDeadMessage,
+  isDesktopProfileMissingMessage,
   isSessionLostMessage,
 } from "../backend/supervise.js";
 import type { ZcodeCreateResult, ZcodeListResult, ZcodeSnapshot } from "../backend/types.js";
@@ -845,11 +846,16 @@ export async function prompt(
           throw new Error("zcode send not accepted");
         }
         // Dead backend at send time: supervised heal (restart + reload +
-        // resubscribe), then resend. Classified error once the budget is gone.
+        // resubscribe), then resend. Stale desktop profile (desktop app
+        // restarted) heals the same way — the restart re-resolves the env
+        // with a fresh identity capture. Classified error once the budget
+        // is gone.
         const rawSendErr = sendResp.error.message ?? "";
-        if (isBackendDeadMessage(rawSendErr)) {
+        if (isBackendDeadMessage(rawSendErr) || isDesktopProfileMissingMessage(rawSendErr)) {
           if (sendHealBudget-- > 0) {
-            warn(`prompt: backend dead at send (${rawSendErr}) — supervised self-heal starting`);
+            warn(
+              `prompt: backend unhealthy at send (${rawSendErr}) — supervised self-heal starting`,
+            );
             await healBackendAndReload(server, params.sessionId, zcodeSid, rawSendErr);
             await listener.resubscribe(() => server.nextId());
             continue;
@@ -1447,8 +1453,22 @@ async function resumeBackendSession(
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     if (isSessionLostMessage(msg)) throw new Error(classified(ERR_SESSION_LOST, msg));
-    if (!healCtx || !isBackendDeadMessage(msg)) throw err;
-    warn(`session/resume hit a dead backend (${msg}) — supervised self-heal starting`);
+    // Desktop app restarts invalidate the persisted identity snapshot; the
+    // supervised heal re-resolves the backend env through
+    // loadDesktopBackendEnv → loadDesktopChildEnvWithRefresh, which captures
+    // the NEW app's identity once it is back (healBackoffMs covers the
+    // restart window). Owner directive 2026-09-11: refresh, retry, and only
+    // surface the error if the profile is still failing after the heal.
+    const healable =
+      isBackendDeadMessage(msg) || isDesktopProfileMissingMessage(msg);
+    if (!healCtx || !healable) throw err;
+    if (isDesktopProfileMissingMessage(msg)) {
+      warn(
+        `session/resume hit a stale desktop profile (${msg}) — refreshing identity via supervised backend restart`,
+      );
+    } else {
+      warn(`session/resume hit a dead backend (${msg}) — supervised self-heal starting`);
+    }
     await healBackendAndReload(server, healCtx.acpSid, healCtx.zcodeSid, msg);
     // The heal reloaded the session into the fresh process; resume again
     // (idempotent) to fetch the result payload.
