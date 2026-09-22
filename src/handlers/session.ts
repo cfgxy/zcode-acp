@@ -36,7 +36,6 @@ import {
 } from "../config/options.js";
 import { emitInitialUsage } from "../config/model-cache.js";
 import { buildProviderRegistry } from "../config/provider-registry.js";
-import { buildResumeRuntimeModel } from "../config/runtime-model.js";
 import {
   lookupLazySession,
   recordMaterializedSession,
@@ -105,8 +104,16 @@ function workspaceFromResumeResult(result: unknown): string | null {
  * config.json — without this RPC a session switching to a third-party model
  * fails with `provider_not_configured`. Best-effort: failures are logged, not
  * thrown, so a registry push problem never blocks session creation.
+ *
+ * zcode 0.16.9 removed the RPC entirely (protocol drift): the backend now
+ * builds its registry from its own provider files (builtin account templates +
+ * provider_config.json provisioned by the desktop). Once that backend reports
+ * the method missing we stop pushing — the attempt is skipped silently.
  */
+let providerRegistryPushUnsupported = false;
+
 async function syncProviderRegistry(server: ZcodeAcpServer, cwd: string): Promise<void> {
+  if (providerRegistryPushUnsupported) return;
   try {
     const registry = buildProviderRegistry();
     const resp = await server
@@ -118,6 +125,14 @@ async function syncProviderRegistry(server: ZcodeAcpServer, cwd: string): Promis
         10000,
       );
     if (resp.error) {
+      if (/method not found/i.test(resp.error.message)) {
+        providerRegistryPushUnsupported = true;
+        log(
+          "provider-registry: backend removed workspace/updateProviderRegistry (zcode ≥ 0.16.9 " +
+            "file-driven registry) — provider availability is now backend/desktop-managed",
+        );
+        return;
+      }
       warn(`provider-registry: sync failed: ${resp.error.message}`);
       return;
     }
@@ -1500,35 +1515,18 @@ async function reloadBackendSession(
  * Resume WITHOUT pinning a model, so the session keeps its own selection (the
  * backend persists it per session — sessions the user ran on GLM-5.3-Flash
  * used to be silently re-pinned to the first config model by an unconditional
- * runtimeModel overlay). The overlay is now a FALLBACK repair only: when the
- * faithful resume fails outright (history carrying a stale/revoked model),
- * retry once pinned to the first enabled provider's first model.
+ * runtimeModel overlay). Protocol drift note (zcode 0.16.9): the resume-time
+ * runtimeModel overlay no longer exists — the backend's strict resume schema
+ * rejects the key — so the old "retry pinned to the first enabled model"
+ * fallback is gone; the post-resume repairUnavailableModel covers the
+ * "session's model no longer enabled" case on the success path.
  */
 async function resumePreservingModel(
   server: ZcodeAcpServer,
   zcParams: Record<string, unknown>,
   healCtx?: { acpSid: string; zcodeSid: string },
 ): Promise<unknown> {
-  try {
-    return await resumeBackendSession(server, zcParams, healCtx);
-  } catch (err) {
-    // A classified terminal failure (session lost / dead after retry) must
-    // not be masked by the model-overlay fallback — that retry cannot fix it.
-    if (
-      err instanceof Error &&
-      (err.message.startsWith(ERR_SESSION_LOST) ||
-        err.message.startsWith(ERR_BACKEND_DEAD_AFTER_RETRY) ||
-        err.message.startsWith(ERR_SPAWN_FAILED))
-    ) {
-      throw err;
-    }
-    const overlay = buildResumeRuntimeModel();
-    if (overlay === null) throw err;
-    warn(
-      `resume failed (${err instanceof Error ? err.message : String(err)}); retrying with default-model overlay`,
-    );
-    return resumeBackendSession(server, { ...zcParams, runtimeModel: overlay }, healCtx);
-  }
+  return resumeBackendSession(server, zcParams, healCtx);
 }
 
 /**

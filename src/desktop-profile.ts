@@ -6,6 +6,12 @@ import process from "node:process";
 export const DESKTOP_PROFILE_ENV_KEYS = [
   "ZCODE_APP_VERSION",
   "ZCODE_BASE_URL",
+  // zcode ≥ the 2026-09 provider-config split: the CLI resolves its built-in /
+  // personal provider configs through these pins; without them it exits at
+  // startup ("无法定位 CLI ZCode Built-in Provider Config") and the backend
+  // reader dies instantly.
+  "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE",
+  "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE",
   "ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED",
   "ZCODE_ENV",
   "ZCODE_RUNTIME_ENV",

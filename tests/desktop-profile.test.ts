@@ -112,6 +112,8 @@ describe("desktop profile environment", () => {
     expect(DESKTOP_PROFILE_ENV_KEYS).toEqual([
       "ZCODE_APP_VERSION",
       "ZCODE_BASE_URL",
+      "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE",
+      "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE",
       "ZCODE_DESKTOP_CONTEXT_PROMPT_ENABLED",
       "ZCODE_ENV",
       "ZCODE_RUNTIME_ENV",
