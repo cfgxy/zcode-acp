@@ -52,6 +52,25 @@ class FakeBackend {
     params?: Record<string, unknown>,
   ): Promise<{ id: number; result?: unknown; error?: unknown }> {
     this.calls.push({ method, params });
+    // applyModelSwitch resolves the backend-canonical ref from session/read's
+    // registry snapshot before sending session/setModel.
+    if (method === "session/read") {
+      return {
+        id,
+        result: {
+          settings: {
+            model: {
+              available: [
+                {
+                  ref: { providerId: "builtin:test", modelId: "GLM-5.3" },
+                  reasoning: { defaultLevel: "max" },
+                },
+              ],
+            },
+          },
+        },
+      };
+    }
     return { id, result: {} };
   }
 }
@@ -77,8 +96,18 @@ describe("setModel (session/set_model alias target)", () => {
     });
     const providerId = (call?.params?.model as { providerId?: string })?.providerId;
     expect(providerId).toMatch(/^builtin:/);
-    // The overlay must carry the full model definition, not a bare id.
-    expect(call?.params?.runtimeModel).toBeDefined();
+    // Protocol drift (zcode 0.16.9): the runtimeModel overlay key was removed
+    // from session/setModel — the strict schema rejects it with
+    // "Unrecognized key", so the switch carries the backend-canonical ref only.
+    expect(call?.params?.runtimeModel).toBeUndefined();
+    // The ref is resolved from the backend registry (canonical modelId casing)
+    // and carries the entry's default reasoning level (some providers reject
+    // a bare ref with "Reasoning level is required").
+    expect(call?.params?.model).toEqual({
+      providerId: "builtin:test",
+      modelId: "GLM-5.3",
+      options: { reasoningLevel: "max" },
+    });
   });
 
   it("missing modelId is rejected", async () => {

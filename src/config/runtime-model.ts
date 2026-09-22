@@ -1,158 +1,185 @@
 /**
- * runtimeModel overlay plumbing.
+ * Runtime model switching.
  *
- * The runtimeModel names the provider+model a session should use. For THIRD-
- * PARTY providers it also carries `apiKey` as `{source:"inline", value:"<key>"}`;
- * the backend resolves model-call auth from the overlay itself, so omitting it
- * yields HTTP 401 "Missing API key". Builtin providers keep using their own
- * OAuth/config auth and never inline a key. `apiFormat` mirrors `kind`.
+ * `applyModelSwitch` sends `session/setModel` with a `model` ref
+ * (`{providerId, modelId}`). The backend resolves BOTH provider definition and
+ * model-call auth from its workspace provider registry — the bridge pushes that
+ * registry (with full model elements and inline apiKeys for third-party
+ * providers) at backend spawn / session create, so the switch request itself
+ * carries no provider payload.
  *
- * Two uses:
- *
- *   1. Resume/load FALLBACK overlay (`buildResumeRuntimeModel`, via
- *      `resumePreservingModel` in handlers/session.ts): sessions are resumed
- *      faithfully (keeping their own model) and this overlay is only applied
- *      when that resume fails outright — history carrying a stale/revoked
- *      third-party model. It pins onto the FIRST enabled provider's FIRST
- *      model as a known-working repair, not as a default choice.
- *
- *   2. Model switch (`applyModelSwitch`): UI/slash model switching goes through
- *      `session/setModel` with both a `model` ref and a `runtimeModel` provider
- *      definition (runtime-only via `persistAsWorkspaceLastUsed:false`).
- *
- * Note: a provider registry push (`workspace/updateProviderRegistry`) is ALSO
- * required for the backend to recognise third-party providers at all — without
- * it the turn fails with `provider_not_configured` before auth is even tried.
- * See provider-registry.ts.
+ * Protocol drift note (zcode 0.16.9 / app 3.14.1, 2026-09): the `runtimeModel`
+ * overlay key was REMOVED from the protocol entirely — `session/setModel` and
+ * `session/resume` run strict schemas that reject it with `Invalid params —
+ * Unrecognized key: "runtimeModel"`, and the minified backend no longer
+ * contains the string. Sending a full provider definition inline was the
+ * pre-refactor contract; the registry push replaced it.
  */
 
-import { buildModelElement, type ModelEntry } from "./provider-registry.js";
-import {
-  findProviderConfig,
-  formatModelValue,
-  isBuiltinProvider,
-  loadAllModels,
-  parseModelValue,
-} from "./options.js";
-import type { ModelRef } from "./options.js";
+import { formatModelValue, parseModelValue } from "./options.js";
+import { loadDesktopProfile } from "../desktop-profile.js";
+import { readFileSync } from "node:fs";
 import { log, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
-
-const DEFAULT_KIND = "anthropic";
-const DEFAULT_BASE_URL = "https://open.bigmodel.cn/api/anthropic";
-
-/** Map config.json `kind` → backend `apiFormat`. */
-function apiFormatForKind(kind: string | undefined): string {
-  if (kind?.includes("anthropic")) return "anthropic-messages";
-  return "openai-chat-completions";
-}
-
-/**
- * Build a runtimeModel overlay for the given provider+model.
- *
- * For THIRD-PARTY providers the overlay MUST carry `apiKey` as the inline union
- * `{source:"inline", value:"<key>"}` — the backend resolves model-call auth from
- * the runtimeModel itself, so omitting it yields HTTP 401 "Missing API key".
- * (This was previously believed unnecessary; live probing proved otherwise.)
- * Builtin providers resolve auth from their own OAuth/config store, so no
- * apiKey is sent for them. `apiFormat` mirrors `kind` per the backend's catalog.
- */
-export function buildRuntimeModel(ref: ModelRef, revision = "bridge"): unknown | null {
-  const p = findProviderConfig(ref.providerId);
-  if (!p) {
-    log(`runtime-model: provider "${ref.providerId}" not in config.json`);
-    return null;
-  }
-  const baseURL = p.options?.baseURL ?? DEFAULT_BASE_URL;
-  // Model elements must carry the full definition (reasoning variants /
-  // contextWindow / label) — a bare {modelId} overlay makes the backend fall
-  // back to the apiFormat's default 2-state thought levels (enabled/disabled),
-  // silently resetting the session's max/high/low dropdown on resume/switch.
-  const models = Object.entries(p.models ?? {}).map(([modelId, m]) =>
-    buildModelElement(modelId, (m ?? {}) as ModelEntry),
-  );
-  if (models.length === 0) models.push({ modelId: ref.modelId });
-  const provider: Record<string, unknown> = {
-    providerId: ref.providerId,
-    kind: p.kind ?? DEFAULT_KIND,
-    apiFormat: apiFormatForKind(p.kind),
-    baseURL,
-    models,
-  };
-  // Third-party providers must inline their apiKey — the backend won't resolve
-  // it from anywhere else and the call fails with 401 without it. Builtin
-  // providers use OAuth/config auth and must NOT send an inline key.
-  if (!isBuiltinProvider(ref.providerId) && p.options?.apiKey) {
-    provider.apiKey = { source: "inline", value: p.options.apiKey };
-  }
-  return {
-    revision,
-    generatedAt: Date.now(),
-    model: { providerId: ref.providerId, modelId: ref.modelId },
-    provider,
-  };
-}
-
-/**
- * Build the resume-time FALLBACK overlay pinned to the first enabled
- * provider's first model — a known-working repair for sessions whose history
- * references an unavailable model. Only applied when a faithful (no-overlay)
- * resume fails; see resumePreservingModel in handlers/session.ts.
- */
-export function buildResumeRuntimeModel(): unknown | null {
-  const first = loadAllModels()[0];
-  if (!first) {
-    log("runtime-model: no enabled provider in config.json (resume overlay skipped)");
-    return null;
-  }
-  return buildRuntimeModel(first, "bridge-resume");
-}
 
 /**
  * Switch a session's model via `session/setModel`.
  *
  * `value` is the configOption value: either `"providerId\modelId"` (encoded) or
- * a legacy plain modelId (resolved to the first enabled builtin provider).
+ * a legacy plain modelId — both resolved against the BACKEND's registry, not
+ * config.json: since zcode 0.16.9 the backend builds its registry from its own
+ * provider files (builtin account templates + provider_config.json), so the
+ * canonical ref comes from `session/read`'s `settings.model.available`. The
+ * lookup is case-insensitive on modelId (the backend canonicalises to
+ * lowercase); a unique match is used directly, an ambiguous one prefers the
+ * requested providerId. When the requested model is absent from `available`
+ * the ref is still sent verbatim — the backend's registry is wider than the
+ * list (its precise errors drive two bounded reasoning-level retries). Models
+ * truly absent from the registry (e.g. the GLM coding-plan account models for
+ * bridge-created sessions — the desktop provisions those separately) fail with
+ * the backend's "Provider Registry 中不存在 Model" error.
  *
- * Sends BOTH a `model` ref (the target) AND a `runtimeModel` (the full provider
- * definition). The runtimeModel lets the backend register the provider into its
- * workspace catalog (so even third-party / non-default models are recognised),
- * while `model` names the selection. `persistAsWorkspaceLastUsed:false` keeps
- * this a runtime-only change. Invalidates the model cache on success.
- *
- * NOTE: the older `session/updateRuntimeModelConfig` path returns `changed:false`
- * on current backends without applying — `session/setModel` is the working
- * protocol since the backend model-management refactor.
+ * `persistAsWorkspaceLastUsed: false` keeps this a runtime-only change.
+ * Invalidates the model cache on success.
  */
 export async function applyModelSwitch(
   server: ZcodeAcpServer,
   zcodeSid: string,
   value: string,
 ): Promise<boolean> {
-  const { providerId, modelId } = parseModelValue(value);
-  const runtimeModel = buildRuntimeModel({ providerId, providerName: providerId, modelId });
-  if (runtimeModel === null) {
-    log(`runtime-model: cannot build overlay for "${value}" (provider not found)`);
-    return false;
-  }
+  const requested = parseModelValue(value);
   const backend = server.ensureBackend();
-  const resp = await backend.request(
-    server.nextId(),
-    "session/setModel",
-    {
-      sessionId: zcodeSid,
-      model: { providerId, modelId },
-      runtimeModel,
-      persistAsWorkspaceLastUsed: false,
-    },
-    15000,
-  );
+  const read = await backend.request(server.nextId(), "session/read", { sessionId: zcodeSid });
+  const available = extractAvailableModels(read.result);
+  const resolved = resolveBackendRef(available, requested);
+  // Fall back through two layers when the read's `available` list doesn't list
+  // the model — that list is narrower than the registry validateSelection
+  // actually checks (observed: a provider's non-default models are absent from
+  // `available` yet still switchable):
+  //   1. config.json's provider ids are desktop-legacy — the backend registers
+  //      personal providers from provider_config.json under fresh UUIDs. Map
+  //      via personalModelIds membership.
+  //   2. verbatim requested ref.
+  const mappedProviderId = resolved ? null : resolvePersonalProviderId(requested.modelId);
+  const ref = resolved ?? {
+    providerId: mappedProviderId ?? requested.providerId,
+    modelId: requested.modelId,
+  };
+  const send = (model: typeof ref) =>
+    backend.request(
+      server.nextId(),
+      "session/setModel",
+      { sessionId: zcodeSid, model, persistAsWorkspaceLastUsed: false },
+      15000,
+    );
+  let resp = await send(ref);
+  // Providers with mandatory reasoning effort reject a bare ref ("Reasoning
+  // level is required for …") and their entry may be missing from `available`
+  // (so no defaultLevel was attached). Retry with the observed template
+  // defaults, bounded to two attempts.
+  for (const level of ["max", "high"]) {
+    if (
+      !resp.error ||
+      !/reasoning level is required/i.test(resp.error.message) ||
+      ref.options
+    ) {
+      break;
+    }
+    resp = await send({ ...ref, options: { reasoningLevel: level } });
+  }
   if (resp.error) {
     warn(`runtime-model: switch failed: ${resp.error.message}`);
     return false;
   }
   invalidateModelCache(server, zcodeSid);
   return true;
+}
+
+interface BackendModelEntry {
+  ref: { providerId: string; modelId: string };
+  reasoning?: { defaultLevel?: string };
+}
+
+/** Pull `settings.model.available` out of a `session/read` result. */
+function extractAvailableModels(result: unknown): BackendModelEntry[] {
+  const settings = (result as { settings?: { model?: { available?: unknown } } } | undefined)
+    ?.settings;
+  const available = settings?.model?.available;
+  if (!Array.isArray(available)) return [];
+  return available.filter(
+    (m): m is BackendModelEntry =>
+      !!m &&
+      typeof m === "object" &&
+      !!(m as BackendModelEntry).ref?.providerId &&
+      !!(m as BackendModelEntry).ref?.modelId,
+  );
+}
+
+interface PersonalProviderRule {
+  providerId: string;
+  config?: { personalModelIds?: unknown };
+}
+
+/**
+ * Map a modelId to the backend-registered personal provider that carries it,
+ * reading the desktop's provider_config.json (path pinned by the desktop
+ * profile's ZCODE_PERSONAL_PROVIDER_CONFIG_FILE). config.json's provider UUIDs
+ * are desktop-legacy and unknown to the backend registry. Best-effort — null
+ * when the file is missing, unreadable, or lists no match.
+ */
+function resolvePersonalProviderId(modelId: string): string | null {
+  try {
+    const profile = loadDesktopProfile();
+    const configPath = profile.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
+    if (!configPath) return null;
+    const raw = JSON.parse(readFileSync(configPath, "utf8")) as {
+      config?: { providerConfigRules?: { providerRules?: PersonalProviderRule[] } };
+    };
+    const rules = raw.config?.providerConfigRules?.providerRules ?? [];
+    const hit = rules.find((r) => {
+      const ids = r.config?.personalModelIds;
+      return (
+        Array.isArray(ids) &&
+        ids.some((m) => typeof m === "string" && m.toLowerCase() === modelId.toLowerCase())
+      );
+    });
+    return hit?.providerId ?? null;
+  } catch (e) {
+    log(`runtime-model: personal provider map unavailable: ${e instanceof Error ? e.message : String(e)}`);
+    return null;
+  }
+}
+
+/**
+ * Match a requested config.json-flavoured ref against the backend's registry.
+ * Case-insensitive on both ids; exact-ref hits win, then unique modelId hits,
+ * then providerId-narrowed picks. Adds the entry's default reasoning level —
+ * some providers reject a bare ref ("Reasoning level is required for …").
+ */
+function resolveBackendRef(
+  available: BackendModelEntry[],
+  requested: { providerId: string; modelId: string },
+): { providerId: string; modelId: string; options?: { reasoningLevel: string } } | null {
+  if (available.length === 0) return null;
+  const lower = (s: string) => s.toLowerCase();
+  const exact = available.find(
+    (m) =>
+      lower(m.ref.providerId) === lower(requested.providerId) &&
+      lower(m.ref.modelId) === lower(requested.modelId),
+  );
+  const byModel = available.filter((m) => lower(m.ref.modelId) === lower(requested.modelId));
+  const entry =
+    exact ??
+    (byModel.length === 1
+      ? byModel[0]
+      : byModel.find((m) => lower(m.ref.providerId) === lower(requested.providerId)));
+  if (!entry) return null;
+  const level = entry.reasoning?.defaultLevel;
+  return {
+    providerId: entry.ref.providerId,
+    modelId: entry.ref.modelId,
+    ...(level ? { options: { reasoningLevel: level } } : {}),
+  };
 }
 
 /** Invalidate the session-level model cache after a switch. */

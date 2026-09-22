@@ -1,16 +1,18 @@
 /**
- * Tests for multi-provider model discovery and runtimeModel construction.
+ * Tests for multi-provider model discovery and model-value encoding.
  *
  * History: loadProviderModels() hardcoded a single builtin provider id, so
  * custom providers configured in the ZCode desktop app never appeared in the
  * dropdown. These tests lock the new behaviour: loadAllModels() aggregates ALL
  * enabled builtin providers PLUS every custom provider (the newer CLI no
  * longer sets `enabled` on third-party providers, so filtering on it would
- * drop them), buildRuntimeModel() inlines apiKey as {source:"inline",value}
- * for third-party providers (the backend resolves model-call auth from the
- * overlay itself; omitting it yields HTTP 401) but omits it for builtins.
- * Builtin models encode as bare modelIds, and third-party models carry their
- * providerId prefix.
+ * drop them). Builtin models encode as bare modelIds, and third-party models
+ * carry their providerId prefix.
+ *
+ * The buildRuntimeModel overlay tests were removed with the overlay itself:
+ * zcode 0.16.9 dropped the `runtimeModel` key from the protocol (strict
+ * schemas reject it); provider definitions and inline apiKeys now travel only
+ * through the workspace provider registry push (provider-registry.ts).
  */
 
 import { describe, expect, it, vi } from "vitest";
@@ -80,12 +82,9 @@ vi.mock("node:fs", async () => {
 });
 
 // Import AFTER vi.mock is set up.
-const { loadAllModels, modelContextWindow, parseModelValue, formatModelValue, buildRuntimeModel } =
-  await import("../src/config/options.js").then(async () => {
-    const opts = await import("../src/config/options.js");
-    const rm = await import("../src/config/runtime-model.js");
-    return { ...opts, buildRuntimeModel: rm.buildRuntimeModel };
-  });
+const { loadAllModels, modelContextWindow, parseModelValue, formatModelValue } = await import(
+  "../src/config/options.js"
+);
 
 describe("loadAllModels", () => {
   it("collects enabled builtins + active custom providers", () => {
@@ -159,58 +158,5 @@ describe("parseModelValue / formatModelValue", () => {
   it("splits on the FIRST backslash only (modelId may contain none)", () => {
     const parsed = parseModelValue("pid\\model-a");
     expect(parsed).toEqual({ providerId: "pid", modelId: "model-a" });
-  });
-});
-
-describe("buildRuntimeModel", () => {
-  it("inlines apiKey as {source:'inline', value} for third-party providers", () => {
-    // The backend resolves model-call auth from the runtimeModel itself — a
-    // third-party overlay WITHOUT apiKey yields HTTP 401 "Missing API key".
-    // apiKey is the inline union, never a bare string (the strict schema rejects it).
-    const rm = buildRuntimeModel({
-      providerId: "custom-provider-alpha",
-      providerName: "Alpha",
-      modelId: "alpha-1",
-    }) as {
-      provider: {
-        apiKey?: { source: string; value: string };
-        baseURL?: string;
-        kind?: string;
-        apiFormat?: string;
-      };
-    };
-
-    expect(rm.provider.apiKey).toEqual({ source: "inline", value: "test-key-alpha" });
-    expect(rm.provider.baseURL).toBe("http://127.0.0.1:8000/v1");
-    expect(rm.provider.kind).toBe("openai-compatible");
-    expect(rm.provider.apiFormat).toBe("openai-chat-completions");
-  });
-
-  it("omits apiKey for builtin OAuth providers (auth resolved from config/OAuth)", () => {
-    const rm = buildRuntimeModel({
-      providerId: "builtin:primary",
-      providerName: "Primary",
-      modelId: "model-a",
-    }) as { provider: { apiKey?: string; apiFormat?: string } };
-
-    expect(rm.provider.apiKey).toBeUndefined();
-    expect(rm.provider.apiFormat).toBe("anthropic-messages");
-  });
-
-  it("returns null for an unknown provider", () => {
-    expect(
-      buildRuntimeModel({ providerId: "nope", providerName: "nope", modelId: "x" }),
-    ).toBeNull();
-  });
-
-  it("includes all the provider's models in the overlay", () => {
-    const rm = buildRuntimeModel({
-      providerId: "builtin:primary",
-      providerName: "Primary",
-      modelId: "model-a",
-    }) as { provider: { models: Array<{ modelId: string }> } };
-
-    const modelIds = rm.provider.models.map((m) => m.modelId);
-    expect(modelIds).toEqual(["model-a", "model-b"]);
   });
 });

@@ -184,23 +184,38 @@ export async function setThoughtLevel(
   return (resp.result ?? {}) as Result;
 }
 
-/** session/updateRuntimeModelConfig → same: runtime overlay of session model config. */
+/**
+ * session/updateRuntimeModelConfig → model switch.
+ *
+ * Protocol drift (zcode 0.16.9): the backend REMOVED both the
+ * `session/updateRuntimeModelConfig` RPC and the runtimeModel overlay concept —
+ * strict schemas reject the key and the method is gone from the route table.
+ * The overlay's remaining useful content is its model ref, so forward that
+ * through applyModelSwitch; callers without a usable model ref get a clear
+ * error instead of a backend -32601.
+ */
 export async function updateRuntimeModelConfig(
   server: ZcodeAcpServer,
   params: ExtensionParams,
 ): Promise<Result> {
   const zcodeSid = await resolveSidOrThrow(server, params);
-  const runtimeModel = params.runtimeModel;
-  if (!runtimeModel) throw new Error("updateRuntimeModelConfig requires runtimeModel");
-  const zcParams: Record<string, unknown> = { sessionId: zcodeSid, runtimeModel };
-  if (params.applyModelSelection !== undefined)
-    zcParams.applyModelSelection = params.applyModelSelection;
-  const resp = await server
-    .ensureBackend()
-    .request(server.nextId(), "session/updateRuntimeModelConfig", zcParams, 15000);
-  if (resp.error) throw new Error(`updateRuntimeModelConfig failed: ${resp.error.message}`);
-  log("session/updateRuntimeModelConfig → ok");
-  return (resp.result ?? {}) as Result;
+  const overlay = params.runtimeModel as
+    | { model?: { providerId?: string; modelId?: string } }
+    | undefined;
+  const modelId = overlay?.model?.modelId;
+  if (!modelId) {
+    throw new Error(
+      "updateRuntimeModelConfig: the runtimeModel overlay was removed from the backend " +
+        "(zcode ≥ 0.16.9); only its model ref can still be applied via session/setModel",
+    );
+  }
+  const providerRef = overlay?.model?.providerId
+    ? `${overlay.model.providerId}\\${modelId}`
+    : modelId;
+  const ok = await applyModelSwitch(server, zcodeSid, providerRef);
+  if (!ok) throw new Error("updateRuntimeModelConfig failed (model switch rejected)");
+  log(`session/updateRuntimeModelConfig → model switch ${providerRef}`);
+  return {};
 }
 
 /** session/setModel → applyModelSwitch (runtime overlay, not persistence). */
