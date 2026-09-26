@@ -18,9 +18,14 @@ import process from "node:process";
 import { main as runHub } from "./bin/hub.js";
 import { main as runQuota } from "./bin/quota.js";
 import { main as runServer } from "./index.js";
-import { DesktopProfileError, refreshDesktopProfile } from "./desktop-profile.js";
+import { DesktopProfileError, loadDesktopProfile, refreshDesktopProfile } from "./desktop-profile.js";
+import {
+  ensurePersonalGlmProvider,
+  personalProviderConfigPath,
+  type PersonalProviderOutcome,
+} from "./config/personal-provider.js";
+import { AGENT_INFO, ZCODE_CREDS_PATH } from "./utils.js";
 import { runRepl } from "./repl/run.js";
-import { AGENT_INFO } from "./utils.js";
 
 /** What the dispatcher decided to run. `args` are the tokens after the subcommand. */
 export type Invocation =
@@ -133,7 +138,9 @@ async function main(): Promise<void> {
           `zcode-acp: ${error instanceof DesktopProfileError ? error.message : "desktop profile invalid"}\n`,
         );
         process.exitCode = 1;
+        return;
       }
+      ensureGlmPersonalProviderAfterRefresh();
       return;
     case "quota":
       await runQuota(invocation.args);
@@ -142,6 +149,36 @@ async function main(): Promise<void> {
       process.stderr.write(`zcode-acp: unknown command '${invocation.sub}'\n\n`);
       process.stdout.write(HELP_TEXT + "\n");
       process.exit(1);
+  }
+}
+
+/**
+ * Post-refresh guard: the desktop provisions provider_config.json on every
+ * update/sync and drops manually-added entries, so re-ensure the GLM Coding
+ * Plan personal provider right after the profile was re-captured (the two
+ * actions share the exact same trigger: a desktop restart/update). The
+ * provider path comes from the just-refreshed profile when loadable — the
+ * capture proves the desktop is running and its pins are current. Best-effort:
+ * outcome is reported, never thrown; refresh's exit code is untouched.
+ */
+function ensureGlmPersonalProviderAfterRefresh(): void {
+  let providerPath: string;
+  try {
+    providerPath = personalProviderConfigPath(loadDesktopProfile().env);
+  } catch {
+    providerPath = personalProviderConfigPath();
+  }
+  const outcome: PersonalProviderOutcome = ensurePersonalGlmProvider(providerPath, ZCODE_CREDS_PATH);
+  switch (outcome.status) {
+    case "added":
+      process.stdout.write(`personal provider: GLM Coding Plan entry re-added (${outcome.providerId})\n`);
+      break;
+    case "present":
+      process.stdout.write(`personal provider: GLM Coding Plan entry present (${outcome.providerId})\n`);
+      break;
+    case "skipped":
+      process.stdout.write(`personal provider: not touched — ${outcome.reason}\n`);
+      break;
   }
 }
 

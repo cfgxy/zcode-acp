@@ -8,15 +8,17 @@
 ## TL;DR（下次 zcode 升级后的 SOP）
 
 1. `zcode-acp profile refresh`（重抓桌面端进程环境变量）。
-2. 若 backend 启动即死（`reader exited (stdout closed)` ×3 自愈失败）：
+2. 同一条命令同时守护 GLM 套餐条目：refresh 会自动检查并补回
+   `provider_config.json` 里的 GLM Coding Plan 个人 provider（桌面端每次
+   升级/同步都会把它清掉）。输出 `personal provider: … present/re-added`。
+3. 若 backend 启动即死（`reader exited (stdout closed)` ×3 自愈失败）：
    对比 `/proc/<zcode-cli-pid>/environ` 与精简 spawn 环境，把**新增的必备环境变量**
    加进 `src/desktop-profile.ts` 的 `DESKTOP_PROFILE_ENV_KEYS`，重建 dist，再 refresh。
 3. `pnpm typecheck && pnpm test && pnpm build`，然后跑
    `scripts/` 里的 bridge 探针验证 initialize + session/new。
-4. 机器本地修复（repo 之外，升级会被覆盖，需重做）：
+5. 机器本地修复（repo 之外，升级会被覆盖，需重做）：
    - `python3 scripts/patch-zcode-tui-modellist.py`（TUI /model 列表显示）
    - `bash scripts/assemble-zcode-tui-runtime.sh <桌面App版本>`（裸 `zcode` TUI，可选）
-   - 检查 `~/.zcode/v2/provider_config.json` 的 GLM 个人套餐条目是否还在（见下文）
 5. 有真实对话后观察 usage/上下文条是否正常（turn 事件语义未回归验证，见"未验证项"）。
 
 ---
@@ -128,11 +130,11 @@ provider-registry: sync failed: Method not found: workspace/updateProviderRegist
 zcode-acp profile refresh   # 需先重建 dist（zcode-acp 软链 → 本仓库 dist/cli.js）
 ```
 
-### 2. provider_config.json 的 GLM 个人套餐条目
+### 2. provider_config.json 的 GLM 个人套餐条目（已自动化）
 
-`~/.zcode/v2/provider_config.json` 的 `config.providerConfigRules.providerRules[]` 中
-保持/重新加入（apiKey 取 config.json 个人套餐 provider 的 key；UUID 随意但不要用
-`account:` 前缀）：
+`zcode-acp profile refresh` 现在自动确保该条目存在（`src/config/personal-provider.ts`
+的 ensurePersonalGlmProvider：幂等、best-effort、apiKey 取 config.json 个人套餐
+provider 的 key）。手工条目形如（UUID 随意但不要用 `account:` 前缀）：
 
 ```json
 {
@@ -148,8 +150,9 @@ zcode-acp profile refresh   # 需先重建 dist（zcode-acp 软链 → 本仓库
 }
 ```
 
-注意：此文件由桌面端管理，桌面端重新同步 provider 时可能覆盖手工条目（症状：`/model`
-又切不了 GLM → 重新加上即可）。备份惯例：`provider_config.json.bak-<时间戳>`。
+注意：此文件由桌面端管理，桌面端重新同步 provider 时会清掉手工条目（症状：`/model`
+又切不了 GLM → 重跑 `zcode-acp profile refresh` 即可，会打印 re-added）。写入自动
+备份：`provider_config.json.bak-<时间戳>`。
 
 ### 3. TUI 运行时组装（可选，仅裸 `zcode` TUI 需要）
 
