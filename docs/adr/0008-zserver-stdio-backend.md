@@ -104,7 +104,25 @@ onDynamicWorkspaceEvent`。
   - `sendPrompt` 的 `content` 是**纯字符串**（非内容块数组）；`taskId` 即
     session id（`sess_*`）；事件订阅必须先于 sendPrompt（动态事件 `onDynamic*`
     携参返回 Event）。
-- **M1b（当前阻塞点，方案已定位）**：真实一轮对话卡在
+- **M1b（进行中，真实一轮已跑通）**：`scripts/zserver-turn-probe.mjs`
+  完整闭环：`createSession` → `createTask(draftSessionId)` →
+  `sendPrompt`（走内层 `zcode-agent` channel 的 session/send 路径，
+  **非** facade 的 v4 sendText——后者要求 agent 侧 session 行已落库，
+  否则 sqlite `FOREIGN KEY constraint failed`）→ 事件流
+  （`onDynamicSessionEvent` live 投递，`state.updated` 帧）→
+  `onDynamicTaskTerminalOutcome` 终态 `succeeded` → `closeTask`。
+  消息持久化（用户+助手）与套餐模型解析
+  （`account:bigmodel-individual-coding-plan/GLM-5.3`）均实证。
+  关键协议事实：**动态事件必须携带 arg**（`onDynamicStreamEvent(taskId)`、
+  `onDynamicSessionEvent({workspacePath, sessionId, deliveryKind})`）；
+  `deliveryKind: "live"` 对应 server 端 `desktop-continuous`。
+  agent 命令解析存在 flake（会选 `agents/glm/zcode-agent` 包装脚本，
+  其 `#!/usr/bin/env node` 在净化 env 下 ENOENT），用
+  `ZCODE_AGENT_SERVER_COMMAND`/`ZCODE_AGENT_SERVER_ARGS_JSON` 钉死。
+  剩余：对话内容帧走 `subscribeConversationV4`/`onDynamicConversationFrame`
+  （V4 帧订阅语义待映射）；`desktop-attached-remote` 权威下的
+  runtime-preferences 应答回路已在探针中就位（local 权威下 server 自答、
+  事件不触发）。
   `session/requestRuntimePreferences`。desktop-attached-remote 权威模式下，
   server 不自答该请求，而是 fire `sessionRuntimePreferencesRequestEmitter`
   转发给**客户端连接作用域**（`createZCodeAgentConnectionScope(role:

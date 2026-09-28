@@ -33,6 +33,14 @@ try {
   // session/requestRuntimePreferences itself — otherwise it forwards the
   // request to the client (trusted-host-relay reverse RPC, M1b scope).
   env.ZCODE_SERVICE_AUTHORITY_MODE = "local";
+  // Pin the agent command: the deployed resolver's native-binary candidate
+  // (agents/glm/zcode-agent) is absent here; zcode.cjs is the real runtime.
+  env.ZCODE_AGENT_SERVER_COMMAND = `${env.ZCODE_SERVER_RUNTIME_ROOT ?? `${process.env.HOME}/.zcode/server`}/node`;
+  env.ZCODE_AGENT_SERVER_ARGS_JSON = JSON.stringify([
+    `${env.ZCODE_SERVER_RUNTIME_ROOT ?? `${process.env.HOME}/.zcode/server`}/agents/glm/zcode.cjs`,
+    "app-server",
+    "--stdio",
+  ]);
   console.log(`[turn] profile env injected (authority forced to local)`);
 } catch (error) {
   console.log(`[turn] no desktop profile (${error.message}); plain env`);
@@ -41,13 +49,35 @@ try {
 const connection = await ZServerConnection.spawn({ env, clientId });
 console.log("[turn] connection ready");
 const tasks = connection.channelOf("zcode-task");
+const agentChannel = connection.channelOf("zcode-agent");
+// M1b: trusted-host-relay 必答回路 —— agent 的 session/requestRuntimePreferences
+// 经 server 转发为该动态事件；不应答则 session/create 超时、sendText FK 失败。
+connection.listen("onDynamicSessionRuntimePreferencesRequest", undefined, (request) => {
+  console.log(`[turn] runtime-preferences request ${request?.requestId} scope=${request?.scope}`);
+  agentChannel
+    .call("respondSessionRuntimePreferences", {
+      requestId: request.requestId,
+      resolution: {
+        status: "ok",
+        preferences: {
+          nativeSearchEnhancementsEnabled: true,
+          memoryEnabled: false,
+          askUserQuestionAutoResolutionEnabled: true,
+        },
+      },
+    })
+    .then(() => console.log("[turn] runtime-preferences responded"));
+});
 const events = [];
 let taskId;
 
 try {
   // 1) createSession on the agent channel — this materializes the session row
   // in the agent db; createTask then adopts it via draftSessionId.
-  const snapshot = await connection.call("createSession", { workspacePath: workspace });
+  const snapshot = await connection.call("createSession", {
+    workspacePath: workspace,
+    persistence: "immediate",
+  });
   const sessionId = snapshot?.session?.sessionId ?? snapshot?.sessionId ?? snapshot?.session?.id;
   console.log(
     `[turn] createSession → sessionId=${sessionId} snapshotKeys=${snapshot ? Object.keys(snapshot).join(",") : "?"}`,
@@ -68,10 +98,13 @@ try {
     throw new Error(`createTask returned no taskId: ${JSON.stringify(created)?.slice(0, 200)}`);
   }
 
-  // 2) subscribe BEFORE prompting (short turns complete fast).
-  const streamEvents = tasks.listen("onDynamicStreamEvent", taskId, (data) => {
-    events.push(data);
-  });
+  // 2) subscribe BEFORE prompting (short turns complete fast). The inner
+  // session event stream carries the live conversation frames.
+  const streamEvents = connection.listen(
+    "onDynamicSessionEvent",
+    { workspacePath: workspace, sessionId: taskId, deliveryKind: "live" },
+    (data) => events.push(data),
+  );
   const terminalPromise = new Promise((resolve) => {
     tasks.listen("onDynamicTaskTerminalOutcome", taskId, (data) => resolve(data));
   });
@@ -87,8 +120,11 @@ try {
   console.log(`[turn] task ready: ${JSON.stringify(ready).slice(0, 200)}`);
 
   // 3) send the prompt.
-  await tasks.call("sendPrompt", {
-    taskId,
+  // 走内层 agent 服务的 session/send 协议路径（等价 bridge 的 session/send），
+  // 而非 facade 的 v4 sendText —— 后者要求 agent 侧 session 行先落库（FK）。
+  await connection.call("sendPrompt", {
+    workspacePath: workspace,
+    sessionId: taskId,
     content: prompt,
     clientId,
     clientMode: "desktop-continuous",

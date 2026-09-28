@@ -131,7 +131,7 @@ describe("zserver ChannelClient", () => {
     const seen: unknown[] = [];
     let unsubscribe: (() => void) | null = null;
     const fired = new Promise<void>((resolve) => {
-      unsubscribe = client.listen("zcode-agent", "onTaskUpdated", (data) => {
+      unsubscribe = client.listen("zcode-agent", "onTaskUpdated", undefined, (data) => {
         seen.push(data);
         resolve();
       });

@@ -133,12 +133,18 @@ export class ChannelClient {
   }
 
   /**
-   * Subscribe to event `name` on `channelName`. The subscription request is
-   * sent on first listener attach and disposed on last detach (mirrors the
-   * upstream Emitter ref-counting so repeated subscribe/unsubscribe cycles
-   * re-arm server-side).
+   * Subscribe to event `name` on `channelName`. Dynamic events (`onDynamic*`)
+   * receive `arg` when the server invokes the event factory; static events
+   * ignore it. The subscription request is sent on first listener attach and
+   * disposed on last detach (mirrors the upstream Emitter ref-counting so
+   * repeated subscribe/unsubscribe cycles re-arm server-side).
    */
-  listen(channelName: string, name: string, onFire: (data: unknown) => void): () => void {
+  listen(
+    channelName: string,
+    name: string,
+    arg: unknown,
+    onFire: (data: unknown) => void,
+  ): () => void {
     if (this.disposed) {
       throw disposedError();
     }
@@ -155,7 +161,7 @@ export class ChannelClient {
         }
       });
       this.eventListeners.set(id, onFire);
-      this.sendRequest(102 as RequestType, id, channelName, name, undefined);
+      this.sendRequest(102 as RequestType, id, channelName, name, arg);
     };
     if (this.initialized) {
       attach();
@@ -254,7 +260,7 @@ export class ServiceChannel {
     return this.client.call(this.channelName, method, args);
   }
 
-  listen(event: string, onFire: (data: unknown) => void): () => void {
-    return this.client.listen(this.channelName, event, onFire);
+  listen(event: string, arg: unknown, onFire: (data: unknown) => void): () => void {
+    return this.client.listen(this.channelName, event, arg, onFire);
   }
 }

@@ -127,7 +127,11 @@ export class ZServerConnection {
     }
 
     const child = spawnChild(nodeBin, bundle, options.env ?? process.env);
-    const connection = new ZServerConnection(child, serverRoot, options.clientId ?? `zcode-acp-${process.pid}`);
+    const connection = new ZServerConnection(
+      child,
+      serverRoot,
+      options.clientId ?? `zcode-acp-${process.pid}`,
+    );
     await connection.handshake(options.version ?? "0.0.0");
     return connection;
   }
@@ -188,8 +192,8 @@ export class ZServerConnection {
     return this.channel.call(method, ...args);
   }
 
-  listen(event: string, onFire: (data: unknown) => void): () => void {
-    return this.channel.listen(event, onFire);
+  listen(event: string, arg: unknown, onFire: (data: unknown) => void): () => void {
+    return this.channel.listen(event, arg, onFire);
   }
 
   /** Channel access for any other registered service ("zcode-task", "zcode-session", …). */
