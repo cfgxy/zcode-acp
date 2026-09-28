@@ -35,7 +35,10 @@ src/
 │   │                     _spawn_failed — wire contract with Multica retry)
 │   ├── credentials.ts    Reads ~/.zcode/v2/config.json for GLM API key
 │   ├── listener.ts       EventStreamListener — subscribes to session/events
-│   └── types.ts          ZCode protocol types
+│   ├── types.ts          ZCode protocol types
+│   └── zserver/          zcode-server.cjs stdio-mode backend (ADR-0008):
+│                         frame/serialization/ChannelClient + connection;
+│                         not wired into the bridge yet (M1 pending)
 ├── handlers/             ACP method handlers
 │   ├── session.ts        session/new, session/prompt (turn loop), load, resume
 │   ├── slash.ts          Slash-command interception (/compact, /mcp, etc.)

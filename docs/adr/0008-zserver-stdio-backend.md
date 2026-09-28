@@ -1,0 +1,136 @@
+# ADR-0008: zserver 模式——复用本机部署的 zcode-server.cjs 作为 zcode-acp 后端
+
+## 状态
+
+Accepted（M0 已落地并活体验证；M1/M2 待实施，见"分阶段"）
+
+## 背景
+
+zcode-acp 现在直接 spawn `zcode app-server --stdio` 作为后端，身份环境变量
+（provider pins、`ZCODE_SERVICE_AUTHORITY_MODE=desktop-attached-remote` 等）
+通过 desktop-profile 从活进程抓取（见 `src/desktop-profile.ts`）。痛点：
+
+- 桌面端与 SSH server 断连后，`zcode-server.cjs`（sshd-session 子进程）与其
+  agent 子进程全部死亡，profile 源进程失活 → 后端无法 spawn，重连后必须手动
+  `profile refresh`。
+- desktop-profile 的源进程存活校验把"env 值仍然有效"和"抓取时的 pid 还活着"
+  绑死在一起，而实测两代 server 的 profile env 逐字节相同。
+
+源码研究（开源仓库 zai-org/ZCode，结合本机 `~/.zcode/server/zcode-server.cjs`
+v3.14.3 bundle 反查）确认的进程拓扑事实：
+
+- 桌面本地任务：host 进程（argv[0] 改名 `zcode-host-local-N`）经
+  `ZCodeAgentProcessManager` spawn **同一个** `zcode.cjs app-server --stdio`。
+  zcode-acp 本来就是"另一个壳"，后端进程与桌面完全相同。
+- 远程任务：桌面把 server bundle 部署到远端 `~/.zcode/server/`，SSH exec
+  `node zcode-server.cjs`（stdio 模式），随后该 server 作为 ServiceCollection
+  owner 托管 agent 运行时、设备身份（deviceMid）与 provider provisioning，
+  按 workspace spawn app-server 子进程。
+- server 有两个官方入口：`entry-stdio.ts`（桌面远程连接在用）与
+  `entry-http.ts`（Web 客户端在用，`PORT` + `ZCODE_SERVER_AUTH_TOKEN`）。
+- stdio 间通信是 unix socketpair（libuv pipe 底层），**socket 无法经
+  /proc/<pid>/fd 重开（ENXIO）**——复用桌面"正在用"的那个 server 实例不可行，
+  也不必（它命悬 sshd-session）。
+
+## 决策
+
+zcode-acp 增加 **zserver 模式**：直接拉起本机已安装的
+`~/.zcode/server/zcode-server.cjs`（stdio 模式），由 zcode-acp 充当该 server
+的通道客户端（与桌面端在远程连接中的角色一致）。
+
+- **不 vendor 任何代码**：协议客户端（帧、序列化、ChannelClient）在
+  `src/backend/zserver/` 中按开源仓库 `packages/rpc` 的线格式自行实现；
+  server 产物直接用本机 `~/.zcode/server/` 下已部署的文件，不复制不下载。
+- **身份 env 在 spawn 时一次性注入**（复用 desktop-profile 捕获），server 的
+  生命周期由 zcode-acp 拥有，与桌面是否连接彻底解耦。
+- 通道：`zcode-agent`（`ServiceChannels.ZCodeAgent`）。服务适配遵循
+  `ProxyChannel` 约定：方法 = 位置参数数组（`handler[command](...args)`），
+  事件 = `onXxx`（`on` 后跟大写字母）；`onDynamic*` 为动态事件。
+
+### 线协议事实（M0 实测，供后续维护）
+
+1. 握手（行模式）：server 在 stdout 打印一行
+   `{"type":"zcode-hello",version,platform,arch,pid}`；客户端回写一行
+   `{"type":"zcode-hello-ack",version,clientId}`（`helloAckMessageSchema`：
+   clientId 非空字符串）。握手前的 SSH banner/MOTD 行必须跳过。
+2. 帧：13 字节头 `type(1)|id(4BE)|ack(4BE)|len(4BE)` + payload；RPC 只走
+   Regular(1)。收帧必须"整帧到齐才消费"（对端实现有 peek-先于-消费的修复，
+   我们同样如此）。
+3. 序列化：1 字节 DataType 标签（Undefined=0/String=1/Buffer=2/VSBuffer=3/
+   Array=4/Object=5/Int=6）+ VQL（7-bit varint）长度；Object 走 JSON，
+   嵌套 Uint8Array 用 `__zcode_rpc_nested_uint8array_v1` base64 标记。
+   注意 `subarray(pos, pos += ri())` 这类求值顺序坑（两处实现都曾中招）。
+4. 消息：请求 = `serialize([100|101|102|103, id, channelName, name])` +
+   `serialize(arg)`；响应 = `serialize([200..204, id])` + `serialize(data)`。
+   server 构造完 ChannelServer 后立即发 Initialize(200)，客户端必须等它。
+5. 已知服务面（v3.14.3 facade）：`initialize / createTask / sendPrompt /
+stopGeneration / compactSession / goalSession / respondPermission /
+respondElicitation / resumeTask / closeTask / deliverSessionMessage / …`；
+   `initialize({workspacePath})` 返回
+   `{available, workspaceKey, protocolName, protocolVersion, transportKind}`。
+
+### 粗糙边缘（server 侧，避免踩坑）
+
+- `ProxyChannel.fromService` 对**未知事件名同步 throw**，会把整个 server 进程
+  砸掉（实测）。订阅事件名必须先从服务面确认。
+- 未知 channel 的请求会被缓冲 1 秒后报 `Unknown channel`，不会崩。
+
+## 备选方案
+
+- **/proc/<pid>/fd 注入桌面进程的 stdio**：否决。两形态的 stdio 都是
+  socketpair，内核禁止经 /proc 重开（ENXIO）；即便回退到管道形态，响应流
+  单读端被 host 独占，两个读者抢字节做不成任何请求/响应协议（已实验证明）。
+- **仅放宽 desktop-profile 存活校验（stale 回退）**：保留为 fallback 班底，
+  但它不解决"server 全死"窗口，且每 spawn 都要重新校验身份。
+- **entry-http + WS**：与 stdio 同级的合法对接口，留作后续多客户端场景的
+  演进方向；stdio 模式与桌面远程连接的路径完全同构，先做它。
+
+## 分阶段
+
+- **M0（已完成，活体验证）**：`src/backend/zserver/` 传输栈
+  （帧/序列化/ChannelClient/连接握手）+ 单测 + `scripts/zserver-probe.mjs`。
+  活体验证：真实 `~/.zcode/server/zcode-server.cjs` + desktop profile env，
+  握手 1.9s，`initialize` 返回 available=true。
+- **M1a（已完成，任务面考古 + 真实调用打通到最后一环）**：
+  `scripts/zserver-turn-probe.mjs`。已实测确认的服务面与流程：
+  - channel **`zcode-task`**（任务 facade）：`createTask / sendPrompt /
+respondPermission / respondElicitation / closeTask / stopGeneration /
+compactSession / goalSession` + 动态事件 `onDynamicStreamEvent(taskId) /
+onDynamicTaskEvent({taskId,…}) / onDynamicTaskReady(taskId) /
+onDynamicTaskTerminalOutcome(taskId) / onDynamicSessionEvent /
+onDynamicWorkspaceEvent`。
+  - channel **`zcode-agent`**（内层 agent 服务）：`createSession({workspacePath})`
+    返回完整快照（`session/settings/projection/messages/slashCommands`…）。
+  - `sendPrompt` 的 `content` 是**纯字符串**（非内容块数组）；`taskId` 即
+    session id（`sess_*`）；事件订阅必须先于 sendPrompt（动态事件 `onDynamic*`
+    携参返回 Event）。
+- **M1b（当前阻塞点，方案已定位）**：真实一轮对话卡在
+  `session/requestRuntimePreferences`。desktop-attached-remote 权威模式下，
+  server 不自答该请求，而是 fire `sessionRuntimePreferencesRequestEmitter`
+  转发给**客户端连接作用域**（`createZCodeAgentConnectionScope(role:
+"trusted-host-relay")`——一个 V4 帧路由器：clientHello 身份声明、ownership、
+  flow-control、订阅路由）。实测：不实现该中继客户端时 agent 拿不到 runtime
+  preferences → `session/create` 超时/缺席 → `sendText` 在 agent sqlite 报
+  `FOREIGN KEY constraint failed`（`message.session_id → session(id)` 无行，
+  已用 `~/.zcode/cli/db/db.sqlite` 查询证实）。强制
+  `ZCODE_SERVICE_AUTHORITY_MODE=local` 无法绕过：server 经中继握手与
+  `initializeRuntimeProcessEnv` 的 env patch 重新注入
+  `desktop-attached-remote`（agent `/proc/<pid>/environ` 实证）。
+  **M1b 工作**：实现 trusted-host-relay 客户端——Initialize 后发送 V4
+  clientHello（connectionId + clientMode "desktop-continuous" + 下游声明），
+  订阅中继帧并应答 `session/requestRuntimePreferences`（server local 模式的
+  默认值可作首版应答：`{askUserQuestionAutoResolutionEnabled: true,
+nativeSearchEnhancementsEnabled: true, memoryEnabled: false}`），以及
+  permission/elicitation 的 `resolveInteraction` host-command 往返。作用域
+  源码在 bundle 内可读（`createZCodeAgentConnectionScope`，~9KB）。
+- **M2**：backend 选择开关（如 `ZCODE_ACP_BACKEND=zserver`），zserver 模式
+  稳定后讨论是否设为默认；desktop-profile 保留为 env 来源。
+
+## 后果
+
+- 正面：后端生命周期归 zcode-acp，桌面断连/升级不再打断或失效；身份注入
+  每次 server 启动仅一次；与桌面共享同一 server artifact（版本随部署走），
+  无需自备后端代码。
+- 代价：backend 层新增一条协议栈与映射层（M1 的主要工作量）；server bundle
+  版本漂移时线协议可能变化——M0 已把全部线格式固化为带向量测试的代码，
+  漂移时测试先行报警。
