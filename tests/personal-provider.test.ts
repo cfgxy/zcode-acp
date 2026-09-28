@@ -25,7 +25,7 @@ vi.mock("node:fs", async () => {
   return {
     ...actual,
     existsSync: (p: string) => files.has(p),
-    readFileSync: (p: string, enc?: string) => {
+    readFileSync: (p: string, _enc?: string) => {
       if (files.has(p)) return files.get(p);
       const err = new Error(`ENOENT: ${p}`) as NodeJS.ErrnoException;
       err.code = "ENOENT";

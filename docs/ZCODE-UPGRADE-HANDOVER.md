@@ -130,6 +130,14 @@ provider-registry: sync failed: Method not found: workspace/updateProviderRegist
 zcode-acp profile refresh   # 需先重建 dist（zcode-acp 软链 → 本仓库 dist/cli.js）
 ```
 
+profile 捕获兼容两种运行时宿主（2026-09-28 起，`src/desktop-profile.ts`
+的 `isRuntimeHostProcess`）：远程附着形态的 `zcode-server.cjs`
+（`~/.zcode/server/` 部署包）与桌面本机形态的 `zcode-host-local-<N>`
+（Electron 子进程，argv[0] 改名，comm 截断为 15 字符的 `zcode-host-loca`
+故按前缀匹配）。两种环境下 `zcode-acp` 都能直接从活进程重抓身份环境变量。
+`zcode-acp profile export [file]` 走同一捕获路径输出 JSON（stdout 或
+0600 文件），供检查/备份/跨机器比对。
+
 ### 2. provider_config.json 的 GLM 个人套餐条目（已自动化）
 
 `zcode-acp profile refresh` 现在自动确保该条目存在（`src/config/personal-provider.ts`

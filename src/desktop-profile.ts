@@ -213,6 +213,25 @@ function processMatches(runtime: DesktopProfileRuntime, pid: number, name: strin
   return comm === name || cmdline.some((token) => path.basename(token) === name);
 }
 
+/** The deployed remote-server bundle (`~/.zcode/server/zcode-server.cjs`). */
+const SERVER_PROCESS_NAME = "zcode-server.cjs";
+/** Desktop host processes rename argv[0] to `zcode-host-local[-N]` / `zcode-host-remote[-N]`. */
+const HOST_PROCESS_NAME_PATTERN = /^zcode-host-(local|remote)/;
+
+/**
+ * Runtime-host ancestor test covering both forms that spawn zcode-cli: the
+ * remote-attached server bundle (`zcode-server.cjs`) and the desktop-local
+ * host (`zcode-host-local-1`, an Electron child with a renamed argv[0]).
+ * Linux truncates comm to 15 chars ("zcode-host-local-1" → "zcode-host-loca"),
+ * so the comm check stays prefix-based while argv keeps the full name.
+ */
+function isRuntimeHostProcess(runtime: DesktopProfileRuntime, pid: number): boolean {
+  const cmdline = read(runtime, `/proc/${pid}/cmdline`).split("\0").filter(Boolean);
+  if (cmdline.some((token) => path.basename(token) === SERVER_PROCESS_NAME)) return true;
+  if (read(runtime, `/proc/${pid}/comm`).trim().startsWith("zcode-host-")) return true;
+  return cmdline.some((token) => HOST_PROCESS_NAME_PATTERN.test(path.basename(token)));
+}
+
 function findServerAncestor(
   runtime: DesktopProfileRuntime,
   pid: number,
@@ -222,7 +241,7 @@ function findServerAncestor(
   for (let depth = 0; current > 1 && depth < 64 && !visited.has(current); depth++) {
     visited.add(current);
     const stat = readProcStat(runtime, current);
-    if (processMatches(runtime, current, "zcode-server.cjs")) {
+    if (isRuntimeHostProcess(runtime, current)) {
       return { pid: current, startTime: stat.startTime };
     }
     current = stat.parentPid;

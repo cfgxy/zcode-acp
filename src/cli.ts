@@ -12,13 +12,19 @@
  * user (or editor config) actually typed.
  */
 
+import { writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import process from "node:process";
 
 import { main as runHub } from "./bin/hub.js";
 import { main as runQuota } from "./bin/quota.js";
 import { main as runServer } from "./index.js";
-import { DesktopProfileError, loadDesktopProfile, refreshDesktopProfile } from "./desktop-profile.js";
+import {
+  captureDesktopProfile,
+  DesktopProfileError,
+  loadDesktopProfile,
+  refreshDesktopProfile,
+} from "./desktop-profile.js";
 import {
   ensurePersonalGlmProvider,
   personalProviderConfigPath,
@@ -34,6 +40,7 @@ export type Invocation =
   | { kind: "server" }
   | { kind: "hub" }
   | { kind: "profile-refresh" }
+  | { kind: "profile-export"; path?: string }
   | { kind: "quota"; args: string[] }
   | { kind: "unknown"; sub: string };
 
@@ -63,10 +70,13 @@ export function resolveInvocation(invokedAs: string, argv: readonly string[]): I
       return { kind: "hub" };
     case "quota":
       return { kind: "quota", args: argv.slice(1) };
-    case "profile":
-      return argv[1] === "refresh" && argv.length === 2
-        ? { kind: "profile-refresh" }
-        : { kind: "unknown", sub: argv.join(" ") };
+    case "profile": {
+      if (argv[1] === "refresh" && argv.length === 2) return { kind: "profile-refresh" };
+      if (argv[1] === "export" && argv.length <= 3) {
+        return { kind: "profile-export", path: argv[2] };
+      }
+      return { kind: "unknown", sub: argv.join(" ") };
+    }
     default:
       return { kind: "unknown", sub };
   }
@@ -84,7 +94,11 @@ Commands:
                     -i <sec>, -d detail, -p plain, provider glm|go.
   hub               Run the remote-access hub daemon (was zcode-acp-hub;
                     usually auto-spawned by bridges, rarely run by hand).
-  profile refresh   Capture the active Linux ZCode Desktop profile.
+  profile refresh   Capture the active Linux ZCode runtime-host profile
+                    (desktop zcode-host-local or remote zcode-server form).
+  profile export [file]
+                    Capture and print/save the same profile as JSON (stdout
+                    when no file is given).
   server            The editor-facing ACP bridge over stdio (was
                     zcode-acp-server; editors normally launch it via the bin
                     alias without this subcommand).
@@ -97,6 +111,7 @@ Examples:
   zcode-acp                                # chat interactively in this repo
   zcode-acp quota -w                       # live usage monitor
   zcode-acp profile refresh                # refresh desktop attachment
+  zcode-acp profile export profile.json    # snapshot identity env to a file
   zcode-acp server                         # stdio bridge (for testing)`;
 
 async function main(): Promise<void> {
@@ -142,6 +157,9 @@ async function main(): Promise<void> {
       }
       ensureGlmPersonalProviderAfterRefresh();
       return;
+    case "profile-export":
+      exportDesktopProfile(invocation.path);
+      return;
     case "quota":
       await runQuota(invocation.args);
       return;
@@ -150,6 +168,32 @@ async function main(): Promise<void> {
       process.stdout.write(HELP_TEXT + "\n");
       process.exit(1);
   }
+}
+
+/**
+ * Capture the live runtime-host profile (works for both the remote-attached
+ * `zcode-server.cjs` form and the desktop `zcode-host-local` form — see
+ * desktop-profile.ts) and emit it as JSON to stdout or a 0600 file, for
+ * inspection and backup. Same capture path as refresh; only the destination
+ * differs, so refresh failures reproduce here verbatim.
+ */
+function exportDesktopProfile(filePath?: string): void {
+  let json: string;
+  try {
+    json = `${JSON.stringify(captureDesktopProfile(), null, 2)}\n`;
+  } catch (error) {
+    process.stderr.write(
+      `zcode-acp: ${error instanceof DesktopProfileError ? error.message : "desktop profile invalid"}\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  if (filePath === undefined) {
+    process.stdout.write(json);
+    return;
+  }
+  writeFileSync(filePath, json, { mode: 0o600 });
+  process.stdout.write(`${filePath}\n`);
 }
 
 /**
@@ -168,13 +212,20 @@ function ensureGlmPersonalProviderAfterRefresh(): void {
   } catch {
     providerPath = personalProviderConfigPath();
   }
-  const outcome: PersonalProviderOutcome = ensurePersonalGlmProvider(providerPath, ZCODE_CREDS_PATH);
+  const outcome: PersonalProviderOutcome = ensurePersonalGlmProvider(
+    providerPath,
+    ZCODE_CREDS_PATH,
+  );
   switch (outcome.status) {
     case "added":
-      process.stdout.write(`personal provider: GLM Coding Plan entry re-added (${outcome.providerId})\n`);
+      process.stdout.write(
+        `personal provider: GLM Coding Plan entry re-added (${outcome.providerId})\n`,
+      );
       break;
     case "present":
-      process.stdout.write(`personal provider: GLM Coding Plan entry present (${outcome.providerId})\n`);
+      process.stdout.write(
+        `personal provider: GLM Coding Plan entry present (${outcome.providerId})\n`,
+      );
       break;
     case "skipped":
       process.stdout.write(`personal provider: not touched — ${outcome.reason}\n`);

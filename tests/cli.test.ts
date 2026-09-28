@@ -31,6 +31,14 @@ describe("resolveInvocation", () => {
     expect(resolveInvocation("cli.js", ["profile", "refresh"])).toEqual({
       kind: "profile-refresh",
     });
+    expect(resolveInvocation("cli.js", ["profile", "export"])).toEqual({
+      kind: "profile-export",
+      path: undefined,
+    });
+    expect(resolveInvocation("cli.js", ["profile", "export", "/tmp/profile.json"])).toEqual({
+      kind: "profile-export",
+      path: "/tmp/profile.json",
+    });
     expect(resolveInvocation("cli.js", ["quota"])).toEqual({ kind: "quota", args: [] });
     expect(resolveInvocation("cli.js", ["quota", "-w", "glm"])).toEqual({
       kind: "quota",
@@ -63,6 +71,10 @@ describe("resolveInvocation", () => {
     expect(resolveInvocation("cli.js", ["profile", "refresh", "extra"])).toEqual({
       kind: "unknown",
       sub: "profile refresh extra",
+    });
+    expect(resolveInvocation("cli.js", ["profile", "export", "a", "b"])).toEqual({
+      kind: "unknown",
+      sub: "profile export a b",
     });
   });
 });
