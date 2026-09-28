@@ -6,6 +6,7 @@ import path from "node:path";
 import { log, warn } from "../../utils.js";
 import { decodeMessage, encodeFrame, encodeMessage, FrameDecoder } from "./protocol.js";
 import { ZServerConnection } from "./connection.js";
+import { runtimeEnvWithProfile } from "./backend.js";
 
 export const DEFAULT_BROKER_SOCKET = path.join(
   process.env.XDG_RUNTIME_DIR || path.join(os.homedir(), ".zcode"),
@@ -14,7 +15,9 @@ export const DEFAULT_BROKER_SOCKET = path.join(
 
 const CLIENT_IDLE_EXIT_MS = Number(process.env.ZCODE_ACP_ZSERVER_BROKER_IDLE_EXIT_MS ?? 0) || 0;
 /** Per-client inbound cap: a frame claiming more than this is a hostile/misbehaving peer. */
-const MAX_CLIENT_BUFFER_BYTES = 64 * 1024 * 1024;
+function maxClientBufferBytes(): number {
+  return Number(process.env.ZCODE_ACP_ZSERVER_MAX_CLIENT_BUFFER ?? 0) || 64 * 1024 * 1024;
+}
 
 interface ClientEntry {
   socket: Socket;
@@ -22,7 +25,6 @@ interface ClientEntry {
   idByClient: Map<number, number>;
   /** client-side request id → server-side request id (translate cancel/dispose). */
   serverIdByClient: Map<number, number>;
-  nextServerId: number;
 }
 
 /**
@@ -46,6 +48,10 @@ export class ZServerBroker {
   private stopped = false;
   private readonly clients = new Map<number, ClientEntry>();
   private nextClientId = 1;
+  /** Server-side id space is broker-global: per-client counters would collide
+   *  (two clients' EventListen rewriting to id 1 collapse into ONE server-side
+   *  subscription, and event routing becomes first-match ambiguity). */
+  private nextServerId = 1;
   private idleTimer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -95,7 +101,7 @@ export class ZServerBroker {
         const connection = await ZServerConnection.spawn({
           serverRoot: this.serverRoot,
           clientId: "zserver-broker",
-          env: process.env,
+          env: await runtimeEnvWithProfile(process.env),
         });
         connection.onExit((code, signal) => {
           warn(
@@ -154,7 +160,6 @@ export class ZServerBroker {
       socket,
       idByClient: new Map(),
       serverIdByClient: new Map(),
-      nextServerId: 1,
     };
     this.clients.set(clientId, entry);
     log(`zserver-broker: client ${clientId} attached (${this.clients.size} attached)`);
@@ -166,15 +171,12 @@ export class ZServerBroker {
     const decoder = new FrameDecoder((payload) => {
       void this.routeClientFrame(entry, payload);
     });
-    let buffered = 0;
     socket.on("data", (chunk: Buffer) => {
-      buffered += chunk.byteLength;
-      if (buffered > MAX_CLIENT_BUFFER_BYTES) {
+      decoder.push(chunk);
+      if (decoder.byteLength > maxClientBufferBytes()) {
         warn(`zserver-broker: client ${clientId} exceeded frame buffer limit — disconnecting`);
         socket.destroy();
-        return;
       }
-      decoder.push(chunk);
     });
     socket.once("close", () => {
       this.clients.delete(clientId);
@@ -221,7 +223,7 @@ export class ZServerBroker {
         entry.serverIdByClient.delete(clientRequestId);
         entry.idByClient.delete(serverId);
       } else {
-        const serverId = entry.nextServerId++;
+        const serverId = this.nextServerId++;
         entry.idByClient.set(serverId, clientRequestId);
         entry.serverIdByClient.set(clientRequestId, serverId);
         header[1] = serverId;

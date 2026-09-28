@@ -64,6 +64,11 @@ export class FrameDecoder {
 
   constructor(private readonly onMessage: (payload: Buffer) => void) {}
 
+  /** Bytes currently buffered awaiting complete frames (backpressure gauge). */
+  get byteLength(): number {
+    return this.totalLength;
+  }
+
   push(chunk: Buffer): void {
     if (chunk.byteLength === 0) {
       return;

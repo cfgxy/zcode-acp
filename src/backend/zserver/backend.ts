@@ -1,4 +1,5 @@
 import type { BridgeBackend, ZcodeEvent, ZcodeResponse } from "../types.js";
+import { loadDesktopChildEnvWithRefresh } from "../../desktop-profile.js";
 import { warn } from "../../utils.js";
 import type { EventListenerLike } from "../types.js";
 import { ServiceChannel, ZServerConnection } from "./index.js";
@@ -20,6 +21,22 @@ export interface ZServerBackendOptions {
  * extensions) lands incrementally — unsupported methods fail with a visible
  * "not supported in zserver mode" error instead of misbehaving silently.
  */
+/**
+ * Best-effort desktop identity pins: when a desktop profile is capturable,
+ * merge its env over the base so the spawned server (and its agents) carry the
+ * desktop-attached identity markers; otherwise the server runs in local
+ * authority mode, which is a verified-working fallback (billing resolves via
+ * ~/.zcode/v2/config.json either way).
+ */
+export async function runtimeEnvWithProfile(base: NodeJS.ProcessEnv): Promise<NodeJS.ProcessEnv> {
+  try {
+    const pins = loadDesktopChildEnvWithRefresh();
+    return { ...base, ...pins };
+  } catch {
+    return base;
+  }
+}
+
 export class ZServerBackend implements BridgeBackend {
   isDead = false;
   deathReason: string | null = null;
@@ -31,6 +48,8 @@ export class ZServerBackend implements BridgeBackend {
   /** Per-session streaming state: emitted text length per assistant row. */
   private readonly emittedByRow = new Map<string, number>();
   private seqBySession = new Map<string, number>();
+  /** Sessions with live server-side subscriptions (conversation/terminal/state). */
+  private readonly subscribedSessions = new Set<string>();
   private spawnPromise: Promise<void> | null = null;
   private idleTimer: NodeJS.Timeout | null = null;
   /** Idle ms before the server child is shut down (0 = keep forever). */
@@ -57,10 +76,16 @@ export class ZServerBackend implements BridgeBackend {
       : await ZServerConnection.spawn({
           serverRoot: this.options.serverRoot,
           clientId: this.clientId,
+          env: await runtimeEnvWithProfile(process.env),
         });
     this.connection = connection;
     this.isDead = false;
     this.deathReason = null;
+    // Server-side subscriptions died with the previous connection (spawn
+    // mode: new server child; attach mode: possibly respawned shared server).
+    // Re-establish lazily via session/resume on the heal path.
+    this.subscribedSessions.clear();
+    this.emittedByRow.clear();
     connection.onExit((code, signal) => {
       this.isDead = true;
       this.deathReason = `zcode server exited (code=${code ?? "null"} signal=${signal ?? "null"})`;
@@ -182,7 +207,12 @@ export class ZServerBackend implements BridgeBackend {
       case "session/load":
       case "session/resume": {
         const target = this.workspaceBySession.get(sessionId) ?? workspacePath;
-        return await agentChannel.call("readSession", { workspacePath: target, sessionId });
+        const result = await agentChannel.call("readSession", { workspacePath: target, sessionId });
+        // The heal path resumes after a backend restart; server-side
+        // subscriptions died with the old connection — re-establish them so
+        // the turn loop sees events again (idempotent via subscribedSessions).
+        this.subscribeConversation(connection, target, sessionId);
+        return result;
       }
       case "session/list": {
         const metas = (await tasks.call("listTasks", {})) as {
@@ -208,6 +238,10 @@ export class ZServerBackend implements BridgeBackend {
     workspacePath: string,
     sessionId: string,
   ): void {
+    // One server-side subscription per session per connection; re-calling
+    // (resume after heal) must not stack duplicate EventListen requests.
+    if (this.subscribedSessions.has(sessionId)) return;
+    this.subscribedSessions.add(sessionId);
     const agentChannel: ServiceChannel = connection.channelOf("zcode-agent");
     const deliver = (event: {
       type: ZcodeEvent["type"];

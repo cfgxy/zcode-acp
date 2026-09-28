@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { connect } from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -129,6 +130,78 @@ describe("ZServerBroker event multiplexing", () => {
       await broker.stop();
     } finally {
       delete process.env.ZSERVER_FAKE_DIE_AFTER_MS;
+    }
+  });
+});
+
+describe("ZServerBroker cross-client isolation", () => {
+  it("keeps two simultaneous subscriptions independent (no id-space collision)", async () => {
+    const socketPath = path.join(os.tmpdir(), `zserver-broker-test5-${Date.now()}.sock`);
+    sockets.push(socketPath);
+    const broker = new ZServerBroker(socketPath, makeServerRoot());
+    await broker.start();
+
+    const a = await ZServerConnection.attach({ socketPath, clientId: "sub-a" });
+    const b = await ZServerConnection.attach({ socketPath, clientId: "sub-b" });
+    try {
+      const seenA: unknown[] = [];
+      const seenB: unknown[] = [];
+      const unsubA = a.listen("onTick", undefined, (d) => seenA.push(d));
+      const unsubB = b.listen("onTick", undefined, (d) => seenB.push(d));
+      await new Promise((r) => setTimeout(r, 350));
+      unsubA();
+      unsubB();
+      // With per-client server-id counters both subscriptions rewrote to the
+      // same server id — the server collapsed them into one and only the
+      // first-match client ever saw events.
+      expect(seenA.length).toBeGreaterThanOrEqual(3);
+      expect(seenB.length).toBeGreaterThanOrEqual(3);
+    } finally {
+      a.dispose();
+      b.dispose();
+      await broker.stop();
+    }
+  });
+
+  it("disconnects a client whose buffered frames exceed the cap", async () => {
+    const socketPath = path.join(os.tmpdir(), `zserver-broker-test6-${Date.now()}.sock`);
+    sockets.push(socketPath);
+    process.env.ZCODE_ACP_ZSERVER_MAX_CLIENT_BUFFER = "1024";
+    try {
+      const broker = new ZServerBroker(socketPath, makeServerRoot());
+      await broker.start();
+      // Prime the shared server with one proper attach so the socket is warm.
+      const primer = await ZServerConnection.attach({ socketPath, clientId: "primer" });
+      primer.dispose();
+      // Raw socket: a Regular frame header claiming a 1MB body plus 2KB of it.
+      // The decoder buffers the partial frame past the 1KB cap → disconnect.
+      const raw = connect(socketPath);
+      await new Promise<void>((resolve, reject) => {
+        raw.once("connect", resolve);
+        raw.once("error", reject);
+      });
+      const rawEvents: string[] = [];
+      for (const ev of ["end", "error", "close"]) {
+        raw.on(ev, (e?: Error) => rawEvents.push(`${ev}:${(e as { code?: string })?.code ?? ""}`));
+      }
+      const header = Buffer.alloc(13);
+      header.writeUInt8(1, 0);
+      header.writeUInt32BE(1024 * 1024, 9);
+      raw.write(header);
+      raw.write(Buffer.alloc(2048));
+      // Broker-side observable: the cap-exceeded client's entry must be dropped
+      // (its socket destroyed). Note: the client-side socket events are not
+      // reliably observable inside the vitest worker (same code delivers them
+      // under plain node), so assert on the broker's own bookkeeping.
+      const clientsOf = () => (broker as unknown as { clients: Map<number, unknown> }).clients.size;
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline && clientsOf() > 0) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      raw.destroy();
+      expect(clientsOf()).toBe(0);
+    } finally {
+      delete process.env.ZCODE_ACP_ZSERVER_MAX_CLIENT_BUFFER;
     }
   });
 });
