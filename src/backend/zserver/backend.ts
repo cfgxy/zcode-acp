@@ -32,6 +32,9 @@ export class ZServerBackend implements BridgeBackend {
   private readonly emittedByRow = new Map<string, number>();
   private seqBySession = new Map<string, number>();
   private spawnPromise: Promise<void> | null = null;
+  private idleTimer: NodeJS.Timeout | null = null;
+  /** Idle ms before the server child is shut down (0 = keep forever). */
+  private readonly idleMs = Number(process.env.ZCODE_ACP_ZSERVER_IDLE_MS ?? 0) || 0;
 
   constructor(
     private readonly options: ZServerBackendOptions = {},
@@ -48,10 +51,13 @@ export class ZServerBackend implements BridgeBackend {
   }
 
   private async spawn(): Promise<void> {
-    const connection = await ZServerConnection.spawn({
-      serverRoot: this.options.serverRoot,
-      clientId: this.clientId,
-    });
+    const socketPath = process.env.ZCODE_ACP_ZSERVER_SOCKET;
+    const connection = socketPath
+      ? await ZServerConnection.attach({ socketPath, clientId: this.clientId })
+      : await ZServerConnection.spawn({
+          serverRoot: this.options.serverRoot,
+          clientId: this.clientId,
+        });
     this.connection = connection;
     this.isDead = false;
     this.deathReason = null;
@@ -61,6 +67,7 @@ export class ZServerBackend implements BridgeBackend {
       // Reject in-flight work visibly; the supervision path classifies it.
       warn(`backend: ${this.deathReason}`);
     });
+    this.armIdleTimer();
     // Forwarded runtime-preferences requests (desktop-attached-remote
     // authority): answer with the server's own local-mode defaults so
     // session/create completes. No-op under local authority (never fires).
@@ -84,6 +91,25 @@ export class ZServerBackend implements BridgeBackend {
     });
   }
 
+  /**
+   * Idle reclamation: with zero registered session listeners the server child
+   * holds ~120MB + agent processes for nothing, so it is shut down after
+   * ZCODE_ACP_ZSERVER_IDLE_MS (0 = keep forever) and lazily respawned on the
+   * next request.
+   */
+  private armIdleTimer(): void {
+    if (!this.idleMs) return;
+    if (this.idleTimer) clearTimeout(this.idleTimer);
+    this.idleTimer = setTimeout(() => {
+      if (this.listeners.size > 0) {
+        this.armIdleTimer();
+        return;
+      }
+      void this.close();
+    }, this.idleMs);
+    this.idleTimer.unref?.();
+  }
+
   /** app-server JSON-RPC surface emulation. Resolves {result} or {error}. */
   async request(
     id: number,
@@ -91,6 +117,7 @@ export class ZServerBackend implements BridgeBackend {
     params: Record<string, unknown> = {},
     _timeoutMs = 15000,
   ): Promise<ZcodeResponse> {
+    this.armIdleTimer();
     try {
       const connection = await this.ensureConnection();
       const result = await this.route(connection, method, params);

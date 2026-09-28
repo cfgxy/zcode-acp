@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { spawn, type ChildProcess } from "node:child_process";
+import { connect as netConnect } from "node:net";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { existsSync } from "node:fs";
 import os from "node:os";
@@ -61,50 +62,62 @@ export class ZServerConnection {
   private readonly exitFailure: Promise<never>;
   private exitReject!: (error: Error) => void;
   private rawBuffer: Buffer = Buffer.alloc(0);
-  private lineMode = true;
+  /** Hello line handshake only applies to spawn; attach starts framed. */
+  private lineMode: boolean;
+  private readonly rawFrameListeners = new Set<(payload: Buffer) => void>();
   private onHelloLine: ((line: string) => void) | null = null;
   private exited = false;
 
   private constructor(
-    readonly child: ChildProcessWithoutNullStreams,
+    readonly child: ChildProcess | null,
     readonly serverRoot: string,
     readonly clientId: string,
+    private readonly io: {
+      writeFrame(payload: Buffer): void;
+      shutdown(): void;
+      bind(onStdout: (chunk: Buffer) => void, onStderr: (chunk: Buffer) => void): void;
+      onExit(cb: (detail: string) => void): void;
+    },
   ) {
     this.exitFailure = new Promise<never>((_, reject) => {
       this.exitReject = reject;
     });
+    this.lineMode = child !== null;
     // A rejected exitFailure with no active handshake awaiting it would crash
     // the process on unhandledRejection — keep a no-op catch attached (same
     // contract as the broadcast loser promises in remote/broadcast.ts).
     this.exitFailure.catch(() => undefined);
     this.client = new ChannelClient((payload) => {
-      if (!this.exited && this.child.stdin.writable) {
-        this.child.stdin.write(encodeFrame(payload));
+      if (!this.exited) {
+        this.io.writeFrame(encodeFrame(payload));
       }
     });
     this.channel = new ServiceChannel(this.client, DEFAULT_CHANNEL);
     this.frameDecoder = new FrameDecoder((payload) => {
       this.client.onMessage(decodeMessage(payload));
+      for (const listener of [...this.rawFrameListeners]) {
+        try {
+          listener(payload);
+        } catch {
+          /* tap errors must not kill the connection */
+        }
+      }
     });
-    this.child.stdout!.on("data", (chunk: Buffer) => this.onStdout(chunk));
-    this.child.stderr!.on("data", (chunk: Buffer) => this.onStderr(chunk));
-    this.child.once("exit", (code, signal) => {
+    this.io.bind(
+      (chunk) => this.onStdout(chunk),
+      (chunk) => this.onStderr(chunk),
+    );
+    this.io.onExit((detail) => {
       this.exited = true;
-      const detail = this.stderrTail.at(-1) ? `: ${this.stderrTail.at(-1)}` : "";
-      this.exitReject(
-        new ZServerConnectionError(
-          "hello",
-          `zcode server exited (code=${code ?? "null"} signal=${signal ?? "null"})${detail}`,
-        ),
-      );
+      const tail = this.stderrTail.at(-1) ? `: ${this.stderrTail.at(-1)}` : "";
+      this.exitReject(new ZServerConnectionError("hello", `zcode server exited: ${detail}${tail}`));
       this.client.dispose(
-        Object.assign(
-          new Error(`zcode server exited (code=${code ?? "null"} signal=${signal ?? "null"})`),
-          { name: "ConnectionClosed" },
-        ),
+        Object.assign(new Error(`zcode server exited: ${detail}${tail}`), {
+          name: "ConnectionClosed",
+        }),
       );
       for (const handler of [...this.exitHandlers]) {
-        handler(code, signal);
+        handler(null, null);
       }
     });
   }
@@ -131,8 +144,41 @@ export class ZServerConnection {
       child,
       serverRoot,
       options.clientId ?? `zcode-acp-${process.pid}`,
+      childIo(child),
     );
     await connection.handshake(options.version ?? "0.0.0");
+    return connection;
+  }
+
+  /**
+   * Attach to an already-running zcode-server channel broker over a unix
+   * socket (machine-level server reuse, ADR-0008). The broker synthesizes the
+   * Initialize frame per attach — no hello handshake on this path.
+   */
+  static async attach(options: {
+    socketPath: string;
+    clientId?: string;
+    serverRoot?: string;
+  }): Promise<ZServerConnection> {
+    const socket = netConnect(options.socketPath);
+    await new Promise<void>((resolve, reject) => {
+      socket.once("connect", resolve);
+      socket.once("error", reject);
+    });
+    const clientId = options.clientId ?? `zcode-acp-${process.pid}`;
+    const connection = new ZServerConnection(null, options.serverRoot ?? "", clientId, {
+      writeFrame: (payload) => socket.write(payload),
+      shutdown: () => socket.end(),
+      bind: (onStdout, _onStderr) => {
+        socket.on("data", (chunk) => onStdout(chunk));
+      },
+      onExit: (cb) => socket.once("close", () => cb("socket closed")),
+    });
+    await Promise.race([
+      connection.client.whenInitialized(),
+      connection.exitFailure,
+      timeout(READY_TIMEOUT_MS, "ready"),
+    ]);
     return connection;
   }
 
@@ -140,8 +186,11 @@ export class ZServerConnection {
     // Phase 1 — hello: the server prints a zcode-hello JSON line on stdout
     // (after any SSH banner noise) and waits up to 10s for the ack line.
     await Promise.race([this.awaitHello(), this.exitFailure, timeout(HELLO_TIMEOUT_MS, "hello")]);
-    this.child.stdin.write(
-      `${JSON.stringify({ type: "zcode-hello-ack", version, clientId: this.clientId })}\n`,
+    this.io.writeFrame(
+      Buffer.from(
+        `${JSON.stringify({ type: "zcode-hello-ack", version, clientId: this.clientId })}\n`,
+        "utf8",
+      ),
     );
     // Phase 2 — the server constructs its ChannelServer right after the ack
     // and sends Initialize; gate first RPC on it.
@@ -175,6 +224,19 @@ export class ZServerConnection {
     });
   }
 
+  /** Send a pre-encoded channel message as one frame (broker path). */
+  rawSend(payload: Buffer): void {
+    if (!this.exited) {
+      this.io.writeFrame(encodeFrame(payload));
+    }
+  }
+
+  /** Observe every inbound Regular-frame payload (broker path). */
+  onRawFrame(listener: (payload: Buffer) => void): () => void {
+    this.rawFrameListeners.add(listener);
+    return () => this.rawFrameListeners.delete(listener);
+  }
+
   onExit(handler: ZServerExitHandler): () => void {
     this.exitHandlers.add(handler);
     return () => this.exitHandlers.delete(handler);
@@ -203,8 +265,8 @@ export class ZServerConnection {
 
   dispose(reason?: Error): void {
     this.client.dispose(reason);
-    if (!this.exited && this.child.exitCode === null && !this.child.killed) {
-      this.child.kill("SIGTERM");
+    if (!this.exited) {
+      this.io.shutdown();
     }
   }
 
@@ -246,6 +308,24 @@ export class ZServerConnection {
       }
     }
   }
+}
+
+function childIo(child: ChildProcessWithoutNullStreams) {
+  return {
+    writeFrame(payload: Buffer): void {
+      child.stdin.write(payload);
+    },
+    shutdown(): void {
+      if (child.exitCode === null && !child.killed) child.kill("SIGTERM");
+    },
+    bind(onStdout: (chunk: Buffer) => void, onStderr: (chunk: Buffer) => void): void {
+      child.stdout!.on("data", onStdout);
+      child.stderr!.on("data", onStderr);
+    },
+    onExit(cb: (detail: string) => void): void {
+      child.once("exit", (code, signal) => cb(`code=${code ?? "null"} signal=${signal ?? "null"}`));
+    },
+  };
 }
 
 function spawnChild(

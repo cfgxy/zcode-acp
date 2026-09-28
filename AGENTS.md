@@ -36,9 +36,10 @@ src/
 │   ├── credentials.ts    Reads ~/.zcode/v2/config.json for GLM API key
 │   ├── listener.ts       EventStreamListener — subscribes to session/events
 │   ├── types.ts          ZCode protocol types
-│   └── zserver/          zcode-server.cjs stdio-mode backend (ADR-0008):
-│                         frame/serialization/ChannelClient + connection;
-│                         not wired into the bridge yet (M1 pending)
+│   └── zserver/          zcode-server.cjs channel backend (ADR-0008):
+│                         frame/serialization/ChannelClient + connection/
+│                         broker (shared server over UDS) + ZServerBackend
+│                         (ZCODE_ACP_BACKEND=zserver)
 ├── handlers/             ACP method handlers
 │   ├── session.ts        session/new, session/prompt (turn loop), load, resume
 │   ├── slash.ts          Slash-command interception (/compact, /mcp, etc.)

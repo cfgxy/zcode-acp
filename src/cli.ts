@@ -41,6 +41,7 @@ export type Invocation =
   | { kind: "hub" }
   | { kind: "profile-refresh" }
   | { kind: "profile-export"; path?: string }
+  | { kind: "zserver-broker" }
   | { kind: "quota"; args: string[] }
   | { kind: "unknown"; sub: string };
 
@@ -68,6 +69,8 @@ export function resolveInvocation(invokedAs: string, argv: readonly string[]): I
       return { kind: "server" };
     case "hub":
       return { kind: "hub" };
+    case "zserver-broker":
+      return { kind: "zserver-broker" };
     case "quota":
       return { kind: "quota", args: argv.slice(1) };
     case "profile": {
@@ -92,6 +95,8 @@ Commands:
                       rows, arrow-key permission prompts. /exit quits.
   quota [args...]   Plan usage cards (was the zcode-quota bin): -w watch,
                     -i <sec>, -d detail, -p plain, provider glm|go.
+  zserver-broker    Keep one shared zcode-server alive for multiple
+                    zcode-acp clients (ZCODE_ACP_ZSERVER_SOCKET, ADR-0008).
   hub               Run the remote-access hub daemon (was zcode-acp-hub;
                     usually auto-spawned by bridges, rarely run by hand).
   profile refresh   Capture the active Linux ZCode runtime-host profile
@@ -145,6 +150,20 @@ async function main(): Promise<void> {
     case "hub":
       await runHub();
       return;
+    case "zserver-broker": {
+      const { ZServerBroker } = await import("./backend/zserver/broker.js");
+      const broker = new ZServerBroker();
+      await broker.start();
+      process.stdout.write(`zserver-broker: ready\n`);
+      // Stay alive until SIGINT/SIGTERM; stop() cleans the socket file.
+      const stop = (): void => {
+        void broker.stop().then(() => process.exit(0));
+      };
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+      await new Promise<never>(() => undefined);
+      return;
+    }
     case "profile-refresh":
       try {
         process.stdout.write(`${refreshDesktopProfile()}\n`);

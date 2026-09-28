@@ -141,8 +141,21 @@ onDynamicWorkspaceEvent`。
 nativeSearchEnhancementsEnabled: true, memoryEnabled: false}`），以及
   permission/elicitation 的 `resolveInteraction` host-command 往返。作用域
   源码在 bundle 内可读（`createZCodeAgentConnectionScope`，~9KB）。
-- **M2**：backend 选择开关（如 `ZCODE_ACP_BACKEND=zserver`），zserver 模式
-  稳定后讨论是否设为默认；desktop-profile 保留为 env 来源。
+- **M2（已完成）**：`ZCODE_ACP_BACKEND=zserver` 开关已接入
+  `server.ensureBackend`（默认路径不变）；`BridgeBackend` 接口统一
+  handlers 消费面；`ZServerBackend` 仿真 app-server RPC 面
+  （session/create|send|read|list|load|resume|stop）并把 V4 deltas 翻译为
+  app-server 事件方言（turn.started/model.streaming/turn.completed|failed）。
+  支持 `ZCODE_ACP_ZSERVER_IDLE_MS` 空闲自动回收 server 子进程。
+- **M2.5（已完成）：broker 复用**。`zcode-acp zserver-broker`（UDS：
+  `$XDG_RUNTIME_DIR/zserver-broker.sock`）保活一台共享 zcode-server，
+  多个 zcode-acp 以 `ZCODE_ACP_ZSERVER_SOCKET=<path>` attach（
+  `ZServerConnection.attach`，跳过 hello、由 broker 合成 Initialize）。
+  broker 按 id 重写路由帧（client id ↔ server id 映射，事件帧循原路
+  返回属主客户端）；runtime-preferences 必答回路收敛在 broker 一处。
+  语义注意：server 按 workspaceKey 隔离会话，同 workspace 的多客户端
+  共享任务面（个人机器场景可接受）。spawn 模式仍可作为无 broker 的
+  退化路径。
 
 ## 后果
 
