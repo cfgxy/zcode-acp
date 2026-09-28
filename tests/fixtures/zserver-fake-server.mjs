@@ -8,6 +8,10 @@
 // NOTE: executed as `<tmpdir>/zcode-server.cjs`, i.e. CommonJS — no ESM syntax.
 // `process` is a global.
 
+if (process.env.ZSERVER_FAKE_DIE_AFTER_MS) {
+  setTimeout(() => process.exit(9), Number(process.env.ZSERVER_FAKE_DIE_AFTER_MS));
+}
+
 process.stdout.write("Connecting to ssh.example.test...\n");
 process.stdout.write("Welcome to the banner.\n");
 process.stdout.write(
@@ -91,11 +95,29 @@ const decMsg = (payload) => {
   return { header, body };
 };
 
+const listeners = new Map();
 const handleFrame = (payload) => {
   const { header, body } = decMsg(payload);
   const [type, id, , name] = header;
   if (type === 100) {
     process.stdout.write(encFrame(msg([201, id], `echo:${name}:${JSON.stringify(body)}`)));
+  } else if (type === 102) {
+    // Subscribe: fire N events with the SAME listen id (EventFire semantics),
+    // then keep a ticker so unsubscribe (103) is observable.
+    let n = 0;
+    listeners.set(
+      id,
+      setInterval(() => {
+        n += 1;
+        process.stdout.write(encFrame(msg([204, id], `evt-${n}`)));
+      }, 20),
+    );
+  } else if (type === 103) {
+    const t = listeners.get(id);
+    if (t) {
+      clearInterval(t);
+      listeners.delete(id);
+    }
   }
 };
 

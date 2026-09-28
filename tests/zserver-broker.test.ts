@@ -82,3 +82,53 @@ describe("ZServerBroker", () => {
     }
   });
 });
+
+describe("ZServerBroker event multiplexing", () => {
+  it("delivers repeated EventFire frames and honors unsubscribe end-to-end", async () => {
+    const socketPath = path.join(os.tmpdir(), `zserver-broker-test3-${Date.now()}.sock`);
+    sockets.push(socketPath);
+    const broker = new ZServerBroker(socketPath, makeServerRoot());
+    await broker.start();
+
+    const client = await ZServerConnection.attach({ socketPath, clientId: "evt-client" });
+    try {
+      // decode/encode helpers from the public module to craft raw listen ids
+      const seen: unknown[] = [];
+      const unsubscribe = client.listen("onTick", undefined, (data) => seen.push(data));
+      await new Promise((r) => setTimeout(r, 300));
+      expect(seen.length).toBeGreaterThanOrEqual(3); // repeated fires, same id
+      unsubscribe();
+      const at = seen.length;
+      await new Promise((r) => setTimeout(r, 300));
+      expect(seen.length).toBe(at); // unsubscribe actually reached the server
+    } finally {
+      client.dispose();
+      await broker.stop();
+    }
+  });
+
+  it("detaches clients when the shared server dies (no silent event stall)", async () => {
+    const socketPath = path.join(os.tmpdir(), `zserver-broker-test4-${Date.now()}.sock`);
+    sockets.push(socketPath);
+    process.env.ZSERVER_FAKE_DIE_AFTER_MS = "400";
+    try {
+      const broker = new ZServerBroker(socketPath, makeServerRoot());
+      await broker.start();
+      const client = await ZServerConnection.attach({ socketPath, clientId: "victim" });
+      const closed = new Promise<void>((resolve) => {
+        client.onExit(() => resolve());
+      });
+      // The fixture kills itself; the broker must detach the client socket so
+      // the client's heal path notices (no silent event stall).
+      const detached = await Promise.race([
+        closed.then(() => "closed"),
+        new Promise((r) => setTimeout(() => r("stall"), 3000)),
+      ]);
+      expect(detached).toBe("closed");
+      client.dispose();
+      await broker.stop();
+    } finally {
+      delete process.env.ZSERVER_FAKE_DIE_AFTER_MS;
+    }
+  });
+});
