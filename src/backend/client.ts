@@ -15,6 +15,7 @@
  * workers) with `process.kill(-pid)` and leave no orphans.
  */
 
+import type { BridgeBackend } from "./types.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import process from "node:process";
@@ -76,7 +77,7 @@ function diagnosticArgs(argv: string[]): string[] {
   return argv.slice(1).map((arg) => (SAFE_DIAGNOSTIC_ARGS.has(arg) ? arg : "<redacted>"));
 }
 
-export class ZcodeBackend {
+export class ZcodeBackend implements BridgeBackend {
   private proc: ChildProcess;
   private readonly pending = new Map<number, PendingRequest>();
   private readonly serverRequests: ServerRequest[] = [];
