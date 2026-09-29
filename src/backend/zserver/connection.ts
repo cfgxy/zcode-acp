@@ -359,12 +359,52 @@ export class ZServerConnection {
 }
 
 function childIo(child: ChildProcessWithoutNullStreams) {
+  // Async stream/child errors (EPIPE against a dying child, ENOENT/EACCES
+  // spawn failures) arrive as 'error' events — without a listener they crash
+  // the whole process (same lesson as backend/client.ts). Route to exit path.
+  const swallowError = (error: Error): void => {
+    warn(`zserver: child io error (handled): ${error.message}`);
+  };
+  child.on("error", swallowError);
+  child.stdin.on("error", swallowError);
+  child.stdout!.on("error", swallowError);
+  child.stderr!.on("error", swallowError);
+  // Watchdog: if this process (bridge/broker) dies without cleanup — Zed
+  // force-kills are the proven scenario — reap the whole server process
+  // group so it cannot orphan (pattern proven in backend/client.ts).
+  const watchdog = spawn(process.execPath, [
+    "-e",
+    `const bridgePid=${process.pid},pgid=${child.pid};` +
+      "const tick=()=>{try{process.kill(bridgePid,0)}catch{try{process.kill(-pgid,'SIGKILL')}catch{}return}" +
+      "try{process.kill(-pgid,0)}catch{return}setInterval(tick,2000)};" +
+      "setInterval(tick,2000);tick();",
+  ], { stdio: "ignore" });
+  watchdog.unref();
+  child.once("exit", () => watchdog.kill("SIGKILL"));
   return {
     writeFrame(payload: Buffer): void {
-      child.stdin.write(payload);
+      if (!child.stdin.destroyed) child.stdin.write(payload);
     },
     shutdown(): void {
-      if (child.exitCode === null && !child.killed) child.kill("SIGTERM");
+      // Group kill (child spawned detached → its pid IS its pgid), with a
+      // SIGKILL escalation if SIGTERM is ignored or trapped.
+      if (child.exitCode === null && !child.killed) {
+        try {
+          process.kill(-child.pid!, "SIGTERM");
+        } catch {
+          child.kill("SIGTERM");
+        }
+        const escalate = setTimeout(() => {
+          try {
+            process.kill(-child.pid!, 0);
+            process.kill(-child.pid!, "SIGKILL");
+          } catch {
+            /* already gone */
+          }
+        }, 5000);
+        escalate.unref();
+        child.once("exit", () => clearTimeout(escalate));
+      }
     },
     bind(onStdout: (chunk: Buffer) => void, onStderr: (chunk: Buffer) => void): void {
       child.stdout!.on("data", onStdout);
@@ -382,9 +422,12 @@ function spawnChild(
   env: NodeJS.ProcessEnv,
 ): ChildProcessWithoutNullStreams {
   try {
+    // detached: the child heads its own process group, so shutdown can reap
+    // the server AND its agent grandchildren together (kill(-pgid)).
     return spawn(nodeBin, [bundle], {
       env,
       stdio: ["pipe", "pipe", "pipe"],
+      detached: process.platform !== "win32",
     }) as ChildProcessWithoutNullStreams;
   } catch (error) {
     throw new ZServerConnectionError("spawn", `zcode server spawn failed: ${String(error)}`);
