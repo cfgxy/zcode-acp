@@ -148,6 +148,18 @@ respondElicitation / resumeTask / closeTask / deliverSessionMessage / …`；
 - TurnMonitor 消费 `result.projection`：内层 readSession 快照顶层含
   projection 键，形状契合（深层字段待编辑器实机确认）。
 
+### 事件流作用域（第十轮深审补记）
+
+- **onDynamicConversationFrame 的 emitter 按 workspaceKey 键控（workspace
+  级）**：同一 workspace 的所有会话共享一条帧流，会话仅由
+  frame.topic（"conversation/<sid>"）区分——按会话监听必须先过
+  frameMatchesSession 再进 gate/翻译，否则跨会话串流（正文/turn 状态
+  互相污染），且外会话帧不得重臂本会话的完成静默门。
+- onDynamicSessionEvent 的键含 sessionId、onDynamicTaskTerminalOutcome
+  内部按 sessionId 过滤——二者天然会话级（已排除）。
+- 已知差距追加：zserver 模式暂不产出 usage/session.updated（上下文条
+  无数据），需实测 V4 行中的 usage 形状后补。
+
 ### 粗糙边缘（server 侧，避免踩坑）
 
 - `ProxyChannel.fromService` 对**未知事件名同步 throw**，会把整个 server 进程

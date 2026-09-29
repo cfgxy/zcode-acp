@@ -356,6 +356,12 @@ export class ZServerBackend implements BridgeBackend {
     // live at the ack, and frames fired between the ack and a later
     // EventListen would be routed to a handler that does not exist yet.
     connection.listen("onDynamicConversationFrame", { workspacePath, sessionId }, (data) => {
+      // The server's frame emitter is WORKSPACE-scoped (keyed by
+      // resolveWorkspaceKey) — this listener receives frames for EVERY session
+      // in the workspace, distinguished only by frame.topic. Foreign frames
+      // must be dropped before the gate too (another session's traffic must
+      // not re-arm this session's completion quiescence).
+      if (!frameMatchesSession(data, sessionId)) return;
       gate.onStreamActivity();
       if (!shouldTranslateFrame(data)) return;
       const deltas =
@@ -440,6 +446,18 @@ export function buildCreateSessionParams(
     out.mcpServers = params["mcpServers"];
   }
   return out;
+}
+
+/**
+ * Session gate for workspace-scoped frame streams: the server keys frame
+ * emitters by workspace, so a per-session listener sees every session's
+ * frames — only the frame topic ("conversation/<sessionId>") identifies the
+ * owning session. Without this filter, one session's text/turn rows bleed
+ * into another session's listeners.
+ */
+export function frameMatchesSession(data: unknown, sessionId: string): boolean {
+  const topic = (data as { frame?: { topic?: string } } | null)?.frame?.topic;
+  return topic === `conversation/${sessionId}`;
 }
 
 /**

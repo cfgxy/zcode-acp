@@ -291,3 +291,14 @@ describe("terminalResultType (outcome fidelity)", () => {
     expect(terminalResultType("failed")).toBe("error");
   });
 });
+
+describe("frameMatchesSession (workspace-scoped stream filtering)", () => {
+  it("accepts only the owning session's frames by topic", async () => {
+    const { frameMatchesSession } = await import("../src/backend/zserver/backend.js");
+    const frame = (sid: string): unknown => ({ frame: { topic: `conversation/${sid}` } });
+    expect(frameMatchesSession(frame("sess-a"), "sess-a")).toBe(true);
+    // Same workspace, other session — what the listener actually receives.
+    expect(frameMatchesSession(frame("sess-b"), "sess-a")).toBe(false);
+    expect(frameMatchesSession({}, "sess-a")).toBe(false);
+  });
+});
