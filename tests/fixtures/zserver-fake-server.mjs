@@ -8,10 +8,56 @@
 // NOTE: executed as `<tmpdir>/zcode-server.cjs`, i.e. CommonJS — no ESM syntax.
 // `process` is a global.
 
+// Slow, orderly shutdown: trap SIGTERM and exit only after N ms — opens the
+// window where a NEW spawn clears the backend's `closing` flag before the OLD
+// child's exit event lands (the poisoned-flag race).
+if (process.env.ZSERVER_FAKE_SLOW_EXIT_MS) {
+  process.on("SIGTERM", () => {
+    setTimeout(() => process.exit(0), Number(process.env.ZSERVER_FAKE_SLOW_EXIT_MS));
+  });
+}
+// Swallow SIGTERM entirely (a wedged/trapping server): only SIGKILL escalation
+// can end it.
+if (process.env.ZSERVER_FAKE_IGNORE_SIGTERM === "1") {
+  process.on("SIGTERM", () => {});
+}
+// Record own pid + spawn a same-group grandchild: lets tests assert that a
+// group kill reaps the WHOLE tree while a leader-only kill leaves the grandchild.
+if (process.env.ZSERVER_FAKE_PID_FILE) {
+  const ignoresTerm = process.env.ZSERVER_FAKE_GRANDCHILD_IGNORES_SIGTERM === "1";
+  const pidFile = process.env.ZSERVER_FAKE_PID_FILE;
+  // The grandchild announces itself ONLY after its SIGTERM handler is armed
+  // (it writes a ready marker); the leader publishes the pid file only once
+  // that marker exists — otherwise a test can SIGTERM the grandchild during
+  // node bootstrap, before the handler exists, and see it die spuriously.
+  const readyMarker = pidFile + ".grandchild-ready";
+  const grandchild = require("node:child_process").spawn(
+    process.execPath,
+    [
+      "-e",
+      (ignoresTerm ? "process.on('SIGTERM',()=>{});" : "") +
+        `require('node:fs').writeFileSync(${JSON.stringify(readyMarker)},'1');` +
+        "setInterval(()=>{},1000)",
+    ],
+    { stdio: "ignore" },
+  );
+  const publish = () => {
+    if (!require("node:fs").existsSync(readyMarker)) return setTimeout(publish, 20);
+    require("node:fs").writeFileSync(
+      pidFile,
+      JSON.stringify({ leader: process.pid, grandchild: grandchild.pid }),
+    );
+  };
+  publish();
+}
+
 if (process.env.ZSERVER_FAKE_DIE_AFTER_MS) {
   setTimeout(() => process.exit(9), Number(process.env.ZSERVER_FAKE_DIE_AFTER_MS));
 }
 
+if (process.env.ZSERVER_FAKE_SPAWN_LOG) {
+  require("node:fs").appendFileSync(process.env.ZSERVER_FAKE_SPAWN_LOG, `${process.pid}\n`);
+}
 process.stdout.write("Connecting to ssh.example.test...\n");
 process.stdout.write("Welcome to the banner.\n");
 process.stdout.write(
@@ -100,9 +146,43 @@ const handleFrame = (payload) => {
   const { header, body } = decMsg(payload);
   const [type, id, , name] = header;
   if (type === 100) {
+    // Scripted server-side failure for a method (202 PromiseError response).
+    if ((process.env.ZSERVER_FAKE_FAIL_METHODS || "").split(",").includes(name)) {
+      process.stdout.write(
+        encFrame(msg([202, id], { message: `scripted failure: ${name}`, name: "Error" })),
+      );
+      return;
+    }
     const hangMethods = (process.env.ZSERVER_FAKE_HANG_METHODS || "").split(",").filter(Boolean);
     if (hangMethods.includes(name)) return; // wedged-but-alive server simulation
+    if (name === "createSession") {
+      process.stdout.write(
+        encFrame(
+          msg([201, id], { session: { sessionId: "sess_fake_1" }, projection: {}, messages: [] }),
+        ),
+      );
+      return;
+    }
+    if (name === "createTask") {
+      process.stdout.write(encFrame(msg([201, id], { taskId: "sess_fake_1" })));
+      return;
+    }
     process.stdout.write(encFrame(msg([201, id], `echo:${name}:${JSON.stringify(body)}`)));
+  } else if (
+    type === 102 &&
+    name === "onDynamicTaskTerminalOutcome" &&
+    process.env.ZSERVER_FAKE_TERMINAL
+  ) {
+    // Scripted terminal outcome (ZSERVER_FAKE_TERMINAL = JSON payload).
+    setTimeout(() => {
+      process.stdout.write(encFrame(msg([204, id], JSON.parse(process.env.ZSERVER_FAKE_TERMINAL))));
+    }, 200);
+  } else if (type === 102 && name === "onDynamicConversationFrame") {
+    // Scripted conversation frames (ZSERVER_FAKE_FRAMES = JSON array of frames).
+    const frames = JSON.parse(process.env.ZSERVER_FAKE_FRAMES || "[]");
+    setTimeout(() => {
+      for (const frame of frames) process.stdout.write(encFrame(msg([204, id], frame)));
+    }, 150);
   } else if (type === 102) {
     // Subscribe: fire N events with the SAME listen id (EventFire semantics),
     // then keep a ticker so unsubscribe (103) is observable.
@@ -145,7 +225,15 @@ process.stdin.on("data", (d) => {
     acked = true;
     const ack = JSON.parse(line);
     if (ack.type !== "zcode-hello-ack" || !ack.clientId) process.exit(2);
-    process.stdout.write(encFrame(msg([200], undefined)));
+    if (process.env.ZSERVER_COALESCE === "1") {
+      // Initialize immediately followed by an unsolicited event frame in ONE
+      // write: the client must hand the post-hello remainder to the decoder.
+      process.stdout.write(
+        Buffer.concat([encFrame(msg([200], undefined)), encFrame(msg([204, 424242], "coalesced"))]),
+      );
+    } else {
+      process.stdout.write(encFrame(msg([200], undefined)));
+    }
     if (acc.length > 0) drain();
     return;
   }

@@ -184,12 +184,16 @@ export class ChannelClient {
   }
 
   cancel(id: number): void {
-    if (!this.pendingRejections.has(id)) {
+    const reject = this.pendingRejections.get(id);
+    if (!reject) {
       return;
     }
     this.sendRaw(encodeMessage([101 as RequestType, id], undefined));
     this.handlers.delete(id);
     this.pendingRejections.delete(id);
+    // Settle the caller (reference implementation rejects "Cancelled"); a
+    // cancelled-but-never-settled promise hangs any awaiting caller forever.
+    reject(Object.assign(new Error("Cancelled"), { name: "Cancelled" }));
   }
 
   dispose(reason?: Error): void {

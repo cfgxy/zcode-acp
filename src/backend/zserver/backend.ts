@@ -28,6 +28,21 @@ export interface ZServerBackendOptions {
  * authority mode, which is a verified-working fallback (billing resolves via
  * ~/.zcode/v2/config.json either way).
  */
+/** Env keys that carry ONE task's/session's credentials or identity. The broker
+ *  is a machine-level daemon shared by every client, so a token inherited from
+ *  whichever process happened to start it must never reach other clients'
+ *  agent shells (credential mixing + silent expiry breakage). */
+const TASK_SCOPED_ENV = /^(MULTICA_|SSH_AUTH_SOCK$|SSH_AGENT_PID$|SSH_CONNECTION$|SSH_CLIENT$)/;
+
+/** Broker-mode env: everything except task-scoped credentials. */
+export function brokerBaseEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const out: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(base)) {
+    if (!TASK_SCOPED_ENV.test(key)) out[key] = value;
+  }
+  return out;
+}
+
 export async function runtimeEnvWithProfile(base: NodeJS.ProcessEnv): Promise<NodeJS.ProcessEnv> {
   try {
     const pins = loadDesktopChildEnvWithRefresh();
@@ -61,6 +76,10 @@ export class ZServerBackend implements BridgeBackend {
   private idleTimer: NodeJS.Timeout | null = null;
   /** Idle ms before the server child is shut down (0 = keep forever). */
   private readonly idleMs = Number(process.env.ZCODE_ACP_ZSERVER_IDLE_MS ?? 0) || 0;
+  /** Requests currently awaiting route(): idle recycling must never close the
+   *  connection out from under them (a slow spawn/request outliving idleMs
+   *  would otherwise get its connection nulled mid-flight). */
+  private inFlight = 0;
   /** Intentional-shutdown marker: the child's exit during close() must NOT
    *  mark the backend dead — index.ts's death poller would kill the whole
    *  bridge within 2s otherwise (idle recycle == suicide without this). */
@@ -75,28 +94,39 @@ export class ZServerBackend implements BridgeBackend {
   ) {}
 
   private async ensureConnection(): Promise<ZServerConnection> {
-    if (this.connection) return this.connection;
-    if (!this.spawnPromise) {
-      this.spawnPromise = this.spawn();
-      // A rejected spawnPromise must never be cached: clear it on failure so
-      // the next request retries, and mark the backend dead with the heal
-      // marker so the supervised path (and ensureBackend) treats this as a
-      // restartable backend instead of a permanently wedged one.
-      this.spawnPromise.catch((error: unknown) => {
-        this.spawnPromise = null;
-        this.isDead = true;
-        const message = error instanceof Error ? error.message : String(error);
-        // Wire contract (supervise.ts consumers): "spawn failed" prefix classifies
-        // permanent unbootable states (ERR_SPAWN_FAILED, no infinite retry);
-        // anything else keeps the backend-dead marker for retryable healing.
-        this.deathReason =
-          error instanceof ZServerConnectionError && error.phase === "spawn"
-            ? `spawn failed: ${message}`
-            : `zcode backend reader exited (backend dead): ${message}`;
-      });
+    // Loop: a close()/restart() racing an in-flight spawn makes that spawn
+    // dispose its own late connection and return without assigning — the
+    // waiter must then start (or join) a fresh spawn instead of dereferencing
+    // a null connection.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      if (this.connection) return this.connection;
+      if (!this.spawnPromise) {
+        const promise = this.spawn();
+        this.spawnPromise = promise;
+        // A rejected spawnPromise must never be cached. The handler is
+        // identity-guarded: a superseded (older) spawn failing late must not
+        // clobber a newer spawn's promise nor mark a healthy backend dead.
+        promise.catch((error: unknown) => {
+          if (this.spawnPromise !== promise) return;
+          this.spawnPromise = null;
+          this.isDead = true;
+          const message = error instanceof Error ? error.message : String(error);
+          // Wire contract (supervise.ts consumers): "spawn failed" prefix
+          // classifies permanent unbootable states (ERR_SPAWN_FAILED, no
+          // infinite retry); anything else keeps the backend-dead marker for
+          // retryable healing.
+          this.deathReason =
+            error instanceof ZServerConnectionError && error.phase === "spawn"
+              ? `spawn failed: ${message}`
+              : `zcode backend reader exited (backend dead): ${message}`;
+        });
+      }
+      await this.spawnPromise;
     }
-    await this.spawnPromise;
-    return this.connection!;
+    if (!this.connection) {
+      throw new Error("zcode backend reader exited (backend dead): zserver connection unavailable");
+    }
+    return this.connection;
   }
 
   private async spawn(): Promise<void> {
@@ -107,9 +137,11 @@ export class ZServerBackend implements BridgeBackend {
     this.closing = false;
     const socketPath = process.env.ZCODE_ACP_ZSERVER_SOCKET;
     let connection: ZServerConnection | null = null;
+    let attached = false;
     if (socketPath) {
       try {
         connection = await ZServerConnection.attach({ socketPath, clientId: this.clientId });
+        attached = true;
       } catch (error) {
         // Broker down should not take the bridge down: fall back to a direct
         // server spawn (the restart/heal path retries the broker first).
@@ -140,9 +172,11 @@ export class ZServerBackend implements BridgeBackend {
     this.subscribedSessions.clear();
     this.emittedByRow.clear();
     connection.onExit((code, signal, detail) => {
-      if (this.closing) {
-        // Expected shutdown (idle recycle / close): stay alive, next request
-        // lazily respawns.
+      // Per-CONNECTION identity, not the shared `closing` flag: an old child's
+      // exit can arrive after a NEW spawn cleared the flag (SIGTERM takes
+      // hundreds of ms). Only the CURRENT connection dying is a backend
+      // death; a retired connection's exit is the expected end of close().
+      if (this.connection !== connection || this.closing) {
         return;
       }
       this.isDead = true;
@@ -158,24 +192,28 @@ export class ZServerBackend implements BridgeBackend {
     // Forwarded runtime-preferences requests (desktop-attached-remote
     // authority): answer with the server's own local-mode defaults so
     // session/create completes. No-op under local authority (never fires).
-    connection.listen("onDynamicSessionRuntimePreferencesRequest", undefined, (request) => {
-      const requestId = (request as { requestId?: string } | null)?.requestId;
-      if (!requestId) return;
-      connection
-        .channelOf("zcode-agent")
-        .call("respondSessionRuntimePreferences", {
-          requestId,
-          resolution: {
-            status: "ok",
-            preferences: {
-              nativeSearchEnhancementsEnabled: true,
-              memoryEnabled: false,
-              askUserQuestionAutoResolutionEnabled: true,
+    // Attach mode: the BROKER owns the shared server and answers there — a
+    // second responder per attached client would double-answer the same
+    // requestId (second respond errors "request not found").
+    if (!attached)
+      connection.listen("onDynamicSessionRuntimePreferencesRequest", undefined, (request) => {
+        const requestId = (request as { requestId?: string } | null)?.requestId;
+        if (!requestId) return;
+        connection
+          .channelOf("zcode-agent")
+          .call("respondSessionRuntimePreferences", {
+            requestId,
+            resolution: {
+              status: "ok",
+              preferences: {
+                nativeSearchEnhancementsEnabled: true,
+                memoryEnabled: false,
+                askUserQuestionAutoResolutionEnabled: true,
+              },
             },
-          },
-        })
-        .catch((error) => warn(`backend: runtime preferences respond failed: ${error.message}`));
-    });
+          })
+          .catch((error) => warn(`backend: runtime preferences respond failed: ${error.message}`));
+      });
   }
 
   /**
@@ -188,7 +226,7 @@ export class ZServerBackend implements BridgeBackend {
     if (!this.idleMs) return;
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => {
-      if (this.listeners.size > 0) {
+      if (this.listeners.size > 0 || this.inFlight > 0) {
         this.armIdleTimer();
         return;
       }
@@ -205,6 +243,7 @@ export class ZServerBackend implements BridgeBackend {
     timeoutMs = 15000,
   ): Promise<ZcodeResponse> {
     this.armIdleTimer();
+    this.inFlight++;
     try {
       const connection = await this.ensureConnection();
       // Per-request timeout, mirroring the direct backend's contract: callers
@@ -240,6 +279,8 @@ export class ZServerBackend implements BridgeBackend {
               : message,
         },
       };
+    } finally {
+      this.inFlight--;
     }
   }
 
@@ -400,46 +441,57 @@ export class ZServerBackend implements BridgeBackend {
       deliver({ type, payload });
     });
     this.gatesBySession.set(sessionId, gate);
-    connection.channelOf("zcode-task").listen("onDynamicTaskTerminalOutcome", sessionId, (data) => {
-      const record = data as { outcome?: string; error?: Record<string, unknown> } | null;
-      if (typeof record?.outcome !== "string") return;
-      // Carry the error dict through: turn.failed consumers read payload.error
-      // for user-facing formatting and transient-retry classification.
-      this.terminalErrorBySession.set(sessionId, record.error);
-      gate.onTerminalOutcome(record.outcome);
-    });
+    const unsubscribers: Array<() => void> = [];
+    unsubscribers.push(
+      connection
+        .channelOf("zcode-task")
+        .listen("onDynamicTaskTerminalOutcome", sessionId, (data) => {
+          const record = data as { outcome?: string; error?: Record<string, unknown> } | null;
+          if (typeof record?.outcome !== "string") return;
+          // Carry the error dict through: turn.failed consumers read payload.error
+          // for user-facing formatting and transient-retry classification.
+          this.terminalErrorBySession.set(sessionId, record.error);
+          gate.onTerminalOutcome(record.outcome);
+        }),
+    );
     // Session state notifications (settings changes) pass through unwrapped.
-    connection.listen(
-      "onDynamicSessionEvent",
-      { workspacePath, sessionId, deliveryKind: "live" },
-      (data) => {
-        const notification = (data as { notification?: Record<string, unknown> } | null)
-          ?.notification;
-        if (!notification) return;
-        gate.onStreamActivity();
-        deliver({ type: "state.updated", payload: notification });
-      },
+    unsubscribers.push(
+      connection.listen(
+        "onDynamicSessionEvent",
+        { workspacePath, sessionId, deliveryKind: "live" },
+        (data) => {
+          const notification = (data as { notification?: Record<string, unknown> } | null)
+            ?.notification;
+          if (!notification) return;
+          gate.onStreamActivity();
+          deliver({ type: "state.updated", payload: notification });
+        },
+      ),
     );
     // Conversation rows → turn lifecycle + text deltas. The listener MUST be
     // registered BEFORE the subscribe call: the server-side subscription goes
     // live at the ack, and frames fired between the ack and a later
     // EventListen would be routed to a handler that does not exist yet.
-    connection.listen("onDynamicConversationFrame", { workspacePath, sessionId }, (data) => {
-      // The server's frame emitter is WORKSPACE-scoped (keyed by
-      // resolveWorkspaceKey) — this listener receives frames for EVERY session
-      // in the workspace, distinguished only by frame.topic. Foreign frames
-      // must be dropped before the gate too (another session's traffic must
-      // not re-arm this session's completion quiescence).
-      if (!frameMatchesSession(data, sessionId)) return;
-      gate.onStreamActivity();
-      if (!shouldTranslateFrame(data)) return;
-      const deltas =
-        (data as { frame?: { payload?: { deltas?: Array<Record<string, unknown>> } } })?.frame
-          ?.payload?.deltas ?? [];
-      for (const delta of deltas) {
-        translateConversationDelta(delta, sessionId, this.emittedByRow, (event) => deliver(event));
-      }
-    });
+    unsubscribers.push(
+      connection.listen("onDynamicConversationFrame", { workspacePath, sessionId }, (data) => {
+        // The server's frame emitter is WORKSPACE-scoped (keyed by
+        // resolveWorkspaceKey) — this listener receives frames for EVERY session
+        // in the workspace, distinguished only by frame.topic. Foreign frames
+        // must be dropped before the gate too (another session's traffic must
+        // not re-arm this session's completion quiescence).
+        if (!frameMatchesSession(data, sessionId)) return;
+        gate.onStreamActivity();
+        if (!shouldTranslateFrame(data)) return;
+        const deltas =
+          (data as { frame?: { payload?: { deltas?: Array<Record<string, unknown>> } } })?.frame
+            ?.payload?.deltas ?? [];
+        for (const delta of deltas) {
+          translateConversationDelta(delta, sessionId, this.emittedByRow, (event) =>
+            deliver(event),
+          );
+        }
+      }),
+    );
     agentChannel
       .call("subscribeConversationV4", {
         workspacePath,
@@ -451,6 +503,13 @@ export class ZServerBackend implements BridgeBackend {
         // permanently mark the session "subscribed" (every later
         // subscribe/resume would be no-opped and the session stay deaf).
         this.subscribedSessions.delete(sessionId);
+        // ...and tear down the listeners this attempt registered: leaving them
+        // armed while clearing the marker made the NEXT subscribe stack a
+        // second set on the same connection (frames delivered twice, a
+        // disposed gate re-arming into duplicate turn.completed).
+        for (const unsubscribe of unsubscribers) unsubscribe();
+        gate.dispose();
+        if (this.gatesBySession.get(sessionId) === gate) this.gatesBySession.delete(sessionId);
         warn(`backend: conversation subscribe failed: ${error.message}`);
       });
   }
@@ -664,11 +723,15 @@ export class TurnCompletionGate {
   }
 
   onTerminalOutcome(outcome: string): void {
+    if (this.disposed) return; // a disposed gate must never re-arm and emit
     this.pendingOutcome = outcome;
     this.arm(++this.generation);
   }
 
+  private disposed = false;
+
   dispose(): void {
+    this.disposed = true;
     this.timer?.cancel();
     this.timer = null;
     this.pendingOutcome = null;

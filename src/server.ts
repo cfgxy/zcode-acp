@@ -20,7 +20,7 @@ import { loadDesktopChildEnvWithRefresh } from "./desktop-profile.js";
 import { BackgroundTaskListener } from "./handlers/background-tasks.js";
 import { enqueueSessionSend } from "./handlers/io.js";
 import { ClientRegistry } from "./remote/broadcast.js";
-import { AGENT_INFO, PROTOCOL_VERSION, log } from "./utils.js";
+import { AGENT_INFO, PROTOCOL_VERSION, log, warn } from "./utils.js";
 
 /** Client capabilities advertised in the initialize request. */
 export interface ClientCapabilities {
@@ -240,7 +240,15 @@ export class ZcodeAcpServer {
   /** Lazily spawn the zcode backend on first use (initialize doesn't need it). */
   ensureBackend(): BridgeBackend {
     if (this.backend && !this.backend.isDead) return this.backend;
-    if (process.env.ZCODE_ACP_BACKEND === "zserver") {
+    const backendChoice = process.env.ZCODE_ACP_BACKEND?.trim();
+    if (backendChoice && backendChoice.toLowerCase() !== "zserver" && backendChoice !== "direct") {
+      // A typo here silently flips the identity/billing path to the direct
+      // backend — say so once instead of failing open in silence.
+      warn(
+        `ZCODE_ACP_BACKEND="${backendChoice}" not recognized (zserver|direct) — using direct backend`,
+      );
+    }
+    if (backendChoice?.toLowerCase() === "zserver") {
       this.backend = new ZServerBackend({
         serverRoot: process.env.ZCODE_SERVER_RUNTIME_ROOT,
       });

@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, unlinkSync } from "node:fs";
+import fs, { chmodSync, existsSync, unlinkSync } from "node:fs";
 import { connect, createServer, type Server, type Socket } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -12,17 +12,114 @@ import {
   replaceHeader,
 } from "./protocol.js";
 import { ZServerConnection } from "./connection.js";
-import { runtimeEnvWithProfile } from "./backend.js";
+import { brokerBaseEnv, runtimeEnvWithProfile } from "./backend.js";
 
 export const DEFAULT_BROKER_SOCKET = path.join(
   process.env.XDG_RUNTIME_DIR || path.join(os.homedir(), ".zcode"),
   "zserver-broker.sock",
 );
 
+/** Effective broker socket: ZCODE_ACP_ZSERVER_SOCKET wins on BOTH sides —
+ *  clients attach to it and the broker must bind it, otherwise clients silently
+ *  fall back to per-process servers and sharing quietly stops working. */
+export function resolveBrokerSocketPath(env: NodeJS.ProcessEnv = process.env): string {
+  return env.ZCODE_ACP_ZSERVER_SOCKET?.trim() || DEFAULT_BROKER_SOCKET;
+}
+
+/** sun_path limits: 107 usable bytes on Linux, 103 on macOS/BSD. Longer paths
+ *  are silently TRUNCATED by bind()/connect(), which breaks stale-socket
+ *  detection (existsSync on the full path is false while the truncated file
+ *  exists) and yields a misleading EADDRINUSE. Fail loudly instead. */
+export function assertSocketPathFits(socketPath: string): void {
+  if (process.platform === "win32") {
+    throw new Error(
+      "zserver-broker uses unix domain sockets and is not supported on Windows " +
+        "(use ZCODE_ACP_BACKEND=zserver without a broker: each bridge spawns its own server)",
+    );
+  }
+  const limit = process.platform === "darwin" ? 103 : 107;
+  const bytes = Buffer.byteLength(socketPath);
+  if (bytes > limit) {
+    throw new Error(
+      `zserver-broker socket path is ${bytes} bytes (limit ${limit}): ${socketPath} — ` +
+        "set ZCODE_ACP_ZSERVER_SOCKET to a shorter path (or XDG_RUNTIME_DIR)",
+    );
+  }
+}
+
 const CLIENT_IDLE_EXIT_MS = Number(process.env.ZCODE_ACP_ZSERVER_BROKER_IDLE_EXIT_MS ?? 0) || 0;
 /** Per-client inbound cap: a frame claiming more than this is a hostile/misbehaving peer. */
 function maxClientBufferBytes(): number {
-  return Number(process.env.ZCODE_ACP_ZSERVER_MAX_CLIENT_BUFFER ?? 0) || 64 * 1024 * 1024;
+  return Number(process.env.ZCODE_ACP_ZSERVER_MAX_CLIENT_BUFFER ?? 0) || 8 * 1024 * 1024;
+}
+
+/**
+ * Broker method allowlist. A broker client speaks raw channel frames straight
+ * into ONE shared, already-authenticated zcode-server whose ServiceCollection
+ * exposes every service (credential.load, terminal.*, file.*, git.*, …).
+ * Forwarding unrestricted frames would make any process able to reach the
+ * socket a full confused-deputy of the user's credentials. Only the RPC
+ * surface ZServerBackend actually uses is forwarded; everything else is
+ * rejected and the offending client disconnected.
+ */
+export const BROKER_ALLOWED_CALLS: Readonly<Record<string, ReadonlySet<string>>> = {
+  "zcode-agent": new Set([
+    "createSession",
+    "readSession",
+    "sendPrompt",
+    "subscribeConversationV4",
+    "unsubscribeConversationV4",
+  ]),
+  "zcode-task": new Set(["createTask", "listTasks", "stopGeneration", "closeTask"]),
+};
+export const BROKER_ALLOWED_EVENTS: Readonly<Record<string, ReadonlySet<string>>> = {
+  "zcode-agent": new Set([
+    "onDynamicConversationFrame",
+    "onDynamicSessionEvent",
+    "onDynamicSessionRuntimePreferencesRequest",
+  ]),
+  "zcode-task": new Set(["onDynamicTaskTerminalOutcome"]),
+};
+
+/** umask in force while the socket file is created (=> mode 0600 at birth). */
+export const BROKER_BIND_UMASK = 0o177;
+
+export type HeaderVerdict = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Validate a client frame header BEFORE any forwarding/re-encoding: exact shape
+ * (bounded array, numeric type in 100..103, integer id), and — for calls and
+ * subscriptions — an allowlisted (channel, name). 101/103 carry only [type,id].
+ */
+export function validateClientHeader(header: unknown): HeaderVerdict {
+  if (!Array.isArray(header) || header.length < 2 || header.length > 4) {
+    return { ok: false, reason: "header must be an array of 2..4 elements" };
+  }
+  const [type, id, channel, name] = header as [unknown, unknown, unknown, unknown];
+  if (typeof type !== "number" || !Number.isInteger(type) || type < 100 || type > 103) {
+    return { ok: false, reason: `request type ${String(type)} not allowed` };
+  }
+  if (typeof id !== "number" || !Number.isInteger(id) || id < 0) {
+    // Non-numeric ids bypass id rewriting: the server would keep a subscription
+    // that can never be routed back nor reclaimed on disconnect.
+    return { ok: false, reason: "request id must be a non-negative integer" };
+  }
+  if (type === 101 || type === 103) {
+    return header.length === 2
+      ? { ok: true }
+      : { ok: false, reason: "cancel/dispose header must be [type,id]" };
+  }
+  if (header.length !== 4 || typeof channel !== "string" || typeof name !== "string") {
+    return { ok: false, reason: "call/listen header must be [type,id,channel,name]" };
+  }
+  const table = type === 100 ? BROKER_ALLOWED_CALLS : BROKER_ALLOWED_EVENTS;
+  if (!table[channel]?.has(name)) {
+    return {
+      ok: false,
+      reason: `${type === 100 ? "call" : "event"} ${channel}.${name} is not allowed through the broker`,
+    };
+  }
+  return { ok: true };
 }
 
 interface ClientEntry {
@@ -52,6 +149,8 @@ export class ZServerBroker {
   private connection: ZServerConnection | null = null;
   private spawning: Promise<void> | null = null;
   private stopped = false;
+  /** Test seam: invoked with the socket file's mode at the instant of creation. */
+  onBoundForTest?: (mode: number) => void;
   private readonly clients = new Map<number, ClientEntry>();
   private nextClientId = 1;
   /** Server-side id space is broker-global: per-client counters would collide
@@ -64,11 +163,12 @@ export class ZServerBroker {
   private idleTimer: NodeJS.Timeout | null = null;
 
   constructor(
-    private readonly socketPath: string = DEFAULT_BROKER_SOCKET,
+    private readonly socketPath: string = resolveBrokerSocketPath(),
     private readonly serverRoot?: string,
   ) {}
 
   async start(): Promise<void> {
+    assertSocketPathFits(this.socketPath);
     if (existsSync(this.socketPath)) {
       // Probe before unlinking: a live broker would accept the connection; a
       // stale file refuses it. Never evict a live broker's socket.
@@ -86,10 +186,22 @@ export class ZServerBroker {
       unlinkSync(this.socketPath);
     }
     this.server = createServer((socket) => this.onClient(socket));
-    await new Promise<void>((resolve, reject) => {
-      this.server!.listen(this.socketPath, () => resolve());
-      this.server!.once("error", reject);
-    });
+    // bind() creates the socket file with 0777 & ~umask; tightening it with
+    // chmod AFTER listen leaves a window (umask 000/002 → group/world
+    // connectable). Bind under umask 0177 so it is 0600 from creation.
+    const previousUmask = process.umask(BROKER_BIND_UMASK);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        this.server!.listen(this.socketPath, () => {
+          // Test seam: report the effective creation-time mode of the socket file.
+          this.onBoundForTest?.(fs.statSync(this.socketPath).mode & 0o777);
+          resolve();
+        });
+        this.server!.once("error", reject);
+      });
+    } finally {
+      process.umask(previousUmask);
+    }
     // The broker drives a server holding credentials; a world-connectable
     // socket would hand that to any local user. Restrict to the owner.
     try {
@@ -110,7 +222,7 @@ export class ZServerBroker {
         const connection = await ZServerConnection.spawn({
           serverRoot: this.serverRoot,
           clientId: "zserver-broker",
-          env: await runtimeEnvWithProfile(process.env),
+          env: await runtimeEnvWithProfile(brokerBaseEnv(process.env)),
         });
         connection.onExit((code, signal) => {
           warn(
@@ -257,7 +369,12 @@ export class ZServerBroker {
       entry.socket.destroy();
       return;
     }
-    if (!Array.isArray(header)) return;
+    const verdict = validateClientHeader(header);
+    if (!verdict.ok) {
+      warn(`zserver-broker: rejected client frame (${verdict.reason}) — disconnecting`);
+      entry.socket.destroy();
+      return;
+    }
     const [type, clientRequestId] = header as [number, number?];
     if (typeof clientRequestId === "number") {
       if (type === 101 || type === 103) {

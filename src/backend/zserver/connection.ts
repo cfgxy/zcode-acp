@@ -358,6 +358,65 @@ export class ZServerConnection {
   }
 }
 
+/** Delay before SIGTERM is escalated to SIGKILL on the server's process group. */
+function killEscalationMs(): number {
+  return Number(process.env.ZCODE_ACP_ZSERVER_KILL_ESCALATION_MS ?? 0) || 5000;
+}
+
+/**
+ * Watchdog script (runs as `node -e`): polls the owner's liveness and, when the
+ * owner (bridge/broker) dies without cleanup, SIGKILLs the whole server process
+ * group so it cannot orphan. Mirrors the proven pattern in backend/client.ts:
+ * `process.exit(0)` on BOTH terminal branches and NO setInterval inside tick —
+ * an earlier zserver copy re-armed a timer every tick (timer count doubled each
+ * 2s) and never exited (orphaned 45MB watchdogs after every owner death).
+ *
+ * It also outlives the group LEADER: it exits only when the whole group is
+ * empty (kill(-pgid,0) throws), so a grandchild ignoring SIGTERM after the
+ * leader died is still reaped when the owner goes away.
+ */
+export function buildWatchdogScript(ownerPid: number, pgid: number): string {
+  if (
+    !Number.isSafeInteger(ownerPid) ||
+    !Number.isSafeInteger(pgid) ||
+    ownerPid <= 0 ||
+    pgid <= 0
+  ) {
+    throw new Error("watchdog requires positive integer pids");
+  }
+  return `
+    const ownerPid = ${ownerPid};
+    const pgid = ${pgid};
+    const tick = () => {
+      try { process.kill(ownerPid, 0); }
+      catch {
+        try { process.kill(-pgid, 'SIGKILL'); } catch {}
+        process.exit(0);
+      }
+      try { process.kill(-pgid, 0); }
+      catch { process.exit(0); }
+    };
+    setInterval(tick, 2000);
+    tick();
+  `;
+}
+
+function startGroupWatchdog(pgid: number | undefined): void {
+  // Unsupported on Windows (no process groups) and pointless without a pid
+  // (spawn failure: async ENOENT leaves child.pid undefined).
+  if (process.platform === "win32" || !pgid) return;
+  const watchdog = spawn(process.execPath, ["-e", buildWatchdogScript(process.pid, pgid)], {
+    stdio: "ignore",
+    detached: true, // own process group: never part of the group it reaps
+    env: {},
+  });
+  // A failed watchdog spawn (EAGAIN/ENOMEM) must not crash the bridge.
+  watchdog.on("error", (error) => {
+    warn(`zserver: watchdog spawn failed (handled): ${error.message}`);
+  });
+  watchdog.unref();
+}
+
 function childIo(child: ChildProcessWithoutNullStreams) {
   // Async stream/child errors (EPIPE against a dying child, ENOENT/EACCES
   // spawn failures) arrive as 'error' events — without a listener they crash
@@ -372,15 +431,7 @@ function childIo(child: ChildProcessWithoutNullStreams) {
   // Watchdog: if this process (bridge/broker) dies without cleanup — Zed
   // force-kills are the proven scenario — reap the whole server process
   // group so it cannot orphan (pattern proven in backend/client.ts).
-  const watchdog = spawn(process.execPath, [
-    "-e",
-    `const bridgePid=${process.pid},pgid=${child.pid};` +
-      "const tick=()=>{try{process.kill(bridgePid,0)}catch{try{process.kill(-pgid,'SIGKILL')}catch{}return}" +
-      "try{process.kill(-pgid,0)}catch{return}setInterval(tick,2000)};" +
-      "setInterval(tick,2000);tick();",
-  ], { stdio: "ignore" });
-  watchdog.unref();
-  child.once("exit", () => watchdog.kill("SIGKILL"));
+  startGroupWatchdog(child.pid);
   return {
     writeFrame(payload: Buffer): void {
       if (!child.stdin.destroyed) child.stdin.write(payload);
@@ -401,9 +452,12 @@ function childIo(child: ChildProcessWithoutNullStreams) {
           } catch {
             /* already gone */
           }
-        }, 5000);
+        }, killEscalationMs());
         escalate.unref();
-        child.once("exit", () => clearTimeout(escalate));
+        // Keep the escalation armed past the leader's exit: if a grandchild
+        // ignored SIGTERM the group is still alive and must be SIGKILLed.
+        // (unref'd timer; the kill(-pgid,0) probe inside makes it a no-op when
+        // the group is already gone.)
       }
     },
     bind(onStdout: (chunk: Buffer) => void, onStderr: (chunk: Buffer) => void): void {
@@ -411,7 +465,20 @@ function childIo(child: ChildProcessWithoutNullStreams) {
       child.stderr!.on("data", onStderr);
     },
     onExit(cb: (detail: string) => void): void {
-      child.once("exit", (code, signal) => cb(`code=${code ?? "null"} signal=${signal ?? "null"}`));
+      // Fire-once across 'exit' AND 'error': an async spawn failure (ENOENT/
+      // EACCES) emits 'error' then 'close' and NEVER 'exit' — without this the
+      // handshake sat out the full 10s hello timeout and was misclassified
+      // as a retryable death instead of a permanent spawn failure.
+      let fired = false;
+      const once = (detail: string): void => {
+        if (fired) return;
+        fired = true;
+        cb(detail);
+      };
+      child.once("exit", (code, signal) =>
+        once(`code=${code ?? "null"} signal=${signal ?? "null"}`),
+      );
+      child.once("error", (error) => once(`spawn error: ${error.message}`));
     },
   };
 }
@@ -435,11 +502,14 @@ function spawnChild(
 }
 
 function timeout(ms: number, phase: ZServerConnectionPhase): Promise<never> {
-  return new Promise<never>((_, reject) =>
-    setTimeout(
+  return new Promise<never>((_, reject) => {
+    const handle = setTimeout(
       () =>
         reject(new ZServerConnectionError(phase, `zcode server ${phase} timeout after ${ms}ms`)),
       ms,
-    ),
-  );
+    );
+    // The losing side of a Promise.race must not pin the event loop for the
+    // remaining seconds after the handshake already won.
+    handle.unref?.();
+  });
 }

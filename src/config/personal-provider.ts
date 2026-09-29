@@ -16,11 +16,19 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { chmodSync, copyFileSync, existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  copyFileSync,
+  existsSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { ZCODE_CREDS_PATH, log } from "../utils.js";
+import { ZCODE_CREDS_PATH, log, warn } from "../utils.js";
 
 const GLM_MODEL_IDS = ["GLM-5.3-Flash", "GLM-5.3"];
 const GLM_BASE_URL = "https://open.bigmodel.cn/api/anthropic";
@@ -52,10 +60,31 @@ interface ProviderConfigFile {
 
 /** The desktop-pinned path when available, else the standard location. */
 export function personalProviderConfigPath(env: NodeJS.ProcessEnv = process.env): string {
-  const pinned = env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE?.trim();
-  if (pinned) return pinned;
   const home = os.homedir();
-  return path.join(home, ".zcode", "v2", "provider_config.json");
+  const fallback = path.join(home, ".zcode", "v2", "provider_config.json");
+  const pinned = env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE?.trim();
+  if (!pinned) return fallback;
+  // ensurePersonalGlmProvider WRITES the user's plan API key into this file. A
+  // pin pointing anywhere else (a tampered profile / a spoofed "desktop host"
+  // process's environ) would exfiltrate the key to an attacker-readable path.
+  // Only accept a pin that resolves inside ~/.zcode/ (symlinks resolved).
+  const zcodeDir = path.join(home, ".zcode") + path.sep;
+  try {
+    const resolved = realpathSync(pinned);
+    if (path.normalize(resolved).startsWith(realpathSync(path.join(home, ".zcode")) + path.sep)) {
+      return pinned;
+    }
+  } catch {
+    // Non-existent pin: fall through to a lexical check on the (not-yet-created) path.
+    if (path.normalize(pinned).startsWith(zcodeDir) && !pinned.split(/[\\/]+/).includes("..")) {
+      return pinned;
+    }
+  }
+  warn(
+    "personal-provider: ignoring untrusted ZCODE_PERSONAL_PROVIDER_CONFIG_FILE pin " +
+      "(outside ~/.zcode) — using the default provider_config.json path",
+  );
+  return fallback;
 }
 
 function isGlmRule(rule: ProviderRule): boolean {
@@ -70,7 +99,10 @@ function isGlmRule(rule: ProviderRule): boolean {
 export function planApiKey(zcodeConfigPath = ZCODE_CREDS_PATH): string | null {
   try {
     const cfg = JSON.parse(readFileSync(zcodeConfigPath, "utf8")) as {
-      provider?: Record<string, { enabled?: boolean; options?: { baseURL?: string; apiKey?: string } }>;
+      provider?: Record<
+        string,
+        { enabled?: boolean; options?: { baseURL?: string; apiKey?: string } }
+      >;
     };
     for (const p of Object.values(cfg.provider ?? {})) {
       const opts = p?.options ?? {};
@@ -95,7 +127,10 @@ export function ensurePersonalGlmProvider(
   try {
     data = JSON.parse(readFileSync(providerConfigPath, "utf8")) as ProviderConfigFile;
   } catch (e) {
-    return { status: "skipped", reason: `provider_config.json unreadable (${e instanceof Error ? e.message : String(e)})` };
+    return {
+      status: "skipped",
+      reason: `provider_config.json unreadable (${e instanceof Error ? e.message : String(e)})`,
+    };
   }
   const rules = data.config?.providerConfigRules?.providerRules;
   if (!Array.isArray(rules)) {
@@ -133,7 +168,10 @@ export function ensurePersonalGlmProvider(
   try {
     writeFile(providerConfigPath, `${JSON.stringify(data, null, 1)}\n`);
   } catch (e) {
-    return { status: "skipped", reason: `write failed (${e instanceof Error ? e.message : String(e)})` };
+    return {
+      status: "skipped",
+      reason: `write failed (${e instanceof Error ? e.message : String(e)})`,
+    };
   }
   log(`personal-provider: added GLM Coding Plan entry ${providerId}`);
   return { status: "added", providerId };

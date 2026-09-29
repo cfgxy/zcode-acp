@@ -2,7 +2,7 @@
 
 ## 状态
 
-Accepted（M0 已落地并活体验证；M1/M2 待实施，见"分阶段"）
+Accepted（M0/M1a/M1b/M2/M2.5 已落地并经真实 server 探针 + 多视角审计验证；仍开放的项见"已知差距"与"分阶段"）
 
 ## 背景
 
@@ -71,9 +71,11 @@ respondElicitation / resumeTask / closeTask / deliverSessionMessage / …`；
 
 ### 协议约束（M2 实测补记）
 
-- **负整数不经 VQL Int 编解码往返**（`-1` 会解码成大正数）——上游同款
-  codec、桌面端同样不发负数，本协议族的事实约束。bridge 构造参数时
-  不得携带负整数（当前所有路由参数均为字符串/正数/布尔）。
+- **负整数可以往返**（已订正）：本文早先版本声称"`-1` 会解码成大正数"，
+  经 codec 实测与对照部署 bundle 的 `writeInt32VQL`/`readIntVQL` 逐位核对
+  为**错误**——VQL 位运算按有符号 32 位折回，-1 编码为 `06 FF FF FF FF 0F`
+  并精确解回，-2^31…2^31-1 全部往返（`tests/zserver-protocol.test.ts`
+  断言）。≥2^31 的整数与浮点走 Object/JSON 路径。
 - bridge handler 栈实际消费的 backend 方法面（zserver 路由需覆盖）：
   `session/create|send|read|subscribe|stop|load|resume|list`。
   `session/subscribe` 是 EventStreamListener 的水位订阅——返回
@@ -192,6 +194,56 @@ diff（并发竞态 / 协议字节保真 / 资源生命周期 / 错误处理降�
 仍开放（需实机数据）：usage/session.updated 产出、readSession 深层
 projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
 
+### 安全模型（多视角审计补记）
+
+威胁模型：跨 uid 用户在 socket 权限下被隔离；**同 uid 的受限主体**（沙箱
+应用、被限制文件写入的 agent、仅能 exec 的工具子进程）是本特性真正防御
+的对象，因为它们本无凭据/执行权，却可能借 broker 或 profile 获得。
+
+- **broker 是 confused deputy 的天然候选**：共享 server 的
+  ServiceCollection 暴露 credential.load、terminal._、file._、git.* 等全部
+  服务。broker 因此**只转发** bridge 实际使用的 (channel, method/event)
+  白名单（`BROKER_ALLOWED_CALLS/EVENTS`），header 先经 `validateClientHeader`
+  严格校验（形状、numeric id、请求类型 100..103），违规客户端立即断开。
+  注意：同一 server 连接内仍无 per-client 会话隔离（事件按 workspace 键控，
+  `frameMatchesSession` 只是客户端自愿过滤）——同 workspace 的客户端互相可见，
+  属已接受的个人机器语义。
+- **socket 创建即 0600**：`bind()` 在 `umask(0o177)` 下执行，消除
+  "listen 后才 chmod" 的窗口（`onBoundForTest` 接缝使其可确定性测试）。
+- **profile 路径类 pin 必须可信**（`isTrustedPinPath`：绝对、无 `..`、位于
+  home / AppImage `/tmp/.mount_*` / `/opt` / `/usr`）；路径 pin 决定 server
+  加载哪份 provider 配置、执行哪个二进制，被篡改即凭据外泄/RCE 面。
+  `profile refresh` 写入 API key 的目标（`personalProviderConfigPath`）额外
+  要求 realpath 落在 `~/.zcode/` 内，否则回退默认路径。
+- **宿主进程识别收紧**：comm 仅接受 `zcode-host-loca`/`zcode-host-remo`
+  精确截断，全名仅匹配 argv[0]（原先任一 argv token 即可冒充宿主）。
+- **broker 的 spawn env 去除任务级凭据**（`MULTICA_*`、SSH agent 变量）：
+  broker 是机器级共享守护，继承启动者任务的令牌会让所有客户端 agent shell
+  带着别人的凭据。直连模式保持原语义（daemon 注入的任务凭据是设计需要）。
+- profile export 以 `O_NOFOLLOW` + `fchmod` 写入，不跟随预置符号链接。
+- 每客户端入站缓冲上限默认 8MB（`replaceHeader` 对大帧有线性放大）。
+- 未覆盖/UNVERIFIED：profile 文件本身无完整性绑定（每次 spawn 仍应优先
+  从 `/proc/<pid>/environ` 重采）、无 SO_PEERCRED（Node 原生不可得）。
+
+### 环境变量一览
+
+| 变量                                    | 作用                                                              | 默认                                   |
+| --------------------------------------- | ----------------------------------------------------------------- | -------------------------------------- |
+| `ZCODE_ACP_BACKEND`                     | `zserver` 切换后端（大小写不敏感；无法识别的值会告警并用 direct） | direct                                 |
+| `ZCODE_ACP_ZSERVER_SOCKET`              | **客户端 attach 与 broker bind 共用**的 socket 路径               | `$XDG_RUNTIME_DIR/zserver-broker.sock` |
+| `ZCODE_ACP_ZSERVER_IDLE_MS`             | 无会话监听且无在途请求 N ms 后回收 server 子进程                  | 0（关闭）                              |
+| `ZCODE_ACP_ZSERVER_TURN_QUIESCE_MS`     | terminal 后等流静默的宽限                                         | 300                                    |
+| `ZCODE_ACP_ZSERVER_MAX_CLIENT_BUFFER`   | broker 每客户端入站缓冲上限（字节）                               | 8MB                                    |
+| `ZCODE_ACP_ZSERVER_BROKER_IDLE_EXIT_MS` | broker 无客户端 N ms 后自退出                                     | 0（关闭）                              |
+| `ZCODE_ACP_ZSERVER_KILL_ESCALATION_MS`  | dispose 时 SIGTERM→SIGKILL 升级延迟                               | 5000                                   |
+| `ZCODE_SERVER_RUNTIME_ROOT`             | server 部署根（`node` + `zcode-server.cjs`）                      | `~/.zcode/server`                      |
+
+注：`attach` 需要同时设置 `ZCODE_ACP_BACKEND=zserver` 与
+`ZCODE_ACP_ZSERVER_SOCKET`；只设 socket 变量不会切换后端。socket 路径超过
+sun_path 上限（Linux 107 / macOS 103 字节）时 broker 启动即报错而非静默
+截断；Windows 不支持 broker（无 unix socket 语义），每个 bridge 各自
+spawn server。
+
 ### 粗糙边缘（server 侧，避免踩坑）
 
 - `ProxyChannel.fromService` 对**未知事件名同步 throw**，会把整个 server 进程
@@ -246,24 +298,17 @@ onDynamicWorkspaceEvent`。
   （V4 帧订阅语义待映射）；`desktop-attached-remote` 权威下的
   runtime-preferences 应答回路已在探针中就位（local 权威下 server 自答、
   事件不触发）。
-  `session/requestRuntimePreferences`。desktop-attached-remote 权威模式下，
-  server 不自答该请求，而是 fire `sessionRuntimePreferencesRequestEmitter`
-  转发给**客户端连接作用域**（`createZCodeAgentConnectionScope(role:
-"trusted-host-relay")`——一个 V4 帧路由器：clientHello 身份声明、ownership、
-  flow-control、订阅路由）。实测：不实现该中继客户端时 agent 拿不到 runtime
-  preferences → `session/create` 超时/缺席 → `sendText` 在 agent sqlite 报
-  `FOREIGN KEY constraint failed`（`message.session_id → session(id)` 无行，
-  已用 `~/.zcode/cli/db/db.sqlite` 查询证实）。强制
-  `ZCODE_SERVICE_AUTHORITY_MODE=local` 无法绕过：server 经中继握手与
-  `initializeRuntimeProcessEnv` 的 env patch 重新注入
-  `desktop-attached-remote`（agent `/proc/<pid>/environ` 实证）。
-  **M1b 工作**：实现 trusted-host-relay 客户端——Initialize 后发送 V4
-  clientHello（connectionId + clientMode "desktop-continuous" + 下游声明），
-  订阅中继帧并应答 `session/requestRuntimePreferences`（server local 模式的
-  默认值可作首版应答：`{askUserQuestionAutoResolutionEnabled: true,
-nativeSearchEnhancementsEnabled: true, memoryEnabled: false}`），以及
-  permission/elicitation 的 `resolveInteraction` host-command 往返。作用域
-  源码在 bundle 内可读（`createZCodeAgentConnectionScope`，~9KB）。
+  **runtime-preferences 中继（已解决）**：desktop-attached-remote 权威下
+  server 不自答 agent 的 `session/requestRuntimePreferences`，而是经动态事件
+  `onDynamicSessionRuntimePreferencesRequest` 转发给连接客户端，须用
+  `respondSessionRuntimePreferences({requestId, resolution:{status:"ok",
+preferences}})` 应答，否则 `session/create` 超时并使后续 `sendText` 因
+  agent 侧 session 行缺失报 `FOREIGN KEY constraint failed`。现由
+  `ZServerBackend`（spawn 模式）或 `ZServerBroker`（共享模式，**仅 broker
+  一处**应答，attach 客户端不再重复）实现，默认偏好取 server local 模式的
+  默认值。强制 `ZCODE_SERVICE_AUTHORITY_MODE=local` 无法绕过——server 会经
+  中继握手重新注入 `desktop-attached-remote`（agent `/proc/<pid>/environ`
+  实证）。
 - **M2（已完成）**：`ZCODE_ACP_BACKEND=zserver` 开关已接入
   `server.ensureBackend`（默认路径不变）；`BridgeBackend` 接口统一
   handlers 消费面；`ZServerBackend` 仿真 app-server RPC 面

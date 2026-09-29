@@ -10,8 +10,10 @@ import { ZServerConnection } from "../src/backend/zserver/index.js";
 
 const tempDirs: string[] = [];
 const sockets: string[] = [];
+const cleanupFns: Array<() => void> = [];
 
 afterEach(() => {
+  for (const fn of cleanupFns.splice(0)) fn();
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { force: true, recursive: true });
   for (const s of sockets.splice(0)) {
     try {
@@ -37,6 +39,12 @@ describe("ZServerBroker", () => {
   it("multiplexes two clients onto one shared server with independent ids", async () => {
     const socketPath = path.join(os.tmpdir(), `zserver-broker-test-${Date.now()}.sock`);
     sockets.push(socketPath);
+    const spawnLog = path.join(os.tmpdir(), `zserver-spawnlog-${Date.now()}.txt`);
+    process.env.ZSERVER_FAKE_SPAWN_LOG = spawnLog;
+    cleanupFns.push(() => {
+      delete process.env.ZSERVER_FAKE_SPAWN_LOG;
+      fs.rmSync(spawnLog, { force: true });
+    });
     const broker = new ZServerBroker(socketPath, makeServerRoot());
     await broker.start();
 
@@ -48,15 +56,20 @@ describe("ZServerBroker", () => {
 
     try {
       // Interleaved calls with colliding client-side ids (both use id 0 first).
-      const a1 = a.call("initialize", { who: "a" });
-      const b1 = b.call("initialize", { who: "b" });
-      const a2 = a.call("listTasks");
-      expect(await a1).toBe('echo:initialize:[{"who":"a"}]');
-      expect(await b1).toBe('echo:initialize:[{"who":"b"}]');
+      const a1 = a.call("readSession", { who: "a" });
+      const b1 = b.call("readSession", { who: "b" });
+      const a2 = a.channelOf("zcode-task").call("listTasks");
+      expect(await a1).toBe('echo:readSession:[{"who":"a"}]');
+      expect(await b1).toBe('echo:readSession:[{"who":"b"}]');
       expect(await a2).toBe("echo:listTasks:[]");
-      // Server stays singular: two attaches, one child process.
-      expect(a.child).toBeNull();
-      expect(b.child).toBeNull();
+      // Server stays singular: two concurrent attaches → exactly ONE server
+      // process was started (the fixture logs every start). The old assertion
+      // (`attach().child === null`) is true by construction and proved nothing.
+      const spawns = fs
+        .readFileSync(process.env.ZSERVER_FAKE_SPAWN_LOG!, "utf8")
+        .trim()
+        .split("\n");
+      expect(spawns).toHaveLength(1);
     } finally {
       a.dispose();
       b.dispose();
@@ -76,7 +89,9 @@ describe("ZServerBroker", () => {
 
     const second = await ZServerConnection.attach({ socketPath, clientId: "second" });
     try {
-      await expect(second.call("listTasks")).resolves.toBe("echo:listTasks:[]");
+      await expect(second.channelOf("zcode-task").call("listTasks")).resolves.toBe(
+        "echo:listTasks:[]",
+      );
     } finally {
       second.dispose();
       await broker.stop();
@@ -95,13 +110,22 @@ describe("ZServerBroker event multiplexing", () => {
     try {
       // decode/encode helpers from the public module to craft raw listen ids
       const seen: unknown[] = [];
-      const unsubscribe = client.listen("onTick", undefined, (data) => seen.push(data));
+      const unsubscribe = client.listen("onDynamicSessionEvent", undefined, (data) =>
+        seen.push(data),
+      );
       await new Promise((r) => setTimeout(r, 300));
       expect(seen.length).toBeGreaterThanOrEqual(3); // repeated fires, same id
       unsubscribe();
       const at = seen.length;
       await new Promise((r) => setTimeout(r, 300));
-      expect(seen.length).toBe(at); // unsubscribe actually reached the server
+      expect(seen.length).toBe(at);
+      // The local count alone is a tautology (the client drops its handler on
+      // unsubscribe whether or not the server ever hears about it). The server
+      // must ALSO have received the translated EventDispose: the fixture logs
+      // ZSERVER_UNSUB:<serverId> only when a 103 matches a live subscription.
+      const brokerConn = (broker as unknown as { connection: { stderrSnapshot(): string[] } })
+        .connection;
+      expect(brokerConn.stderrSnapshot().join("\n")).toMatch(/ZSERVER_UNSUB:\d{6,}/);
     } finally {
       client.dispose();
       await broker.stop();
@@ -146,8 +170,8 @@ describe("ZServerBroker cross-client isolation", () => {
     try {
       const seenA: unknown[] = [];
       const seenB: unknown[] = [];
-      const unsubA = a.listen("onTick", undefined, (d) => seenA.push(d));
-      const unsubB = b.listen("onTick", undefined, (d) => seenB.push(d));
+      const unsubA = a.listen("onDynamicSessionEvent", undefined, (d) => seenA.push(d));
+      const unsubB = b.listen("onDynamicSessionEvent", undefined, (d) => seenB.push(d));
       await new Promise((r) => setTimeout(r, 350));
       unsubA();
       unsubB();
@@ -215,7 +239,7 @@ describe("ZServerBroker detach hygiene", () => {
     const client = await ZServerConnection.attach({ socketPath, clientId: "ghost" });
     // Leave a subscription open, then vanish WITHOUT unsubscribing
     // (ChannelClient.dispose sends nothing).
-    client.listen("onTick", undefined, () => undefined);
+    client.listen("onDynamicSessionEvent", undefined, () => undefined);
     await new Promise((r) => setTimeout(r, 250)); // let the subscribe reach the server
     client.dispose();
     await new Promise((r) => setTimeout(r, 400));

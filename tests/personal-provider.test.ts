@@ -57,9 +57,8 @@ vi.mock("node:fs", async () => {
   } as unknown as typeof import("node:fs");
 });
 
-const { ensurePersonalGlmProvider, personalProviderConfigPath, planApiKey } = await import(
-  "../src/config/personal-provider.js"
-);
+const { ensurePersonalGlmProvider, personalProviderConfigPath, planApiKey } =
+  await import("../src/config/personal-provider.js");
 
 const PROVIDER_CONFIG_PATH = `${HOME}/.zcode/v2/provider_config.json`;
 
@@ -103,11 +102,16 @@ describe("ensurePersonalGlmProvider", () => {
     const rules = saved.config.providerConfigRules.providerRules;
     const glm = rules.find((r: { providerId: string }) => r.providerId === outcome.providerId);
     expect(glm.config.access).toEqual({ type: "api-key", apiKey: "plan-key-123" });
-    expect(glm.config.api).toEqual({ type: "anthropic-messages", baseUrl: "https://open.bigmodel.cn/api/anthropic" });
+    expect(glm.config.api).toEqual({
+      type: "anthropic-messages",
+      baseUrl: "https://open.bigmodel.cn/api/anthropic",
+    });
     expect(glm.config.personalModelIds).toEqual(["GLM-5.3-Flash", "GLM-5.3"]);
     // per-model rules registered too
     const modelRules = saved.config.modelConfigRules.providerModelRules;
-    expect(modelRules.filter((m: { providerId: string }) => m.providerId === outcome.providerId)).toHaveLength(2);
+    expect(
+      modelRules.filter((m: { providerId: string }) => m.providerId === outcome.providerId),
+    ).toHaveLength(2);
   });
 
   it("is idempotent — reports present without rewriting when a GLM entry exists", () => {
@@ -120,7 +124,10 @@ describe("ensurePersonalGlmProvider", () => {
     const second = ensurePersonalGlmProvider(PROVIDER_CONFIG_PATH, ZCODE_CREDS_PATH, () => {
       throw new Error("must not write when present");
     });
-    expect(second).toEqual({ status: "present", providerId: (first as { providerId: string }).providerId });
+    expect(second).toEqual({
+      status: "present",
+      providerId: (first as { providerId: string }).providerId,
+    });
     expect(files.get(PROVIDER_CONFIG_PATH)).toBe(before);
   });
 
@@ -129,9 +136,7 @@ describe("ensurePersonalGlmProvider", () => {
       providerConfig: JSON.stringify({
         config: {
           providerConfigRules: {
-            providerRules: [
-              { providerId: "p1", config: { personalModelIds: ["glm-5.3-flash"] } },
-            ],
+            providerRules: [{ providerId: "p1", config: { personalModelIds: ["glm-5.3-flash"] } }],
           },
         },
       }),
@@ -153,21 +158,36 @@ describe("ensurePersonalGlmProvider", () => {
   it("skips on unreadable or malformed provider_config.json without throwing", () => {
     files.clear();
     files.set(ZCODE_CREDS_PATH, ZCODE_CONFIG);
-    expect(ensurePersonalGlmProvider(PROVIDER_CONFIG_PATH, ZCODE_CREDS_PATH).status).toBe("skipped");
+    expect(ensurePersonalGlmProvider(PROVIDER_CONFIG_PATH, ZCODE_CREDS_PATH).status).toBe(
+      "skipped",
+    );
 
     setup({ providerConfig: "not json" });
-    expect(ensurePersonalGlmProvider(PROVIDER_CONFIG_PATH, ZCODE_CREDS_PATH).status).toBe("skipped");
+    expect(ensurePersonalGlmProvider(PROVIDER_CONFIG_PATH, ZCODE_CREDS_PATH).status).toBe(
+      "skipped",
+    );
 
     setup({ providerConfig: JSON.stringify({ config: {} }) });
-    expect(ensurePersonalGlmProvider(PROVIDER_CONFIG_PATH, ZCODE_CREDS_PATH).status).toBe("skipped");
+    expect(ensurePersonalGlmProvider(PROVIDER_CONFIG_PATH, ZCODE_CREDS_PATH).status).toBe(
+      "skipped",
+    );
   });
 });
 
 describe("personalProviderConfigPath", () => {
-  it("prefers the desktop-pinned env path", () => {
+  it("prefers the desktop-pinned env path when it lives under ~/.zcode", () => {
+    const pinned = "/home/test/.zcode/v2/runtime/provider_config.json";
+    expect(personalProviderConfigPath({ ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: pinned })).toBe(
+      pinned,
+    );
+  });
+
+  it("ignores a pin outside ~/.zcode (the plan API key is WRITTEN to this path)", () => {
     expect(
-      personalProviderConfigPath({ ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: "/pinned/provider_config.json" }),
-    ).toBe("/pinned/provider_config.json");
+      personalProviderConfigPath({
+        ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: "/pinned/provider_config.json",
+      }),
+    ).toBe("/home/test/.zcode/v2/provider_config.json");
   });
 
   it("falls back to ~/.zcode/v2/provider_config.json", () => {
@@ -184,7 +204,9 @@ describe("planApiKey", () => {
   it("ignores enabled providers on other hosts and missing files", () => {
     setup({
       zcodeConfig: JSON.stringify({
-        provider: { other: { enabled: true, options: { baseURL: "https://api.example.com", apiKey: "x" } } },
+        provider: {
+          other: { enabled: true, options: { baseURL: "https://api.example.com", apiKey: "x" } },
+        },
       }),
     });
     expect(planApiKey(ZCODE_CREDS_PATH)).toBeNull();

@@ -12,7 +12,6 @@ afterEach(() => {
 });
 
 import {
-  shouldTranslateFrame,
   translateConversationDelta,
   TurnCompletionGate,
   ZServerBackend,
@@ -250,21 +249,6 @@ describe("zserver round-5 audit fixes", () => {
     const second = await backend.request(2, "session/list", {});
     expect(second.error?.message).toContain("backend reader exited");
   });
-
-  it("history (initial) frames do not translate into streaming events", () => {
-    const { events, deliver } = collect();
-    const historyRow = {
-      op: "row.appended",
-      row: { rowId: "9", kind: "assistantText", text: "old reply" },
-    };
-    // The deliveryKind gate lives before translation; assert both layers.
-    expect(shouldTranslateFrame({ deliveryKind: "initial" })).toBe(false);
-    expect(shouldTranslateFrame({ deliveryKind: "online" })).toBe(true);
-    if (shouldTranslateFrame({ deliveryKind: "initial" })) {
-      translateConversationDelta(historyRow, "sess-h", new Map(), deliver);
-    }
-    expect(events).toEqual([]);
-  });
 });
 
 describe("buildCreateSessionParams (bridge param fidelity)", () => {
@@ -358,16 +342,165 @@ describe("multi-agent audit round fixes", () => {
       await backend.close();
     }
   });
+});
 
-  it("a failed conversation subscribe rolls back the subscribed marker", async () => {
-    const backend = new ZServerBackend();
-    const subscribed = (backend as unknown as { subscribedSessions: Set<string> })
-      .subscribedSessions;
-    // Simulate the wiring: mark-then-fail path must delete the marker.
-    subscribed.add("sess-x");
-    (backend as unknown as { subscribedSessions: Set<string> }).subscribedSessions = subscribed;
-    // Direct: emulate the catch branch contract via the real method shape.
-    subscribed.delete("sess-x");
-    expect(subscribed.has("sess-x")).toBe(false);
+function makeFakeRoot(): string {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "zserver-int-"));
+  tempDirs.push(root);
+  fs.copyFileSync(
+    new URL("./fixtures/zserver-fake-server.mjs", import.meta.url).pathname,
+    path.join(root, "zcode-server.cjs"),
+  );
+  return root;
+}
+
+interface BackendInternals {
+  subscribedSessions: Set<string>;
+  gatesBySession: Map<string, unknown>;
+  connection: { channelOf(n: string): { call(m: string, ...a: unknown[]): Promise<unknown> } };
+}
+
+describe("ZServerBackend session flow (real backend + scripted server)", () => {
+  it("session/create wires the subscription and mode/mcp forwarding end-to-end", async () => {
+    const backend = new ZServerBackend({ serverRoot: makeFakeRoot() });
+    try {
+      const created = await backend.request(1, "session/create", {
+        workspace: { workspacePath: "/tmp/ws-int" },
+        mode: "yolo",
+      });
+      expect(created.error).toBeUndefined();
+      expect((created.result as { session: { sessionId: string } }).session.sessionId).toBe(
+        "sess_fake_1",
+      );
+      const internals = backend as unknown as BackendInternals;
+      expect(internals.subscribedSessions.has("sess_fake_1")).toBe(true);
+      expect(internals.gatesBySession.has("sess_fake_1")).toBe(true);
+    } finally {
+      await backend.close();
+    }
+  });
+
+  it("a FAILED conversation subscribe rolls back the marker and lets the next subscribe retry", async () => {
+    process.env.ZSERVER_FAKE_FAIL_METHODS = "subscribeConversationV4";
+    const backend = new ZServerBackend({ serverRoot: makeFakeRoot() });
+    try {
+      await backend.request(1, "session/create", { workspace: { workspacePath: "/tmp/ws-fail" } });
+      const internals = backend as unknown as BackendInternals;
+      // subscribeConversation fires the RPC asynchronously; wait for the rollback.
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline && internals.subscribedSessions.has("sess_fake_1")) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(internals.subscribedSessions.has("sess_fake_1")).toBe(false); // rolled back
+      expect(internals.gatesBySession.has("sess_fake_1")).toBe(false); // gate torn down
+      // The next subscribe is NOT a silent no-op: it re-registers.
+      delete process.env.ZSERVER_FAKE_FAIL_METHODS;
+      const again = await backend.request(2, "session/subscribe", {
+        sessionId: "sess_fake_1",
+        workspace: { workspacePath: "/tmp/ws-fail" },
+      });
+      expect(again.error).toBeUndefined();
+      expect(internals.subscribedSessions.has("sess_fake_1")).toBe(true);
+    } finally {
+      delete process.env.ZSERVER_FAKE_FAIL_METHODS;
+      await backend.close();
+    }
+  });
+
+  it("history (initial) frames are dropped while online frames stream — through the real wiring", async () => {
+    const topic = "conversation/sess_fake_1";
+    const row = (text: string): unknown => ({
+      op: "row.appended",
+      row: { rowId: "1", kind: "assistantText", text },
+    });
+    process.env.ZSERVER_FAKE_FRAMES = JSON.stringify([
+      // history replay of a PAST turn — must NOT surface as live streaming
+      { deliveryKind: "initial", frame: { topic, payload: { deltas: [row("OLD HISTORY")] } } },
+      // a different session in the same workspace — must be filtered by topic
+      {
+        deliveryKind: "online",
+        frame: { topic: "conversation/other", payload: { deltas: [row("FOREIGN")] } },
+      },
+      // the live frame for THIS session
+      { deliveryKind: "online", frame: { topic, payload: { deltas: [row("LIVE")] } } },
+    ]);
+    const backend = new ZServerBackend({ serverRoot: makeFakeRoot() });
+    const seen: string[] = [];
+    try {
+      backend.registerEventListener("sess_fake_1", {
+        handleEvent: (event) => {
+          if (event.type === "model.streaming") {
+            seen.push(String((event.payload as { delta?: string }).delta));
+          }
+        },
+      });
+      await backend.request(1, "session/create", {
+        workspace: { workspacePath: "/tmp/ws-frames" },
+      });
+      const deadline = Date.now() + 3000;
+      while (Date.now() < deadline && !seen.includes("LIVE")) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      expect(seen).toEqual(["LIVE"]); // no history replay, no foreign session
+    } finally {
+      delete process.env.ZSERVER_FAKE_FRAMES;
+      await backend.close();
+    }
+  });
+});
+
+describe("terminal outcome delivery (real wiring)", () => {
+  async function runWithTerminal(
+    terminal: Record<string, unknown>,
+  ): Promise<Array<{ type: string; payload: Record<string, unknown> }>> {
+    process.env.ZSERVER_FAKE_TERMINAL = JSON.stringify(terminal);
+    process.env.ZCODE_ACP_ZSERVER_TURN_QUIESCE_MS = "60";
+    const backend = new ZServerBackend({ serverRoot: makeFakeRoot() });
+    const events: Array<{ type: string; payload: Record<string, unknown> }> = [];
+    try {
+      backend.registerEventListener("sess_fake_1", {
+        handleEvent: (event) => {
+          if (event.type === "turn.completed" || event.type === "turn.failed") {
+            events.push({ type: event.type, payload: event.payload as Record<string, unknown> });
+          }
+        },
+      });
+      await backend.request(1, "session/create", { workspace: { workspacePath: "/tmp/ws-term" } });
+      const deadline = Date.now() + 4000;
+      while (Date.now() < deadline && events.length === 0) {
+        await new Promise((r) => setTimeout(r, 25));
+      }
+      return events;
+    } finally {
+      delete process.env.ZSERVER_FAKE_TERMINAL;
+      delete process.env.ZCODE_ACP_ZSERVER_TURN_QUIESCE_MS;
+      await backend.close();
+    }
+  }
+
+  it("failed outcome → turn.failed carrying the server's error dict (retry/format consumers read it)", async () => {
+    const events = await runWithTerminal({
+      outcome: "failed",
+      error: { code: "model_request_failed", message: "provider hiccup" },
+    });
+    expect(events).toHaveLength(1);
+    expect(events[0]!.type).toBe("turn.failed");
+    expect(events[0]!.payload).toMatchObject({
+      resultType: "error",
+      error: { code: "model_request_failed", message: "provider hiccup" },
+    });
+  });
+
+  it("cancelled outcome → turn.completed with resultType 'cancelled' (not folded into success)", async () => {
+    const events = await runWithTerminal({ outcome: "cancelled" });
+    expect(events).toHaveLength(1);
+    expect(events[0]!.type).toBe("turn.completed");
+    expect(events[0]!.payload["resultType"]).toBe("cancelled");
+  });
+
+  it("succeeded outcome → turn.completed resultType success", async () => {
+    const events = await runWithTerminal({ outcome: "succeeded" });
+    expect(events[0]!.type).toBe("turn.completed");
+    expect(events[0]!.payload["resultType"]).toBe("success");
   });
 });

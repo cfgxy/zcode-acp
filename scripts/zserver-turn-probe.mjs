@@ -70,6 +70,7 @@ connection.listen("onDynamicSessionRuntimePreferencesRequest", undefined, (reque
 });
 const events = [];
 let taskId;
+let watchdogTimer;
 
 try {
   // 1) createSession on the agent channel — this materializes the session row
@@ -99,12 +100,39 @@ try {
   }
 
   // 2) subscribe BEFORE prompting (short turns complete fast). The inner
-  // session event stream carries the live conversation frames.
+  // session event stream carries state updates; the V4 conversation frames
+  // carry the actual content deltas (text, tool calls).
   const streamEvents = connection.listen(
     "onDynamicSessionEvent",
     { workspacePath: workspace, sessionId: taskId, deliveryKind: "live" },
     (data) => events.push(data),
   );
+  const frames = [];
+  const frameEvents = connection.listen(
+    "onDynamicConversationFrame",
+    { workspacePath: workspace, sessionId: taskId },
+    (data) => {
+      // Frames are WORKSPACE-scoped: keep only this session's topic.
+      if (data?.frame?.topic !== `conversation/${taskId}`) return;
+      frames.push(data);
+      for (const delta of data?.frame?.payload?.deltas ?? []) events.push(delta);
+    },
+  );
+  try {
+    const sub = await Promise.race([
+      agentChannel.call("subscribeConversationV4", {
+        workspacePath: workspace,
+        sessionId: taskId,
+        clientMode: "desktop-continuous",
+      }),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("subscribe timeout 15s")), 15_000),
+      ),
+    ]);
+    console.log(`[turn] subscribeConversationV4 → ${JSON.stringify(sub).slice(0, 160)}`);
+  } catch (error) {
+    console.log(`[turn] subscribeConversationV4 failed: ${error.message}`);
+  }
   const terminalPromise = new Promise((resolve) => {
     tasks.listen("onDynamicTaskTerminalOutcome", taskId, (data) => resolve(data));
   });
@@ -115,8 +143,11 @@ try {
   });
   const ready = await Promise.race([
     readyPromise,
-    new Promise((resolve) => setTimeout(() => resolve({ kind: "watchdog" }), 30_000)),
+    new Promise((resolve) => {
+      watchdogTimer = setTimeout(() => resolve({ kind: "watchdog" }), 30_000);
+    }),
   ]);
+  clearTimeout(watchdogTimer);
   console.log(`[turn] task ready: ${JSON.stringify(ready).slice(0, 200)}`);
 
   // 3) send the prompt.
@@ -134,7 +165,9 @@ try {
   // 4) wait for the terminal outcome.
   const outcome = await Promise.race([
     terminalPromise.then((data) => ({ kind: "terminal", data })),
-    new Promise((resolve) => setTimeout(() => resolve({ kind: "watchdog" }), TURN_TIMEOUT_MS)),
+    new Promise((resolve) => {
+      watchdogTimer = setTimeout(() => resolve({ kind: "watchdog" }), TURN_TIMEOUT_MS);
+    }),
   ]);
   streamEvents();
 
@@ -144,15 +177,43 @@ try {
     const t = event?.type ?? "?";
     counts[t] = (counts[t] ?? 0) + 1;
   }
-  console.log(`[turn] event type counts: ${JSON.stringify(counts)}`);
+  const frameKinds = frames.map(
+    (f) =>
+      `${f?.kind}/${f?.deliveryKind}:${f?.frame?.entries?.length ?? f?.frame?.messages?.length ?? "?"}`,
+  );
+  console.log(`[turn] frames(${frames.length}): ${frameKinds.join(" | ").slice(0, 600)}`);
+  const ops = [];
+  for (const f of frames) {
+    for (const d of f?.frame?.payload?.deltas ?? []) {
+      ops.push(d);
+    }
+  }
+  console.log(`[turn] delta ops: ${ops.map((d) => d.op).join(", ")}`);
+  for (const d of ops) {
+    if (d.op === "row.appended" || d.op === "row.upserted" || d.op === "row.updated") {
+      console.log(
+        `[turn] ${d.op} kind=${d.row?.kind} state=${d.row?.state}: ${JSON.stringify(d.row).slice(0, 350)}`,
+      );
+    }
+  }
+  for (const f of frames) {
+    if (f?.deliveryKind !== "online") continue;
+    const inner = f.frame ?? {};
+    console.log(`[turn] online frame keys: ${Object.keys(inner).join(",")}`);
+    const batch = inner.batch ?? inner.ops ?? inner.records ?? null;
+    console.log(`[turn] online frame body: ${JSON.stringify(batch ?? inner).slice(0, 1200)}`);
+    break;
+  }
   console.log(`[turn] outcome: ${JSON.stringify(outcome).slice(0, 300)}`);
   const shown = new Set();
-  for (const event of events) {
-    const t = event?.type ?? "?";
+  for (const event of [...events, ...frames]) {
+    const t = event?.type ?? event?.frame?.type ?? "?";
     if (shown.has(t)) continue;
     shown.add(t);
     console.log(`[turn] first "${t}": ${JSON.stringify(event).slice(0, 400)}`);
   }
+  frameEvents();
+  clearTimeout(watchdogTimer);
   if (outcome.kind === "watchdog") {
     console.log("[turn] WATCHDOG — turn did not complete in 60s");
     process.exitCode = 1;
@@ -160,6 +221,7 @@ try {
     console.log("[turn] turn complete");
   }
 } catch (error) {
+  clearTimeout(watchdogTimer);
   console.error(`[turn] failed: ${error.name}: ${error.message}`);
   console.error("[turn] server stderr tail:");
   for (const line of connection.stderrSnapshot()) {

@@ -12,7 +12,7 @@
  * user (or editor config) actually typed.
  */
 
-import { chmodSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fchmodSync, openSync, writeSync } from "node:fs";
 import { basename } from "node:path";
 import process from "node:process";
 
@@ -157,7 +157,17 @@ async function main(): Promise<void> {
       process.stdout.write(`zserver-broker: ready\n`);
       // Stay alive until SIGINT/SIGTERM; stop() cleans the socket file.
       const stop = (): void => {
-        void broker.stop().then(() => process.exit(0));
+        // Never leave stop() failure as an unhandledRejection: log and exit
+        // non-zero so a supervisor sees the unclean shutdown.
+        broker.stop().then(
+          () => process.exit(0),
+          (error: unknown) => {
+            process.stderr.write(
+              `zserver-broker: stop failed: ${error instanceof Error ? error.message : String(error)}\n`,
+            );
+            process.exit(1);
+          },
+        );
       };
       process.once("SIGINT", stop);
       process.once("SIGTERM", stop);
@@ -211,9 +221,29 @@ function exportDesktopProfile(filePath?: string): void {
     process.stdout.write(json);
     return;
   }
-  writeFileSync(filePath, json, { mode: 0o600 });
-  // mode only applies at creation — enforce 0600 on pre-existing files too.
-  chmodSync(filePath, 0o600);
+  try {
+    // O_NOFOLLOW: a pre-planted symlink at the target must not redirect the
+    // write (and its truncation) onto another file; O_EXCL is deliberately NOT
+    // used so re-exporting over an earlier export still works.
+    const fd = openSync(
+      filePath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      writeSync(fd, json);
+      // Enforce 0600 on the fd (no path race) — mode only applies at creation.
+      fchmodSync(fd, 0o600);
+    } finally {
+      closeSync(fd);
+    }
+  } catch (error) {
+    process.stderr.write(
+      `zcode-acp: cannot write profile export to ${filePath}: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
   process.stdout.write(`${filePath}\n`);
 }
 

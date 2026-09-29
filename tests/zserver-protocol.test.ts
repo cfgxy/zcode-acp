@@ -179,7 +179,12 @@ describe("multi-agent audit: decode hardening", () => {
   it("rejects array length claims exceeding the payload", () => {
     // Array tag + VQL(2^31-1) — 6 bytes total, impossible element claim.
     const payload = Buffer.from([0x04, 0xff, 0xff, 0xff, 0xff, 0x07]);
-    expect(() => decodeMessage(payload)).toThrowError(/array length/);
+    // Must be OUR guard, and fast: without it the engine's own RangeError
+    // ("Invalid array length") also matched the old /array length/ regex while
+    // the decoder spun for seconds pre-allocating the claimed elements.
+    const startedAt = Date.now();
+    expect(() => decodeMessage(payload)).toThrowError(/exceeds remaining payload/);
+    expect(Date.now() - startedAt).toBeLessThan(500);
   });
 
   it("passes marker-shaped plain objects through untouched (guard parity)", async () => {

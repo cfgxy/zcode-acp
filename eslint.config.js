@@ -30,6 +30,8 @@ export default [
         clearTimeout: "readonly",
         clearInterval: "readonly",
         Buffer: "readonly",
+        // Fixtures run as CommonJS (staged as zcode-server.cjs).
+        require: "readonly",
       },
     },
   },
