@@ -2,11 +2,12 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { ZServerBackend } from "../src/backend/zserver/backend.js";
+import { TurnCompletionGate, ZServerBackend } from "../src/backend/zserver/backend.js";
 import { ZServerBroker } from "../src/backend/zserver/broker.js";
 import { ChannelClient } from "../src/backend/zserver/channel-client.js";
+import { decodeMessage } from "../src/backend/zserver/protocol.js";
 import { ZServerConnection, ZServerConnectionError } from "../src/backend/zserver/connection.js";
 import { ZcodeAcpServer } from "../src/server.js";
 
@@ -476,5 +477,270 @@ describe("non-fatal child errors", () => {
     expect(exits).toBe(0);
     // Still fully usable: the transport was never declared dead.
     await expect(connection.channelOf("zcode-task").call("listTasks")).resolves.toBeDefined();
+  }, 20000);
+});
+
+describe("refused and failed subscriptions (broker 202 / subscribe rejection)", () => {
+  function connectedClient(): { client: ChannelClient; sent: Buffer[] } {
+    const sent: Buffer[] = [];
+    const client = new ChannelClient((payload) => sent.push(payload));
+    client.onMessage({ header: [200], body: undefined });
+    return { client, sent };
+  }
+
+  it("a listen the broker refuses (202) is dropped and reported, not left silently deaf", () => {
+    const { client } = connectedClient();
+    const errors: Error[] = [];
+    client.listen(
+      "zcode-agent",
+      "onDynamicConversationFrame",
+      { a: 1 },
+      () => undefined,
+      (e) => errors.push(e),
+    );
+    const internals = client as unknown as ChannelInternals;
+    expect(internals.handlers.size).toBe(1);
+    client.onMessage({
+      header: [202, 0],
+      body: { message: "broker: event not allowed", name: "BrokerPolicyError" },
+    });
+    expect(errors).toHaveLength(1);
+    expect(errors[0]!.message).toMatch(/event not allowed/);
+    expect(errors[0]!.name).toBe("BrokerPolicyError");
+    expect(internals.handlers.size).toBe(0);
+    expect(internals.eventListeners.size).toBe(0);
+  });
+
+  it("a refused listen with no onError handler warns instead of vanishing", () => {
+    const { client } = connectedClient();
+    const writes: string[] = [];
+    const spy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation((chunk: string | Uint8Array) => {
+        writes.push(String(chunk));
+        return true;
+      });
+    try {
+      client.listen("zcode-task", "onDynamicTaskTerminalOutcome", "s1", () => undefined);
+      client.onMessage({ header: [202, 0], body: { message: "broker: nope", name: "X" } });
+    } finally {
+      spy.mockRestore();
+    }
+    expect(writes.join("")).toMatch(
+      /zcode-task\.onDynamicTaskTerminalOutcome subscription refused/,
+    );
+  });
+
+  it("events still flow to a healthy listen (the 204 path is untouched)", () => {
+    const { client } = connectedClient();
+    const seen: unknown[] = [];
+    client.listen(
+      "c",
+      "e",
+      undefined,
+      (d) => seen.push(d),
+      () => seen.push("ERR"),
+    );
+    client.onMessage({ header: [204, 0], body: "one" });
+    client.onMessage({ header: [204, 0], body: "two" });
+    expect(seen).toEqual(["one", "two"]);
+  });
+
+  it("a refused conversation-frame listen rolls the WHOLE subscription back (no deaf session marked subscribed)", async () => {
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    await backend.request(1, "session/create", { workspace: { workspacePath: "/tmp/ws-refuse" } });
+    const internals = backend as unknown as BackendInternals;
+    expect(internals.subscribedSessions.has("sess_fake_1")).toBe(true);
+
+    // The broker answers the frame subscription with a 202 refusal.
+    const client = internals.connection.client as unknown as {
+      handlers: Map<number, (r: { type: number; id?: number; data?: unknown }) => void>;
+      eventListeners: Map<number, unknown>;
+    };
+    const frameListenId = [...client.eventListeners.keys()].at(-1)!;
+    client.handlers.get(frameListenId)!({
+      type: 202,
+      id: frameListenId,
+      data: { message: "broker: refused", name: "BrokerPolicyError" },
+    });
+
+    expect(internals.subscribedSessions.has("sess_fake_1")).toBe(false);
+    expect(internals.gatesBySession.has("sess_fake_1")).toBe(false);
+    expect(internals.unsubscribersBySession.has("sess_fake_1")).toBe(false);
+    // ...so the next subscribe re-registers instead of being short-circuited.
+    const again = await backend.request(2, "session/subscribe", { sessionId: "sess_fake_1" });
+    expect(again.error).toBeUndefined();
+    expect(internals.subscribedSessions.has("sess_fake_1")).toBe(true);
+  }, 20000);
+
+  it("a failed subscribe call unsubscribes what this attempt registered (the 103s reach the server)", async () => {
+    withEnv({ ZSERVER_FAKE_FAIL_METHODS: "subscribeConversationV4" });
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    await backend.request(1, "session/create", { workspace: { workspacePath: "/tmp/ws-fail2" } });
+    const internals = backend as unknown as BackendInternals;
+    const unsubLines = (): string[] =>
+      (backend as unknown as { connection: { stderrSnapshot(): string[] } }).connection
+        .stderrSnapshot()
+        .filter((line) => line.startsWith("ZSERVER_UNSUB:"));
+    // Three listeners were registered. The fixture only logs an unsubscribe for
+    // listens it armed a ticker for — the terminal-outcome and session-event ones;
+    // the scripted conversation-frame listen has no ticker, so it never logs.
+    expect(await until(() => unsubLines().length >= 2)).toBe(true);
+    expect(internals.subscribedSessions.has("sess_fake_1")).toBe(false);
+    expect(internals.unsubscribersBySession.has("sess_fake_1")).toBe(false);
+  }, 20000);
+
+  it("setup that throws (client disposed under the route) leaves no marker/gate behind", async () => {
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    await backend.request(1, "session/list", {}); // connect
+    const internals = backend as unknown as BackendInternals;
+    // Dispose the transport client but keep the backend's reference: listen() throws.
+    internals.connection.client.dispose();
+    const subscribe = (
+      backend as unknown as {
+        subscribeConversation(c: unknown, w: string, s: string): void;
+      }
+    ).subscribeConversation.bind(backend);
+    expect(() => subscribe(internals.connection, "/tmp/ws-x", "sess_throw")).toThrow();
+    expect(internals.subscribedSessions.has("sess_throw")).toBe(false);
+    expect(internals.gatesBySession.has("sess_throw")).toBe(false);
+    expect(internals.unsubscribersBySession.has("sess_throw")).toBe(false);
+  }, 20000);
+
+  it("a stale failure never rolls back a NEWER attempt's state", async () => {
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    await backend.request(1, "session/create", { workspace: { workspacePath: "/tmp/ws-stale" } });
+    const internals = backend as unknown as BackendInternals;
+    const client = internals.connection.client as unknown as {
+      handlers: Map<number, (r: { type: number; id?: number; data?: unknown }) => void>;
+      eventListeners: Map<number, unknown>;
+    };
+    // Capture the refusal callback of the FIRST attempt's frame listener...
+    const firstFrameListenId = [...client.eventListeners.keys()].at(-1)!;
+    const staleHandler = client.handlers.get(firstFrameListenId)!;
+    // ...then release and re-subscribe: a NEW attempt now owns the session.
+    (backend as unknown as { releaseSession(s: string): void }).releaseSession("sess_fake_1");
+    await backend.request(2, "session/subscribe", { sessionId: "sess_fake_1" });
+    const newer = internals.unsubscribersBySession.get("sess_fake_1");
+    expect(newer).toHaveLength(3);
+
+    // The stale attempt's refusal arrives late: it must be ignored.
+    staleHandler({ type: 202, id: firstFrameListenId, data: { message: "late refusal" } });
+    expect(internals.subscribedSessions.has("sess_fake_1")).toBe(true);
+    expect(internals.unsubscribersBySession.get("sess_fake_1")).toBe(newer);
+  }, 20000);
+});
+
+describe("cancel() and disposed completion gates (mutation-audit gaps)", () => {
+  it("cancel() sends [101,id], settles the caller with Cancelled and frees the slot", async () => {
+    const sent: Buffer[] = [];
+    const client = new ChannelClient((payload) => sent.push(payload));
+    client.onMessage({ header: [200], body: undefined });
+    const call = client.call("c", "m");
+    const settled = call.then(
+      () => "resolved",
+      (error: Error) => error.name,
+    );
+    const before = sent.length;
+    client.cancel(0);
+    await expect(settled).resolves.toBe("Cancelled");
+    const cancelFrame = decodeMessage(sent[before]!);
+    expect(cancelFrame.header).toEqual([101, 0]);
+    const internals = client as unknown as ChannelInternals;
+    expect(internals.handlers.size).toBe(0);
+    expect(internals.pendingRejections.size).toBe(0);
+    expect(() => client.cancel(0)).not.toThrow(); // already gone
+  });
+
+  it("a disposed gate ignores a terminal outcome that arrives LATER (heal/replace race)", () => {
+    const emitted: string[] = [];
+    const scheduled: Array<() => void> = [];
+    const gate = new TurnCompletionGate(
+      (outcome) => emitted.push(outcome),
+      10,
+      (fn) => {
+        scheduled.push(fn);
+        return { cancel: () => undefined };
+      },
+    );
+    gate.dispose();
+    gate.onTerminalOutcome("succeeded"); // arrives after dispose
+    for (const fn of scheduled) fn();
+    expect(scheduled).toHaveLength(0); // never even armed
+    expect(emitted).toEqual([]);
+  });
+});
+
+describe("session/list against the real listTasks shape", () => {
+  // The deployed server's listTasks returns a BARE ARRAY of task metas (verified
+  // against the bundle and a live run: 1575 rows). The old code read `.tasks`, so
+  // it returned [] for every real server while its fixture-backed test passed.
+  const tasks = [
+    { taskId: "t1", workspacePath: "/w/a", title: "first", updatedAt: 1000, mode: "yolo" },
+    { taskId: "t2", workspacePath: "/w/b", title: "second", updatedAt: 2000 },
+  ];
+
+  async function listWith(
+    payload: unknown,
+    params: Record<string, unknown> = {},
+  ): Promise<
+    Array<{
+      sessionId?: string;
+      workspace?: { workspacePath?: string };
+      title?: string;
+      updatedAt?: number;
+    }>
+  > {
+    withEnv({ ZSERVER_FAKE_TASKS: JSON.stringify(payload) });
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    const response = await backend.request(1, "session/list", params);
+    expect(response.error).toBeUndefined();
+    return (response.result as { sessions: never[] }).sessions;
+  }
+
+  it("maps a bare array of task metas (what the real server returns)", async () => {
+    const sessions = await listWith(tasks);
+    expect(sessions).toEqual([
+      { sessionId: "t1", workspace: { workspacePath: "/w/a" }, title: "first", updatedAt: 1000 },
+      { sessionId: "t2", workspace: { workspacePath: "/w/b" }, title: "second", updatedAt: 2000 },
+    ]);
+  });
+
+  it("still accepts a wrapped {tasks:[…]} shape", async () => {
+    const sessions = await listWith({ tasks });
+    expect(sessions.map((s) => s.sessionId)).toEqual(["t1", "t2"]);
+  });
+
+  it("degrades to [] for null / unexpected payloads instead of throwing", async () => {
+    expect(await listWith(null)).toEqual([]);
+    expect(await listWith({ unrelated: true })).toEqual([]);
+  });
+
+  it("asks the server for the caller's workspace only (it filters server-side)", async () => {
+    const seen: unknown[] = [];
+    withEnv({ ZSERVER_FAKE_TASKS: JSON.stringify(tasks) });
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    await backend.request(1, "session/list", { workspace: { workspacePath: "/w/a" } });
+    const client = (backend as unknown as BackendInternals).connection.client as unknown as {
+      send: (payload: Buffer) => void;
+    };
+    const realSend = client.send.bind(client);
+    client.send = (payload: Buffer) => {
+      seen.push(decodeMessage(payload));
+      realSend(payload);
+    };
+    await backend.request(2, "session/list", { workspace: { workspacePath: "/w/a" } });
+    await backend.request(3, "session/list", {});
+    const listCalls = (seen as Array<{ header: unknown[]; body: unknown }>).filter(
+      (m) => m.header[3] === "listTasks",
+    );
+    expect(listCalls[0]!.body).toEqual([{ workspacePath: "/w/a" }]);
+    expect(listCalls[1]!.body).toEqual([{}]);
   }, 20000);
 });

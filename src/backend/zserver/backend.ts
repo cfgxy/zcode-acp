@@ -408,14 +408,19 @@ export class ZServerBackend implements BridgeBackend {
         return { messages: snapshot?.messages ?? [] };
       }
       case "session/list": {
-        const metas = (await tasks.call("listTasks", {})) as {
-          tasks?: Array<{ taskId?: string; workspacePath?: string; title?: string }>;
-        };
+        // The real server's listTasks returns a BARE ARRAY of task metas (verified
+        // against the deployed bundle: `tasks.map(rememberIndexedTaskMeta)`), not
+        // `{tasks:[…]}`; it filters by workspace when one is given. `.tasks` is
+        // accepted too so a wrapped shape (older/newer server) keeps working.
+        const raw = (await tasks.call("listTasks", workspacePath ? { workspacePath } : {})) as
+          TaskMeta[] | { tasks?: TaskMeta[] } | null;
+        const metas = Array.isArray(raw) ? raw : (raw?.tasks ?? []);
         return {
-          sessions: (metas?.tasks ?? []).map((t) => ({
+          sessions: metas.map((t) => ({
             sessionId: t.taskId,
             workspace: { workspacePath: t.workspacePath },
             title: t.title,
+            updatedAt: t.updatedAt,
           })),
         };
       }
@@ -474,85 +479,103 @@ export class ZServerBackend implements BridgeBackend {
     });
     this.gatesBySession.set(sessionId, gate);
     const unsubscribers: Array<() => void> = [];
-    unsubscribers.push(
-      connection
-        .channelOf("zcode-task")
-        .listen("onDynamicTaskTerminalOutcome", sessionId, (data) => {
-          const record = data as { outcome?: string; error?: Record<string, unknown> } | null;
-          if (typeof record?.outcome !== "string") return;
-          // Carry the error dict through: turn.failed consumers read payload.error
-          // for user-facing formatting and transient-retry classification.
-          this.terminalErrorBySession.set(sessionId, record.error);
-          gate.onTerminalOutcome(record.outcome);
-        }),
-    );
-    // Session state notifications (settings changes) pass through unwrapped.
-    unsubscribers.push(
-      connection.listen(
-        "onDynamicSessionEvent",
-        { workspacePath, sessionId, deliveryKind: "live" },
-        (data) => {
-          const notification = (data as { notification?: Record<string, unknown> } | null)
-            ?.notification;
-          if (!notification) return;
-          gate.onStreamActivity();
-          deliver({ type: "state.updated", payload: notification });
-        },
-      ),
-    );
-    // Conversation rows → turn lifecycle + text deltas. The listener MUST be
-    // registered BEFORE the subscribe call: the server-side subscription goes
-    // live at the ack, and frames fired between the ack and a later
-    // EventListen would be routed to a handler that does not exist yet.
-    unsubscribers.push(
-      connection.listen("onDynamicConversationFrame", { workspacePath, sessionId }, (data) => {
-        // The server's frame emitter is WORKSPACE-scoped (keyed by
-        // resolveWorkspaceKey) — this listener receives frames for EVERY session
-        // in the workspace, distinguished only by frame.topic. Foreign frames
-        // must be dropped before the gate too (another session's traffic must
-        // not re-arm this session's completion quiescence).
-        if (!frameMatchesSession(data, sessionId)) return;
-        gate.onStreamActivity();
-        if (!shouldTranslateFrame(data)) return;
-        const deltas =
-          (data as { frame?: { payload?: { deltas?: Array<Record<string, unknown>> } } })?.frame
-            ?.payload?.deltas ?? [];
-        for (const delta of deltas) {
-          translateConversationDelta(delta, sessionId, this.emittedByRow, (event) =>
-            deliver(event),
-          );
-        }
-      }),
-    );
     this.unsubscribersBySession.set(sessionId, unsubscribers);
+    // One attempt-scoped rollback for every way this subscription can fail (the
+    // subscribe call rejected, a listen was refused, registration threw). It only
+    // acts while THIS attempt still owns the session's state: a failure that
+    // arrives after close()/restart()/releaseSession — or after a newer attempt
+    // took over — must not delete the newer attempt's marker (the next subscribe
+    // would then stack a second listener set on the same connection).
+    const rollback = (reason: string, error: Error): void => {
+      if (this.unsubscribersBySession.get(sessionId) !== unsubscribers) return;
+      // A failed subscription must not stay marked "subscribed": every later
+      // subscribe/resume would be no-opped and the session would stay deaf.
+      this.subscribedSessions.delete(sessionId);
+      // Tear down what this attempt registered, or the NEXT subscribe stacks a
+      // second set (frames delivered twice, a disposed gate re-arming into a
+      // duplicate turn.completed).
+      for (const unsubscribe of unsubscribers) unsubscribe();
+      gate.dispose();
+      if (this.gatesBySession.get(sessionId) === gate) this.gatesBySession.delete(sessionId);
+      this.unsubscribersBySession.delete(sessionId);
+      warn(`backend: ${reason}: ${error.message}`);
+    };
+    try {
+      unsubscribers.push(
+        connection.channelOf("zcode-task").listen(
+          "onDynamicTaskTerminalOutcome",
+          sessionId,
+          (data) => {
+            const record = data as { outcome?: string; error?: Record<string, unknown> } | null;
+            if (typeof record?.outcome !== "string") return;
+            // Carry the error dict through: turn.failed consumers read payload.error
+            // for user-facing formatting and transient-retry classification.
+            this.terminalErrorBySession.set(sessionId, record.error);
+            gate.onTerminalOutcome(record.outcome);
+          },
+          (error) => rollback("terminal-outcome subscription refused", error),
+        ),
+      );
+      // Session state notifications (settings changes) pass through unwrapped.
+      unsubscribers.push(
+        connection.listen(
+          "onDynamicSessionEvent",
+          { workspacePath, sessionId, deliveryKind: "live" },
+          (data) => {
+            const notification = (data as { notification?: Record<string, unknown> } | null)
+              ?.notification;
+            if (!notification) return;
+            gate.onStreamActivity();
+            deliver({ type: "state.updated", payload: notification });
+          },
+          (error) => rollback("session-event subscription refused", error),
+        ),
+      );
+      // Conversation rows → turn lifecycle + text deltas. The listener MUST be
+      // registered BEFORE the subscribe call: the server-side subscription goes
+      // live at the ack, and frames fired between the ack and a later
+      // EventListen would be routed to a handler that does not exist yet.
+      unsubscribers.push(
+        connection.listen(
+          "onDynamicConversationFrame",
+          { workspacePath, sessionId },
+          (data) => {
+            // The server's frame emitter is WORKSPACE-scoped (keyed by
+            // resolveWorkspaceKey) — this listener receives frames for EVERY session
+            // in the workspace, distinguished only by frame.topic. Foreign frames
+            // must be dropped before the gate too (another session's traffic must
+            // not re-arm this session's completion quiescence).
+            if (!frameMatchesSession(data, sessionId)) return;
+            gate.onStreamActivity();
+            if (!shouldTranslateFrame(data)) return;
+            const deltas =
+              (data as { frame?: { payload?: { deltas?: Array<Record<string, unknown>> } } })?.frame
+                ?.payload?.deltas ?? [];
+            for (const delta of deltas) {
+              translateConversationDelta(delta, sessionId, this.emittedByRow, (event) =>
+                deliver(event),
+              );
+            }
+          },
+          (error) => rollback("conversation-frame subscription refused", error),
+        ),
+      );
+    } catch (error) {
+      // listen() throws when the client was disposed under us (close() raced
+      // this route): leave no marker/gate behind, and let the request fail.
+      rollback(
+        "subscription setup failed",
+        error instanceof Error ? error : new Error(String(error)),
+      );
+      throw error;
+    }
     agentChannel
       .call("subscribeConversationV4", {
         workspacePath,
         sessionId,
         clientMode: "desktop-continuous",
       })
-      .catch((error) => {
-        // A failure on a RETIRED connection (close()/restart() disposed it and
-        // rejected its pending calls) is expected and must not touch state that
-        // now belongs to the newer connection — deleting the marker there would
-        // let the next subscribe stack a second listener set.
-        if (this.connection !== connection) return;
-        // Roll back the marker: a transient subscribe failure must not
-        // permanently mark the session "subscribed" (every later
-        // subscribe/resume would be no-opped and the session stay deaf).
-        this.subscribedSessions.delete(sessionId);
-        // ...and tear down the listeners this attempt registered: leaving them
-        // armed while clearing the marker made the NEXT subscribe stack a
-        // second set on the same connection (frames delivered twice, a
-        // disposed gate re-arming into duplicate turn.completed).
-        for (const unsubscribe of unsubscribers) unsubscribe();
-        gate.dispose();
-        if (this.gatesBySession.get(sessionId) === gate) this.gatesBySession.delete(sessionId);
-        if (this.unsubscribersBySession.get(sessionId) === unsubscribers) {
-          this.unsubscribersBySession.delete(sessionId);
-        }
-        warn(`backend: conversation subscribe failed: ${error.message}`);
-      });
+      .catch((error: Error) => rollback("conversation subscribe failed", error));
   }
 
   /**
@@ -746,6 +769,14 @@ export function translateConversationDelta(
     }
   }
 }
+/** The task-meta fields session/list consumers read (the server sends more). */
+interface TaskMeta {
+  taskId?: string;
+  workspacePath?: string;
+  title?: string;
+  updatedAt?: number;
+}
+
 class RequestTimeoutError extends Error {
   constructor() {
     super("timeout");

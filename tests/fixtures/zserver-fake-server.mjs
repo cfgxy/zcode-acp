@@ -12,8 +12,8 @@
 //
 // Test-only knobs (read here, not runtime configuration): ZSERVER_FAKE_*
 // (SLOW_EXIT_MS, IGNORE_SIGTERM, PID_FILE, GRANDCHILD_IGNORES_SIGTERM,
-// DIE_AFTER_MS, SPAWN_LOG, FAIL_METHODS, HANG_METHODS, TERMINAL, FRAMES) and
-// ZSERVER_COALESCE.
+// DIE_AFTER_MS, SPAWN_LOG, FAIL_METHODS, HANG_METHODS, TERMINAL, FRAMES, TASKS)
+// and ZSERVER_COALESCE.
 //
 // NOTE: executed as `<tmpdir>/zcode-server.cjs`, i.e. CommonJS — no ESM syntax.
 // `process` is a global.
@@ -175,6 +175,13 @@ const handleFrame = (payload) => {
     }
     if (name === "createTask") {
       process.stdout.write(encFrame(msg([201, id], { taskId: "sess_fake_1" })));
+      return;
+    }
+    // Scripted listTasks payload (ZSERVER_FAKE_TASKS = JSON). Unset keeps the
+    // legacy echo string the connection/broker tests key on. The real server
+    // answers with a BARE ARRAY of task metas.
+    if (name === "listTasks" && process.env.ZSERVER_FAKE_TASKS) {
+      process.stdout.write(encFrame(msg([201, id], JSON.parse(process.env.ZSERVER_FAKE_TASKS))));
       return;
     }
     process.stdout.write(encFrame(msg([201, id], `echo:${name}:${JSON.stringify(body)}`)));

@@ -314,8 +314,13 @@ export class ZServerConnection {
     return this.channel.call(method, ...args);
   }
 
-  listen(event: string, arg: unknown, onFire: (data: unknown) => void): () => void {
-    return this.channel.listen(event, arg, onFire);
+  listen(
+    event: string,
+    arg: unknown,
+    onFire: (data: unknown) => void,
+    onError?: (error: Error) => void,
+  ): () => void {
+    return this.channel.listen(event, arg, onFire, onError);
   }
 
   /** Channel access for any other registered service ("zcode-task", "zcode-session", …).

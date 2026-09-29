@@ -1,3 +1,4 @@
+import { warn } from "../../utils.js";
 import {
   type DecodedMessage,
   encodeMessage,
@@ -163,6 +164,7 @@ export class ChannelClient {
     name: string,
     arg: unknown,
     onFire: (data: unknown) => void,
+    onError?: (error: Error) => void,
   ): () => void {
     if (this.disposed) {
       throw disposedError();
@@ -180,6 +182,26 @@ export class ChannelClient {
       this.handlers.set(id, (response) => {
         if (response.type === 204) {
           onFire(response.data);
+          return;
+        }
+        if (response.type === 202 || response.type === 203) {
+          // The subscription was refused (a broker's policy/limit reply) or
+          // failed: it will never fire. Left registered it would be silently
+          // deaf forever — drop it and tell the caller.
+          attached = false;
+          this.handlers.delete(id);
+          this.eventListeners.delete(id);
+          const error =
+            response.type === 202
+              ? toRpcError(response.data)
+              : response.data instanceof Error
+                ? response.data
+                : new Error(String(response.data));
+          if (onError) {
+            onError(error);
+          } else {
+            warn(`zserver: ${channelName}.${name} subscription refused: ${error.message}`);
+          }
         }
       });
       this.eventListeners.set(id, onFire);
@@ -307,7 +329,12 @@ export class ServiceChannel {
     return this.client.call(this.channelName, method, args, this.signal);
   }
 
-  listen(event: string, arg: unknown, onFire: (data: unknown) => void): () => void {
-    return this.client.listen(this.channelName, event, arg, onFire);
+  listen(
+    event: string,
+    arg: unknown,
+    onFire: (data: unknown) => void,
+    onError?: (error: Error) => void,
+  ): () => void {
+    return this.client.listen(this.channelName, event, arg, onFire, onError);
   }
 }
