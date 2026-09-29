@@ -50,6 +50,7 @@ export class ZServerBackend implements BridgeBackend {
   private seqBySession = new Map<string, number>();
   /** Sessions with live server-side subscriptions (conversation/terminal/state). */
   private readonly subscribedSessions = new Set<string>();
+  private readonly gatesBySession = new Map<string, TurnCompletionGate>();
   private spawnPromise: Promise<void> | null = null;
   private idleTimer: NodeJS.Timeout | null = null;
   /** Idle ms before the server child is shut down (0 = keep forever). */
@@ -71,13 +72,25 @@ export class ZServerBackend implements BridgeBackend {
 
   private async spawn(): Promise<void> {
     const socketPath = process.env.ZCODE_ACP_ZSERVER_SOCKET;
-    const connection = socketPath
-      ? await ZServerConnection.attach({ socketPath, clientId: this.clientId })
-      : await ZServerConnection.spawn({
-          serverRoot: this.options.serverRoot,
-          clientId: this.clientId,
-          env: await runtimeEnvWithProfile(process.env),
-        });
+    let connection: ZServerConnection | null = null;
+    if (socketPath) {
+      try {
+        connection = await ZServerConnection.attach({ socketPath, clientId: this.clientId });
+      } catch (error) {
+        // Broker down should not take the bridge down: fall back to a direct
+        // server spawn (the restart/heal path retries the broker first).
+        warn(
+          `backend: broker attach failed (${
+            error instanceof Error ? error.message : String(error)
+          }) — falling back to direct zcode server spawn`,
+        );
+      }
+    }
+    connection ??= await ZServerConnection.spawn({
+      serverRoot: this.options.serverRoot,
+      clientId: this.clientId,
+      env: await runtimeEnvWithProfile(process.env),
+    });
     this.connection = connection;
     this.isDead = false;
     this.deathReason = null;
@@ -288,14 +301,23 @@ export class ZServerBackend implements BridgeBackend {
         }
       }
     };
-    // Turn terminal outcome → turn.completed / turn.failed.
-    connection.channelOf("zcode-task").listen("onDynamicTaskTerminalOutcome", sessionId, (data) => {
-      const outcome = (data as { outcome?: string } | null)?.outcome;
+    // Turn terminal outcome → turn.completed / turn.failed, gated on stream
+    // quiescence: terminal and the V4 text frames travel on independent
+    // channels, so completing on terminal alone truncates long replies.
+    // Re-subscribing after a restart replaces any gate left by the dead
+    // connection (its pending timer would emit spuriously into this one).
+    this.gatesBySession.get(sessionId)?.dispose();
+    const gate = new TurnCompletionGate((outcome) => {
       const type: ZcodeEvent["type"] = outcome === "failed" ? "turn.failed" : "turn.completed";
       deliver({
         type,
         payload: { resultType: outcome === "failed" ? "error" : "success" },
       });
+    });
+    this.gatesBySession.set(sessionId, gate);
+    connection.channelOf("zcode-task").listen("onDynamicTaskTerminalOutcome", sessionId, (data) => {
+      const outcome = (data as { outcome?: string } | null)?.outcome;
+      if (typeof outcome === "string") gate.onTerminalOutcome(outcome);
     });
     // Session state notifications (settings changes) pass through unwrapped.
     connection.listen(
@@ -305,6 +327,7 @@ export class ZServerBackend implements BridgeBackend {
         const notification = (data as { notification?: Record<string, unknown> } | null)
           ?.notification;
         if (!notification) return;
+        gate.onStreamActivity();
         deliver({ type: "state.updated", payload: notification });
       },
     );
@@ -317,11 +340,14 @@ export class ZServerBackend implements BridgeBackend {
       })
       .then(() => {
         connection.listen("onDynamicConversationFrame", { workspacePath, sessionId }, (data) => {
+          gate.onStreamActivity();
           const deltas =
             (data as { frame?: { payload?: { deltas?: Array<Record<string, unknown>> } } })?.frame
               ?.payload?.deltas ?? [];
           for (const delta of deltas) {
-            translateConversationDelta(delta, this.emittedByRow, (event) => deliver(event));
+            translateConversationDelta(delta, sessionId, this.emittedByRow, (event) =>
+              deliver(event),
+            );
           }
         });
       })
@@ -345,8 +371,12 @@ export class ZServerBackend implements BridgeBackend {
   /** Drop per-session streaming state (called on session close/eviction). */
   forgetSession(sessionId: string): void {
     this.listeners.delete(sessionId);
-    for (const rowId of [...this.emittedByRow.keys()]) {
-      if (rowId.includes(sessionId)) this.emittedByRow.delete(rowId);
+    this.gatesBySession.get(sessionId)?.dispose();
+    this.gatesBySession.delete(sessionId);
+    // Row keys are namespaced `${sessionId}:${rowId}` (rowIds are per-session
+    // log positions and would otherwise collide across sessions).
+    for (const key of [...this.emittedByRow.keys()]) {
+      if (key.startsWith(`${sessionId}:`)) this.emittedByRow.delete(key);
     }
   }
 
@@ -369,17 +399,20 @@ export class ZServerBackend implements BridgeBackend {
  */
 export function translateConversationDelta(
   delta: Record<string, unknown>,
+  scope: string,
   emittedByRow: Map<string, number>,
   deliver: (event: { type: ZcodeEvent["type"]; payload?: Record<string, unknown> }) => void,
 ): void {
   const op = delta["op"] as string;
   const row = (delta["row"] ?? {}) as Record<string, unknown>;
-  const rowId = String(row["rowId"] ?? delta["rowId"] ?? "");
+  // Namespace by scope (sessionId): bare rowIds are per-session log positions
+  // and collide across sessions sharing one backend.
+  const rowKey = `${scope}:${String(row["rowId"] ?? delta["rowId"] ?? "")}`;
   if (op === "row.appended" && row["kind"] === "turnHeader") {
     deliver({ type: "turn.started", payload: {} });
     return;
   }
-  if (op === "row.delta" && rowId) {
+  if (op === "row.delta" && rowKey !== `${scope}:`) {
     const chunk = (delta["delta"] ?? delta["textDelta"] ?? delta["text"]) as string | undefined;
     if (typeof chunk === "string" && chunk.length > 0) {
       deliver({ type: "model.streaming", payload: { kind: "text_delta", delta: chunk } });
@@ -388,13 +421,76 @@ export function translateConversationDelta(
   }
   if ((op === "row.upserted" || op === "row.appended") && row["kind"] === "assistantText") {
     const text = (row["text"] as string) ?? "";
-    const emitted = emittedByRow.get(rowId) ?? 0;
+    const emitted = emittedByRow.get(rowKey) ?? 0;
     if (text.length > emitted) {
       deliver({
         type: "model.streaming",
         payload: { kind: "text_delta", delta: text.slice(emitted) },
       });
-      emittedByRow.set(rowId, text.length);
+      emittedByRow.set(rowKey, text.length);
     }
+  }
+}
+export interface ScheduledHandle {
+  cancel(): void;
+}
+
+function defaultSchedule(fn: () => void, ms: number): ScheduledHandle {
+  const timer = setTimeout(fn, ms);
+  timer.unref?.();
+  return { cancel: () => clearTimeout(timer) };
+}
+
+/**
+ * Quiescence gate for turn completion (ADR-0008): the terminal outcome arrives
+ * on the zcode-task channel while reply text streams over the V4 conversation
+ * subscription — two channels with no ordering guarantee between them.
+ * Emitting completion on terminal arrival alone truncates replies (turn loop
+ * exits while tail frames are in flight). The gate waits for the stream to go
+ * quiet for `graceMs` after a terminal outcome before emitting; any frame or
+ * session event re-arms the timer. If no frames follow at all (short or
+ * already-flushed turns), completion lands one grace period after terminal.
+ */
+export class TurnCompletionGate {
+  private pendingOutcome: string | null = null;
+  private generation = 0;
+  private timer: ScheduledHandle | null = null;
+
+  constructor(
+    private readonly emit: (outcome: string) => void,
+    private readonly graceMs: number = Number(process.env.ZCODE_ACP_ZSERVER_TURN_QUIESCE_MS ?? 0) ||
+      300,
+    private readonly schedule: (fn: () => void, ms: number) => ScheduledHandle = defaultSchedule,
+  ) {}
+
+  /** Any conversation frame or session event: the stream is still alive. */
+  onStreamActivity(): void {
+    if (this.pendingOutcome === null || this.timer === null) {
+      return;
+    }
+    this.arm(this.generation);
+  }
+
+  onTerminalOutcome(outcome: string): void {
+    this.pendingOutcome = outcome;
+    this.arm(++this.generation);
+  }
+
+  dispose(): void {
+    this.timer?.cancel();
+    this.timer = null;
+    this.pendingOutcome = null;
+  }
+
+  private arm(generation: number): void {
+    this.timer?.cancel();
+    const outcome = this.pendingOutcome;
+    if (outcome === null) return;
+    this.timer = this.schedule(() => {
+      if (generation !== this.generation || this.pendingOutcome !== outcome) return;
+      this.pendingOutcome = null;
+      this.timer = null;
+      this.emit(outcome);
+    }, this.graceMs);
   }
 }

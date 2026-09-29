@@ -82,6 +82,19 @@ respondElicitation / resumeTask / closeTask / deliverSessionMessage / …`；
   使 `isBackendDeadMessage` 分类器对 zserver 模式同样生效（heal 路径
   无差别工作）。
 
+### 时序事实（第三轮深审补记）
+
+- **terminal 与正文走两条无序通道**：`onDynamicTaskTerminalOutcome`
+  （zcode-task 通道）与 `onDynamicConversationFrame`（V4 订阅）之间没有
+  顺序保证。terminal 先到而正文未收完时立即判定完成会截断回复——
+  ZServerBackend 用静默期门（TurnCompletionGate，
+  `ZCODE_ACP_ZSERVER_TURN_QUIESCE_MS`，默认 300ms）在 terminal 后等流
+  静默再发 turn.completed/failed，任何帧/会话事件重置计时。
+- **V4 rowId 是每会话日志位置**（"1","2","3"…），跨会话会碰撞——增量
+  水位必须以 `${sessionId}:${rowId}` 复合键存放。
+- broker attach 失败（如 broker 死亡）回退直接 spawn；restart/heal 会
+  先重试 broker。
+
 ### 粗糙边缘（server 侧，避免踩坑）
 
 - `ProxyChannel.fromService` 对**未知事件名同步 throw**，会把整个 server 进程
