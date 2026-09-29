@@ -146,7 +146,13 @@ export class ZServerConnection {
       options.clientId ?? `zcode-acp-${process.pid}`,
       childIo(child),
     );
-    await connection.handshake(options.version ?? "0.0.0");
+    try {
+      await connection.handshake(options.version ?? "0.0.0");
+    } catch (error) {
+      // A failed handshake must not leak the spawned server child.
+      connection.dispose();
+      throw error;
+    }
     return connection;
   }
 

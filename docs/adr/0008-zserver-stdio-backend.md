@@ -69,6 +69,19 @@ respondElicitation / resumeTask / closeTask / deliverSessionMessage / …`；
    `initialize({workspacePath})` 返回
    `{available, workspaceKey, protocolName, protocolVersion, transportKind}`。
 
+### 协议约束（M2 实测补记）
+
+- **负整数不经 VQL Int 编解码往返**（`-1` 会解码成大正数）——上游同款
+  codec、桌面端同样不发负数，本协议族的事实约束。bridge 构造参数时
+  不得携带负整数（当前所有路由参数均为字符串/正数/布尔）。
+- bridge handler 栈实际消费的 backend 方法面（zserver 路由需覆盖）：
+  `session/create|send|read|subscribe|stop|load|resume|list`。
+  `session/subscribe` 是 EventStreamListener 的水位订阅——返回
+  `{eventSeq}`（当前 seq），事件投递由本侧会话订阅承担。
+- ZServerBackend 的死亡错误文案含规范 marker `backend reader exited`，
+  使 `isBackendDeadMessage` 分类器对 zserver 模式同样生效（heal 路径
+  无差别工作）。
+
 ### 粗糙边缘（server 侧，避免踩坑）
 
 - `ProxyChannel.fromService` 对**未知事件名同步 throw**，会把整个 server 进程

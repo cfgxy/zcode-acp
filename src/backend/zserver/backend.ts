@@ -88,8 +88,12 @@ export class ZServerBackend implements BridgeBackend {
     this.emittedByRow.clear();
     connection.onExit((code, signal) => {
       this.isDead = true;
-      this.deathReason = `zcode server exited (code=${code ?? "null"} signal=${signal ?? "null"})`;
-      // Reject in-flight work visibly; the supervision path classifies it.
+      // Message carries the canonical "backend reader exited" marker so the
+      // supervision classifiers (isBackendDeadMessage) recognize zserver-mode
+      // deaths and the heal path fires exactly as for the direct backend.
+      this.deathReason =
+        "zcode backend reader exited (backend dead): " +
+        `zcode server exited (code=${code ?? "null"} signal=${signal ?? "null"})`;
       warn(`backend: ${this.deathReason}`);
     });
     this.armIdleTimer();
@@ -148,7 +152,18 @@ export class ZServerBackend implements BridgeBackend {
       const result = await this.route(connection, method, params);
       return { id, result: result as Record<string, unknown> };
     } catch (error) {
-      return { id, error: { message: error instanceof Error ? error.message : String(error) } };
+      const message = error instanceof Error ? error.message : String(error);
+      // Died while this request was in flight → classify as backend-dead so
+      // the supervised heal path (restart + resume) engages.
+      return {
+        id,
+        error: {
+          message:
+            this.isDead && !message.includes("backend reader exited")
+              ? `zcode backend reader exited (backend dead): ${message}`
+              : message,
+        },
+      };
     }
   }
 
@@ -194,6 +209,14 @@ export class ZServerBackend implements BridgeBackend {
           clientMode: "desktop-continuous",
         });
         return { accepted: true };
+      }
+      case "session/subscribe": {
+        // The EventStreamListener's watermark subscription. Server-side event
+        // delivery is handled by our conversation subscriptions; the listener
+        // only needs the current seq watermark here.
+        const target = this.workspaceBySession.get(sessionId) ?? workspacePath;
+        this.subscribeConversation(connection, target, sessionId);
+        return { eventSeq: this.seqBySession.get(sessionId) ?? 0 };
       }
       case "session/read": {
         const target = this.workspaceBySession.get(sessionId) ?? workspacePath;
