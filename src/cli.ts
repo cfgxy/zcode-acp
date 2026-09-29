@@ -12,7 +12,7 @@
  * user (or editor config) actually typed.
  */
 
-import { writeFileSync } from "node:fs";
+import { chmodSync, writeFileSync } from "node:fs";
 import { basename } from "node:path";
 import process from "node:process";
 
@@ -212,6 +212,8 @@ function exportDesktopProfile(filePath?: string): void {
     return;
   }
   writeFileSync(filePath, json, { mode: 0o600 });
+  // mode only applies at creation — enforce 0600 on pre-existing files too.
+  chmodSync(filePath, 0o600);
   process.stdout.write(`${filePath}\n`);
 }
 

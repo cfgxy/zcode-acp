@@ -2,7 +2,7 @@ import type { BridgeBackend, ZcodeEvent, ZcodeResponse } from "../types.js";
 import { loadDesktopChildEnvWithRefresh } from "../../desktop-profile.js";
 import { warn } from "../../utils.js";
 import type { EventListenerLike } from "../types.js";
-import { ServiceChannel, ZServerConnection } from "./index.js";
+import { ServiceChannel, ZServerConnection, ZServerConnectionError } from "./index.js";
 
 export interface ZServerBackendOptions {
   serverRoot?: string;
@@ -32,7 +32,12 @@ export async function runtimeEnvWithProfile(base: NodeJS.ProcessEnv): Promise<No
   try {
     const pins = loadDesktopChildEnvWithRefresh();
     return { ...base, ...pins };
-  } catch {
+  } catch (error) {
+    warn(
+      `backend: desktop profile unavailable (${
+        error instanceof Error ? error.message : String(error)
+      }) — spawning server with plain env (local authority)`,
+    );
     return base;
   }
 }
@@ -51,10 +56,18 @@ export class ZServerBackend implements BridgeBackend {
   /** Sessions with live server-side subscriptions (conversation/terminal/state). */
   private readonly subscribedSessions = new Set<string>();
   private readonly gatesBySession = new Map<string, TurnCompletionGate>();
+  private readonly terminalErrorBySession = new Map<string, Record<string, unknown> | undefined>();
   private spawnPromise: Promise<void> | null = null;
   private idleTimer: NodeJS.Timeout | null = null;
   /** Idle ms before the server child is shut down (0 = keep forever). */
   private readonly idleMs = Number(process.env.ZCODE_ACP_ZSERVER_IDLE_MS ?? 0) || 0;
+  /** Intentional-shutdown marker: the child's exit during close() must NOT
+   *  mark the backend dead — index.ts's death poller would kill the whole
+   *  bridge within 2s otherwise (idle recycle == suicide without this). */
+  private closing = false;
+  /** Monotonic spawn generation: a close() during an in-flight spawn() must
+   *  leave the late connection disposed, not assigned (orphan/dual-server). */
+  private spawnGeneration = 0;
 
   constructor(
     private readonly options: ZServerBackendOptions = {},
@@ -72,9 +85,14 @@ export class ZServerBackend implements BridgeBackend {
       this.spawnPromise.catch((error: unknown) => {
         this.spawnPromise = null;
         this.isDead = true;
-        this.deathReason = `zcode backend reader exited (backend dead): ${
-          error instanceof Error ? error.message : String(error)
-        }`;
+        const message = error instanceof Error ? error.message : String(error);
+        // Wire contract (supervise.ts consumers): "spawn failed" prefix classifies
+        // permanent unbootable states (ERR_SPAWN_FAILED, no infinite retry);
+        // anything else keeps the backend-dead marker for retryable healing.
+        this.deathReason =
+          error instanceof ZServerConnectionError && error.phase === "spawn"
+            ? `spawn failed: ${message}`
+            : `zcode backend reader exited (backend dead): ${message}`;
       });
     }
     await this.spawnPromise;
@@ -82,6 +100,11 @@ export class ZServerBackend implements BridgeBackend {
   }
 
   private async spawn(): Promise<void> {
+    const generation = ++this.spawnGeneration;
+    // A fresh spawn starts a fresh lifecycle: clear the intentional-shutdown
+    // marker (idle-recycle/close set it so the OLD child's exit was ignored;
+    // without clearing here the backend could never respawn).
+    this.closing = false;
     const socketPath = process.env.ZCODE_ACP_ZSERVER_SOCKET;
     let connection: ZServerConnection | null = null;
     if (socketPath) {
@@ -102,22 +125,33 @@ export class ZServerBackend implements BridgeBackend {
       clientId: this.clientId,
       env: await runtimeEnvWithProfile(process.env),
     });
+    if (this.closing || generation !== this.spawnGeneration) {
+      // close() raced the spawn: nobody wants this connection anymore.
+      connection.dispose();
+      return;
+    }
     this.connection = connection;
     this.isDead = false;
     this.deathReason = null;
+    this.closing = false;
     // Server-side subscriptions died with the previous connection (spawn
     // mode: new server child; attach mode: possibly respawned shared server).
     // Re-establish lazily via session/resume on the heal path.
     this.subscribedSessions.clear();
     this.emittedByRow.clear();
-    connection.onExit((code, signal) => {
+    connection.onExit((code, signal, detail) => {
+      if (this.closing) {
+        // Expected shutdown (idle recycle / close): stay alive, next request
+        // lazily respawns.
+        return;
+      }
       this.isDead = true;
       // Message carries the canonical "backend reader exited" marker so the
       // supervision classifiers (isBackendDeadMessage) recognize zserver-mode
       // deaths and the heal path fires exactly as for the direct backend.
       this.deathReason =
         "zcode backend reader exited (backend dead): " +
-        `zcode server exited (code=${code ?? "null"} signal=${signal ?? "null"})`;
+        `zcode server exited (${detail ?? `code=${code ?? "null"} signal=${signal ?? "null"}`})`;
       warn(`backend: ${this.deathReason}`);
     });
     this.armIdleTimer();
@@ -177,13 +211,19 @@ export class ZServerBackend implements BridgeBackend {
       // (EventStreamListener subscribe retry, resume retry) key on the exact
       // error message "timeout" — a wedged-but-alive server must surface as a
       // retryable timeout, not hang the turn setup forever.
-      const result = await Promise.race([
-        this.route(connection, method, params),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new RequestTimeoutError()), timeoutMs),
-        ),
-      ]);
-      return { id, result: result as Record<string, unknown> };
+      let timeoutHandle: NodeJS.Timeout | undefined;
+      try {
+        const result = await Promise.race([
+          this.route(connection, method, params),
+          new Promise<never>((_, reject) => {
+            timeoutHandle = setTimeout(() => reject(new RequestTimeoutError()), timeoutMs);
+            timeoutHandle.unref?.();
+          }),
+        ]);
+        return { id, result: result as Record<string, unknown> };
+      } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
+      }
     } catch (error) {
       if (error instanceof RequestTimeoutError) {
         return { id, error: { message: "timeout" } };
@@ -266,12 +306,34 @@ export class ZServerBackend implements BridgeBackend {
       case "session/load":
       case "session/resume": {
         const target = this.workspaceBySession.get(sessionId) ?? workspacePath;
+        if (!target) {
+          throw new Error(
+            "session/resume requires workspace (no mapping for session — " +
+              "send workspace:{workspacePath} so later session/send can address it)",
+          );
+        }
+        // Remember the mapping: session/send / read / stop carry only sessionId
+        // (no workspace), and after a bridge restart this is the only place
+        // the mapping is rebuilt.
+        this.workspaceBySession.set(sessionId, target);
         const result = await agentChannel.call("readSession", { workspacePath: target, sessionId });
         // The heal path resumes after a backend restart; server-side
         // subscriptions died with the old connection — re-establish them so
         // the turn loop sees events again (idempotent via subscribedSessions).
         this.subscribeConversation(connection, target, sessionId);
         return result;
+      }
+      case "session/messages": {
+        // History surface (replay/differ baseline). The inner readSession
+        // snapshot carries the persisted message log; deep shape parity with
+        // the direct backend's dialect is pending live verification (ADR), but
+        // routing it beats the previous silent blank (fetchMessages warn+[]).
+        const target = this.workspaceBySession.get(sessionId) ?? workspacePath;
+        const snapshot = (await agentChannel.call("readSession", {
+          workspacePath: target,
+          sessionId,
+        })) as { messages?: unknown };
+        return { messages: snapshot?.messages ?? [] };
       }
       case "session/list": {
         const metas = (await tasks.call("listTasks", {})) as {
@@ -332,12 +394,19 @@ export class ZServerBackend implements BridgeBackend {
     this.gatesBySession.get(sessionId)?.dispose();
     const gate = new TurnCompletionGate((outcome) => {
       const type: ZcodeEvent["type"] = outcome === "failed" ? "turn.failed" : "turn.completed";
-      deliver({ type, payload: { resultType: terminalResultType(outcome) } });
+      const payload: Record<string, unknown> = { resultType: terminalResultType(outcome) };
+      const error = this.terminalErrorBySession.get(sessionId);
+      if (outcome === "failed" && error) payload["error"] = error;
+      deliver({ type, payload });
     });
     this.gatesBySession.set(sessionId, gate);
     connection.channelOf("zcode-task").listen("onDynamicTaskTerminalOutcome", sessionId, (data) => {
-      const outcome = (data as { outcome?: string } | null)?.outcome;
-      if (typeof outcome === "string") gate.onTerminalOutcome(outcome);
+      const record = data as { outcome?: string; error?: Record<string, unknown> } | null;
+      if (typeof record?.outcome !== "string") return;
+      // Carry the error dict through: turn.failed consumers read payload.error
+      // for user-facing formatting and transient-retry classification.
+      this.terminalErrorBySession.set(sessionId, record.error);
+      gate.onTerminalOutcome(record.outcome);
     });
     // Session state notifications (settings changes) pass through unwrapped.
     connection.listen(
@@ -377,11 +446,21 @@ export class ZServerBackend implements BridgeBackend {
         sessionId,
         clientMode: "desktop-continuous",
       })
-      .catch((error) => warn(`backend: conversation subscribe failed: ${error.message}`));
+      .catch((error) => {
+        // Roll back the marker: a transient subscribe failure must not
+        // permanently mark the session "subscribed" (every later
+        // subscribe/resume would be no-opped and the session stay deaf).
+        this.subscribedSessions.delete(sessionId);
+        warn(`backend: conversation subscribe failed: ${error.message}`);
+      });
   }
 
   send(method: string, params: Record<string, unknown>): void {
-    void this.request(0, method, params).catch(() => undefined);
+    void this.request(0, method, params).then((response) => {
+      if (response.error) {
+        warn(`backend: send(${method}) failed: ${response.error.message}`);
+      }
+    });
   }
 
   registerEventListener(sessionId: string, listener: EventListenerLike): void {
@@ -391,12 +470,21 @@ export class ZServerBackend implements BridgeBackend {
   }
 
   unregisterEventListener(sessionId: string, listener: EventListenerLike): void {
-    this.listeners.get(sessionId)?.delete(listener);
+    const set = this.listeners.get(sessionId);
+    if (!set) return;
+    set.delete(listener);
+    // Drop the empty set (mirrors ZcodeBackend): stale empty sets keep
+    // listeners.size > 0 forever, which permanently disarms idle recycling.
+    if (set.size === 0) this.listeners.delete(sessionId);
   }
 
   /** Drop per-session streaming state (called on session close/eviction). */
   forgetSession(sessionId: string): void {
     this.listeners.delete(sessionId);
+    this.workspaceBySession.delete(sessionId);
+    this.seqBySession.delete(sessionId);
+    this.subscribedSessions.delete(sessionId);
+    this.terminalErrorBySession.delete(sessionId);
     this.gatesBySession.get(sessionId)?.dispose();
     this.gatesBySession.delete(sessionId);
     // Row keys are namespaced `${sessionId}:${rowId}` (rowIds are per-session
@@ -407,15 +495,33 @@ export class ZServerBackend implements BridgeBackend {
   }
 
   async close(): Promise<void> {
+    this.closing = true;
+    this.spawnGeneration++;
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
     this.connection?.dispose();
     this.connection = null;
     this.spawnPromise = null;
   }
 
-  /** Supervised heal path: respawn the server connection in place. */
+  /** Supervised heal path: respawn the server connection in place. Never
+   *  throws — a transient respawn failure stays visible via the next
+   *  request's error (driving the next heal round) instead of splitting
+   *  listeners across a replacement backend instance (server.ts swaps in a
+   *  new ZServerBackend when restart throws, orphaning every listener). */
   async restart(_reason: string): Promise<void> {
     await this.close();
-    await this.ensureConnection();
+    try {
+      await this.ensureConnection();
+    } catch (error) {
+      warn(
+        `backend: zserver respawn failed after restart (${
+          error instanceof Error ? error.message : String(error)
+        }) — next request retries`,
+      );
+    }
   }
 }
 /**

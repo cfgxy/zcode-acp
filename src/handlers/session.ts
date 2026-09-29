@@ -125,7 +125,7 @@ async function syncProviderRegistry(server: ZcodeAcpServer, cwd: string): Promis
         10000,
       );
     if (resp.error) {
-      if (/method not found/i.test(resp.error.message)) {
+      if (/method not found|not supported in zserver backend mode/i.test(resp.error.message)) {
         providerRegistryPushUnsupported = true;
         log(
           "provider-registry: backend removed workspace/updateProviderRegistry (zcode ≥ 0.16.9 " +

@@ -134,16 +134,22 @@ export class FrameDecoder {
       if (!header) {
         return;
       }
+      const type = header.readUInt8(0);
       const length = header.readUInt32BE(9);
       if (this.totalLength < HEADER_SIZE + length) {
         return;
       }
       this.read(HEADER_SIZE);
       if (length === 0) {
-        this.onMessage(Buffer.alloc(0));
+        if (type === FrameType.Regular) this.onMessage(Buffer.alloc(0));
         continue;
       }
-      this.onMessage(this.read(length));
+      const body = this.read(length)!;
+      // Only Regular frames carry RPC messages; Control/Ack/KeepAlive frames
+      // are consumed silently (mirrors the reference SocketProtocol).
+      if (type === FrameType.Regular) {
+        this.onMessage(body);
+      }
     }
   }
 }
@@ -186,14 +192,20 @@ function encodeRpcJsonValue(_key: string, value: unknown): unknown {
 }
 
 function decodeRpcJsonValue(_key: string, value: unknown): unknown {
+  // Guard parity with the reference implementation (isRpcEncodedUint8Array):
+  // marker===true AND base64 is a string AND exactly two keys — anything else
+  // is a plain object the sender embedded and must pass through untouched.
   if (
     typeof value === "object" &&
     value !== null &&
     !Array.isArray(value) &&
-    (value as Record<string, unknown>)[RPC_NESTED_UINT8_ARRAY_MARKER] === true
+    (value as Record<string, unknown>)[RPC_NESTED_UINT8_ARRAY_MARKER] === true &&
+    typeof (value as Record<string, unknown>)["base64"] === "string" &&
+    Object.keys(value).length === 2
   ) {
-    const record = value as Record<string, unknown>;
-    return new Uint8Array(Buffer.from(record.base64 as string, "base64"));
+    return new Uint8Array(
+      Buffer.from((value as Record<string, unknown>)["base64"] as string, "base64"),
+    );
   }
   return value;
 }
@@ -287,6 +299,11 @@ function decodeValue(buffer: Buffer, state: { pos: number }): unknown {
     }
     case DataType.Array: {
       const length = readIntVQL(buffer, state);
+      // A crafted 6-byte payload can claim 2^31-1 elements and hang/OOM the
+      // decoder (each element consumes ≥1 byte, so the claim is impossible).
+      if (length > buffer.byteLength - state.pos) {
+        throw new Error(`zserver protocol: array length ${length} exceeds remaining payload`);
+      }
       const result: unknown[] = [];
       for (let i = 0; i < length; i++) {
         result.push(decodeValue(buffer, state));

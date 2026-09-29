@@ -160,6 +160,38 @@ respondElicitation / resumeTask / closeTask / deliverSessionMessage / …`；
 - 已知差距追加：zserver 模式暂不产出 usage/session.updated（上下文条
   无数据），需实测 V4 行中的 usage 形状后补。
 
+### 多 agent 并行深审（第十一次审查，5 视角）
+
+单人 dry-run 十轮后改用 5 个并行 subagent 各持正交视角逐行审阅未推送
+diff（并发竞态 / 协议字节保真 / 资源生命周期 / 错误处理降级 / 集成契约），
+一次性发现 7 高 + 12 中 + 9 低——显著多于单视角连续十轮的任何一轮，
+证实"每轮都发现新问题"源于单视角盲区而非代码无限恶化。关键修复：
+
+- `'error'` 事件零监听（child/stdin/socket）——异步 EPIPE/RST 击穿进程；
+  补齐监听并路由进 exit 语义。
+- broker 双 id 分配器线上相撞：broker 自身 ChannelClient（低段 id）与
+  客户端路由 id 共用 server id 空间——路由 id 移至 1_000_000 高段
+  （同 ZcodeBackend.sendIdCounter 手法）。
+- 空闲回收=自杀：idle 关闭 → onExit 置 isDead → index.ts 死亡轮询 2s
+  内杀 bridge；closing 标志区分"主动关闭"与"意外死亡"（新 spawn 复位）。
+- resume 不记录 workspace：跨 bridge 重启后首次 sendPrompt 带空
+  workspacePath 必失败——resume/load 现在重建映射并在缺 workspace 时
+  显式报错。
+- broker rejected spawning 永久缓存；attach 失败泄漏 socket+幽灵客户端；
+  SIGINT 启动窗口孤儿——均已修。
+- 子进程组杀+SIGKILL 升级+看门狗（owner 被 SIGKILL 时回收整组）。
+- `session/messages` 路由（readSession.messages 透传，形状待实测）——
+  此前历史回放静默空白。
+- 订阅失败回滚 subscribedSessions；decodeRpcJsonValue 补参考实现两条
+  守卫；FrameDecoder 只投递 Regular 帧；数组长度上界；帧解码 try/catch
+  不入事件循环；restart() 不抛（防实例劈分）；spawn 失败带 "spawn
+  failed" 前缀（wire 分类契约）；terminal outcome 透传 error 字典；
+  unregister 删空 Set（idle 回收可达）；routeClientFrame await 后复查
+  客户端存活性；broker 客户端 socket 持久 error 监听+写前检查。
+
+仍开放（需实机数据）：usage/session.updated 产出、readSession 深层
+projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
+
 ### 粗糙边缘（server 侧，避免踩坑）
 
 - `ProxyChannel.fromService` 对**未知事件名同步 throw**，会把整个 server 进程

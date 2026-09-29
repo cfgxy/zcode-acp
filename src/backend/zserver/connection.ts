@@ -31,7 +31,11 @@ export interface HelloInfo {
   pid?: number;
 }
 
-export type ZServerExitHandler = (code: number | null, signal: string | null) => void;
+export type ZServerExitHandler = (
+  code: number | null,
+  signal: string | null,
+  detail?: string,
+) => void;
 
 export type ZServerConnectionPhase = "spawn" | "hello" | "ready";
 
@@ -94,7 +98,18 @@ export class ZServerConnection {
     });
     this.channel = new ServiceChannel(this.client, DEFAULT_CHANNEL);
     this.frameDecoder = new FrameDecoder((payload) => {
-      this.client.onMessage(decodeMessage(payload));
+      // Malformed frames must never escape into the event loop (an uncaught
+      // throw inside a stream 'data' handler kills the process).
+      try {
+        this.client.onMessage(decodeMessage(payload));
+      } catch (error) {
+        warn(
+          `zserver: undecodable frame dropped: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        return;
+      }
       for (const listener of [...this.rawFrameListeners]) {
         try {
           listener(payload);
@@ -117,7 +132,7 @@ export class ZServerConnection {
         }),
       );
       for (const handler of [...this.exitHandlers]) {
-        handler(null, null);
+        handler(null, null, detail);
       }
     });
   }
@@ -149,8 +164,15 @@ export class ZServerConnection {
     try {
       await connection.handshake(options.version ?? "0.0.0");
     } catch (error) {
-      // A failed handshake must not leak the spawned server child.
+      // A failed handshake must not leak the spawned server child. Attach the
+      // stderr tail — a bundle crashing at startup prints its reason there.
       connection.dispose();
+      if (error instanceof ZServerConnectionError) {
+        const tail = connection.stderrTailLines(3);
+        if (tail.length > 0) {
+          error.message = `${error.message} | stderr: ${tail.join(" / ").slice(0, 400)}`;
+        }
+      }
       throw error;
     }
     return connection;
@@ -173,18 +195,33 @@ export class ZServerConnection {
     });
     const clientId = options.clientId ?? `zcode-acp-${process.pid}`;
     const connection = new ZServerConnection(null, options.serverRoot ?? "", clientId, {
-      writeFrame: (payload) => socket.write(payload),
-      shutdown: () => socket.end(),
+      writeFrame: (payload) => {
+        if (!socket.destroyed) socket.write(payload);
+      },
+      shutdown: () => socket.destroy(),
       bind: (onStdout, _onStderr) => {
         socket.on("data", (chunk) => onStdout(chunk));
+        // Persistent (not once): RST/ECONNRESET must never surface as an
+        // unhandled 'error' event — route to close semantics instead.
+        socket.on("error", (error) => {
+          warn(`zserver: attach socket error (handled): ${error.message}`);
+          socket.destroy();
+        });
       },
       onExit: (cb) => socket.once("close", () => cb("socket closed")),
     });
-    await Promise.race([
-      connection.client.whenInitialized(),
-      connection.exitFailure,
-      timeout(READY_TIMEOUT_MS, "ready"),
-    ]);
+    try {
+      await Promise.race([
+        connection.client.whenInitialized(),
+        connection.exitFailure,
+        timeout(READY_TIMEOUT_MS, "ready"),
+      ]);
+    } catch (error) {
+      // A failed attach must not leak the connected socket, nor leave a ghost
+      // client entry on the broker (which would block its idle exit forever).
+      connection.dispose();
+      throw error;
+    }
     return connection;
   }
 
@@ -241,6 +278,11 @@ export class ZServerConnection {
   onRawFrame(listener: (payload: Buffer) => void): () => void {
     this.rawFrameListeners.add(listener);
     return () => this.rawFrameListeners.delete(listener);
+  }
+
+  /** stderr tail (last lines) for failure diagnostics. */
+  stderrTailLines(count = 5): string[] {
+    return this.stderrTail.slice(-count);
   }
 
   onExit(handler: ZServerExitHandler): () => void {

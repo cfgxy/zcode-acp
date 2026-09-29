@@ -56,8 +56,11 @@ export class ZServerBroker {
   private nextClientId = 1;
   /** Server-side id space is broker-global: per-client counters would collide
    *  (two clients' EventListen rewriting to id 1 collapse into ONE server-side
-   *  subscription, and event routing becomes first-match ambiguity). */
-  private nextServerId = 1;
+   *  subscription, and event routing becomes first-match ambiguity). The high
+   *  offset keeps routed-client ids clear of the broker's OWN ChannelClient
+   *  (prefs responder + subscriptions), which allocates from 0 on the same
+   *  wire — same trick as ZcodeBackend.sendIdCounter. */
+  private nextServerId = 1_000_000;
   private idleTimer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -150,6 +153,11 @@ export class ZServerBroker {
         });
       })();
     }
+    // A rejected spawn must never be cached: reset it so the next client
+    // retries (one transient failure must not wedge the broker forever).
+    this.spawning.catch(() => {
+      this.spawning = null;
+    });
     await this.spawning;
     if (this.stopped) {
       // stop() raced the spawn: the connection was registered after the guard
@@ -201,7 +209,12 @@ export class ZServerBroker {
       entry.serverIdByClient.clear();
       this.armIdleExit();
     });
-    socket.once("error", () => socket.destroy());
+    // Persistent (not once): a second 'error' after the first (e.g. write to
+    // an already-RST socket) must not escape as unhandled and crash the broker.
+    socket.on("error", (error) => {
+      warn(`zserver-broker: client ${clientId} socket error: ${error.message}`);
+      socket.destroy();
+    });
 
     void this.ensureServer()
       .then((connection) => {
@@ -226,7 +239,24 @@ export class ZServerBroker {
       entry.socket.destroy();
       return;
     }
-    const header = decodeMessage(payload).header as unknown[];
+    if (entry.socket.destroyed || ![...this.clients.values()].includes(entry)) {
+      // The client vanished while we awaited the shared server: forwarding its
+      // frame (e.g. an EventListen) would leak a server-side subscription that
+      // can never be routed back.
+      return;
+    }
+    let header: unknown[];
+    try {
+      header = decodeMessage(payload).header as unknown[];
+    } catch (error) {
+      warn(
+        `zserver-broker: undecodable client frame (${
+          error instanceof Error ? error.message : String(error)
+        }) — disconnecting`,
+      );
+      entry.socket.destroy();
+      return;
+    }
     if (!Array.isArray(header)) return;
     const [type, clientRequestId] = header as [number, number?];
     if (typeof clientRequestId === "number") {
@@ -260,7 +290,19 @@ export class ZServerBroker {
 
   /** Forward one server-side frame to its owning client (or drop). */
   private routeServerPayload(payload: Buffer): void {
-    const header = decodeMessage(payload).header as unknown[];
+    let header: unknown[];
+    try {
+      header = decodeMessage(payload).header as unknown[];
+    } catch (error) {
+      // Malformed server frames must never crash the broker (AGENTS.md:
+      // event handlers are best-effort, never thrown into the event loop).
+      warn(
+        `zserver-broker: undecodable server frame (${
+          error instanceof Error ? error.message : String(error)
+        }) — dropped`,
+      );
+      return;
+    }
     if (!Array.isArray(header)) return;
     const [type, id] = header as [number, number?];
     if (type === 200) return; // server Initialize — synthesized per client
@@ -279,7 +321,9 @@ export class ZServerBroker {
         }
       }
       header[1] = clientRequestId;
-      entry.socket.write(encodeFrame(replaceHeader(payload, header)));
+      if (!entry.socket.destroyed) {
+        entry.socket.write(encodeFrame(replaceHeader(payload, header)));
+      }
       return;
     }
   }
@@ -289,9 +333,7 @@ export class ZServerBroker {
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => {
       log(`zserver-broker: idle ${CLIENT_IDLE_EXIT_MS}ms with no clients — exiting`);
-      this.connection?.dispose();
-      this.server?.close(() => unlinkSync(this.socketPath));
-      process.exit(0);
+      void this.stop().then(() => process.exit(0));
     }, CLIENT_IDLE_EXIT_MS);
     this.idleTimer.unref?.();
   }
@@ -299,6 +341,10 @@ export class ZServerBroker {
   async stop(): Promise<void> {
     this.stopped = true;
     if (this.idleTimer) clearTimeout(this.idleTimer);
+    // A SIGINT during the startup handshake must not orphan the in-flight
+    // server child: wait for the spawn to settle (the continuation disposes
+    // it when stopped) before tearing the listener down and exiting.
+    await this.spawning?.catch(() => undefined);
     for (const entry of this.clients.values()) entry.socket.destroy();
     this.clients.clear();
     this.connection?.dispose();

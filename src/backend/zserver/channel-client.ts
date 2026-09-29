@@ -150,8 +150,11 @@ export class ChannelClient {
     }
     const id = this.lastRequestId++;
     let attached = false;
+    // Unsubscribe before the queued attach ran must cancel it, or the
+    // subscription arms after the caller believes it is gone (leak).
+    let cancelled = false;
     const attach = () => {
-      if (this.disposed || attached) {
+      if (this.disposed || attached || cancelled) {
         return;
       }
       attached = true;
@@ -170,6 +173,7 @@ export class ChannelClient {
     }
     return () => {
       if (!attached) {
+        cancelled = true;
         return;
       }
       attached = false;

@@ -174,3 +174,32 @@ describe("replaceHeader (byte-faithful forwarding)", () => {
   });
 });
 const DataType_VSBuffer = 3;
+
+describe("multi-agent audit: decode hardening", () => {
+  it("rejects array length claims exceeding the payload", () => {
+    // Array tag + VQL(2^31-1) — 6 bytes total, impossible element claim.
+    const payload = Buffer.from([0x04, 0xff, 0xff, 0xff, 0xff, 0x07]);
+    expect(() => decodeMessage(payload)).toThrowError(/array length/);
+  });
+
+  it("passes marker-shaped plain objects through untouched (guard parity)", async () => {
+    const { encodeMessage } = await import("../src/backend/zserver/protocol.js");
+    const crafted = { __zcode_rpc_nested_uint8array_v1: true, base64: 123 };
+    const decoded = decodeMessage(encodeMessage(crafted, undefined));
+    expect(decoded.header).toEqual(crafted); // NOT coerced, NOT crashed
+    const extra = { __zcode_rpc_nested_uint8array_v1: true, base64: "QUJD", keep: 1 };
+    expect(decodeMessage(encodeMessage(extra, undefined)).header).toEqual(extra);
+  });
+
+  it("delivers only Regular frames from the decoder", () => {
+    const delivered: Buffer[] = [];
+    const decoder = new FrameDecoder((p) => delivered.push(p));
+    const keepAlive = Buffer.alloc(13);
+    keepAlive.writeUInt8(9, 0); // KeepAlive
+    keepAlive.writeUInt32BE(4, 9);
+    const regular = encodeFrame(encodeMessage([201, 1], "ok"));
+    decoder.push(Buffer.concat([keepAlive, Buffer.from("junk"), regular]));
+    expect(delivered).toHaveLength(1);
+    expect(decodeMessage(delivered[0]!).header).toEqual([201, 1]);
+  });
+});
