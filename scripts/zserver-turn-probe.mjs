@@ -16,9 +16,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const workspace = path.resolve(
-  process.argv[2] ?? fs.mkdtempSync(path.join(os.tmpdir(), "zserver-turn-")),
-);
+// A workspace the probe creates itself is removed on exit; a caller-supplied
+// one is never touched.
+const ownedWorkspace = process.argv[2]
+  ? null
+  : fs.mkdtempSync(path.join(os.tmpdir(), "zserver-turn-"));
+const workspace = path.resolve(process.argv[2] ?? ownedWorkspace);
+process.on("exit", () => {
+  if (ownedWorkspace) fs.rmSync(ownedWorkspace, { force: true, recursive: true });
+});
 const prompt = process.argv[3] ?? "Reply with exactly: ok";
 const clientId = `zserver-turn-probe-${process.pid}`;
 const TURN_TIMEOUT_MS = 60_000;

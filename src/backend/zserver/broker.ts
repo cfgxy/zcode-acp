@@ -47,7 +47,10 @@ export function assertSocketPathFits(socketPath: string): void {
   }
 }
 
-const CLIENT_IDLE_EXIT_MS = Number(process.env.ZCODE_ACP_ZSERVER_BROKER_IDLE_EXIT_MS ?? 0) || 0;
+/** Idle ms with no attached client before the broker exits (0 = never). */
+function clientIdleExitMs(): number {
+  return Number(process.env.ZCODE_ACP_ZSERVER_BROKER_IDLE_EXIT_MS ?? 0) || 0;
+}
 /** Per-client inbound cap: a frame claiming more than this is a hostile/misbehaving peer. */
 function maxClientBufferBytes(): number {
   return Number(process.env.ZCODE_ACP_ZSERVER_MAX_CLIENT_BUFFER ?? 0) || 8 * 1024 * 1024;
@@ -84,7 +87,24 @@ export const BROKER_ALLOWED_EVENTS: Readonly<Record<string, ReadonlySet<string>>
 /** umask in force while the socket file is created (=> mode 0600 at birth). */
 export const BROKER_BIND_UMASK = 0o177;
 
-export type HeaderVerdict = { ok: true } | { ok: false; reason: string };
+/** Policy rejections tolerated per client before it is disconnected. */
+const MAX_VIOLATIONS_PER_CLIENT = 5;
+
+/** Outstanding (un-answered calls + live subscriptions) requests allowed per
+ *  client. Bounds the broker's id maps against a client that never completes. */
+function maxPendingPerClient(): number {
+  return Number(process.env.ZCODE_ACP_ZSERVER_MAX_PENDING ?? 0) || 4096;
+}
+
+export type HeaderVerdict =
+  | { ok: true }
+  | {
+      ok: false;
+      reason: string;
+      /** Set when the header is well-formed and only POLICY rejected it: the
+       *  client can be answered (its id is known) instead of just cut off. */
+      replyTo?: number;
+    };
 
 /**
  * Validate a client frame header BEFORE any forwarding/re-encoding: exact shape
@@ -113,16 +133,25 @@ export function validateClientHeader(header: unknown): HeaderVerdict {
     return { ok: false, reason: "call/listen header must be [type,id,channel,name]" };
   }
   const table = type === 100 ? BROKER_ALLOWED_CALLS : BROKER_ALLOWED_EVENTS;
-  if (!table[channel]?.has(name)) {
+  // Own-property lookup: the tables are plain objects, so a bare index would
+  // resolve "__proto__"/"constructor"/"toString" to inherited members and
+  // `?.has` would then throw on a non-Set — killing the broker from one frame.
+  const allowed = Object.hasOwn(table, channel) ? table[channel] : undefined;
+  if (!allowed?.has(name)) {
     return {
       ok: false,
       reason: `${type === 100 ? "call" : "event"} ${channel}.${name} is not allowed through the broker`,
+      replyTo: id,
     };
   }
   return { ok: true };
 }
 
 interface ClientEntry {
+  /** Broker-local client number, for log correlation only. */
+  id: number;
+  /** Policy rejections so far; the client is cut off at MAX_VIOLATIONS_PER_CLIENT. */
+  violations: number;
   socket: Socket;
   /** server-side request id → client-side request id (route responses/events back). */
   idByClient: Map<number, number>;
@@ -149,8 +178,11 @@ export class ZServerBroker {
   private connection: ZServerConnection | null = null;
   private spawning: Promise<void> | null = null;
   private stopped = false;
+  private rejectedFrames = 0;
   /** Test seam: invoked with the socket file's mode at the instant of creation. */
   onBoundForTest?: (mode: number) => void;
+  /** Process exit used by the idle-exit path (replaceable so tests can observe it). */
+  exitProcess: (code: number) => void = (code) => process.exit(code);
   private readonly clients = new Map<number, ClientEntry>();
   private nextClientId = 1;
   /** Server-side id space is broker-global: per-client counters would collide
@@ -186,22 +218,28 @@ export class ZServerBroker {
       unlinkSync(this.socketPath);
     }
     this.server = createServer((socket) => this.onClient(socket));
+    const listening = new Promise<void>((resolve, reject) => {
+      this.server!.once("listening", resolve);
+      this.server!.once("error", reject);
+    });
     // bind() creates the socket file with 0777 & ~umask; tightening it with
     // chmod AFTER listen leaves a window (umask 000/002 → group/world
     // connectable). Bind under umask 0177 so it is 0600 from creation.
+    // listen(path) performs bind() synchronously (EADDRINUSE and friends
+    // arrive later as an 'error' event), so the process-global umask is
+    // changed only for this synchronous call — never across an await, where
+    // unrelated code in this process would create files with it.
     const previousUmask = process.umask(BROKER_BIND_UMASK);
     try {
-      await new Promise<void>((resolve, reject) => {
-        this.server!.listen(this.socketPath, () => {
-          // Test seam: report the effective creation-time mode of the socket file.
-          this.onBoundForTest?.(fs.statSync(this.socketPath).mode & 0o777);
-          resolve();
-        });
-        this.server!.once("error", reject);
-      });
+      this.server.listen(this.socketPath);
+      // Test seam: the socket file's mode at the instant of creation.
+      if (this.onBoundForTest && existsSync(this.socketPath)) {
+        this.onBoundForTest(fs.statSync(this.socketPath).mode & 0o777);
+      }
     } finally {
       process.umask(previousUmask);
     }
+    await listening;
     // The broker drives a server holding credentials; a world-connectable
     // socket would hand that to any local user. Restrict to the owner.
     try {
@@ -283,6 +321,8 @@ export class ZServerBroker {
   private onClient(socket: Socket): void {
     const clientId = this.nextClientId++;
     const entry: ClientEntry = {
+      id: clientId,
+      violations: 0,
       socket,
       idByClient: new Map(),
       serverIdByClient: new Map(),
@@ -295,7 +335,17 @@ export class ZServerBroker {
     }
 
     const decoder = new FrameDecoder((payload) => {
-      void this.routeClientFrame(entry, payload);
+      // routeClientFrame contains its own failures; the catch here is the
+      // last line of defence — a rejection escaping a `void` promise would be
+      // an unhandledRejection that kills the shared daemon.
+      this.routeClientFrame(entry, payload).catch((error: unknown) => {
+        warn(
+          `zserver-broker: client ${clientId} frame handling failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        socket.destroy();
+      });
     });
     socket.on("data", (chunk: Buffer) => {
       decoder.push(chunk);
@@ -371,7 +421,24 @@ export class ZServerBroker {
     }
     const verdict = validateClientHeader(header);
     if (!verdict.ok) {
-      warn(`zserver-broker: rejected client frame (${verdict.reason}) — disconnecting`);
+      entry.violations++;
+      this.rejectedFrames++;
+      warn(
+        `zserver-broker: client ${entry.id} frame rejected (${verdict.reason}) ` +
+          `[${entry.violations}/${MAX_VIOLATIONS_PER_CLIENT}]`,
+      );
+      // A well-formed but disallowed request is ANSWERED (the client sees why
+      // instead of an opaque "socket closed" it would misread as a server
+      // death and heal against forever). Malformed frames, and clients that
+      // keep offending, are still cut off.
+      if (
+        verdict.replyTo !== undefined &&
+        entry.violations < MAX_VIOLATIONS_PER_CLIENT &&
+        !entry.socket.destroyed
+      ) {
+        this.replyError(entry, verdict.replyTo, "BrokerPolicyError", verdict.reason);
+        return;
+      }
       entry.socket.destroy();
       return;
     }
@@ -387,6 +454,17 @@ export class ZServerBroker {
         entry.serverIdByClient.delete(clientRequestId);
         entry.idByClient.delete(serverId);
       } else {
+        if (entry.idByClient.size >= maxPendingPerClient()) {
+          // Resource limit, not misbehaviour: answer, don't count a violation.
+          warn(`zserver-broker: client ${entry.id} exceeded the pending-request limit`);
+          this.replyError(
+            entry,
+            clientRequestId,
+            "BrokerLimitError",
+            "too many outstanding requests through the broker",
+          );
+          return;
+        }
         const serverId = this.nextServerId++;
         entry.idByClient.set(serverId, clientRequestId);
         entry.serverIdByClient.set(clientRequestId, serverId);
@@ -403,6 +481,26 @@ export class ZServerBroker {
       );
       entry.socket.destroy();
     }
+  }
+
+  /** Answer one client request with a PromiseError (202) frame. */
+  private replyError(entry: ClientEntry, id: number, name: string, message: string): void {
+    if (entry.socket.destroyed) return;
+    entry.socket.write(
+      encodeFrame(encodeMessage([202, id], { message: `broker: ${message}`, name })),
+    );
+  }
+
+  /** Point-in-time counters (tests, and the basis for a future status probe). */
+  stats(): { clients: number; pending: number; rejected: number; sharedServerPid: number | null } {
+    let pending = 0;
+    for (const entry of this.clients.values()) pending += entry.idByClient.size;
+    return {
+      clients: this.clients.size,
+      pending,
+      rejected: this.rejectedFrames,
+      sharedServerPid: this.connection?.child?.pid ?? null,
+    };
   }
 
   /** Forward one server-side frame to its owning client (or drop). */
@@ -433,8 +531,10 @@ export class ZServerBroker {
       if (clientRequestId === undefined) continue;
       if (terminal) {
         entry.idByClient.delete(id);
-        for (const [clientKey, serverKey] of entry.serverIdByClient) {
-          if (serverKey === id) entry.serverIdByClient.delete(clientKey);
+        // Only drop the reverse entry if it still points at THIS server id (a
+        // client that reused a request id overwrote it with a newer one).
+        if (entry.serverIdByClient.get(clientRequestId) === id) {
+          entry.serverIdByClient.delete(clientRequestId);
         }
       }
       header[1] = clientRequestId;
@@ -446,12 +546,23 @@ export class ZServerBroker {
   }
 
   private armIdleExit(): void {
-    if (!CLIENT_IDLE_EXIT_MS || this.clients.size > 0) return;
+    const idleMs = clientIdleExitMs();
+    if (!idleMs || this.clients.size > 0) return;
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => {
-      log(`zserver-broker: idle ${CLIENT_IDLE_EXIT_MS}ms with no clients — exiting`);
-      void this.stop().then(() => process.exit(0));
-    }, CLIENT_IDLE_EXIT_MS);
+      log(`zserver-broker: idle ${idleMs}ms with no clients — exiting`);
+      // A failing stop() must not become an unhandledRejection; a failed clean
+      // shutdown still ends the idle daemon (non-zero so a supervisor sees it).
+      this.stop().then(
+        () => this.exitProcess(0),
+        (error: unknown) => {
+          warn(
+            `zserver-broker: idle stop failed: ${error instanceof Error ? error.message : String(error)}`,
+          );
+          this.exitProcess(1);
+        },
+      );
+    }, idleMs);
     this.idleTimer.unref?.();
   }
 
@@ -466,9 +577,11 @@ export class ZServerBroker {
     this.clients.clear();
     this.connection?.dispose();
     this.connection = null;
+    const server = this.server;
+    this.server = null;
     await new Promise<void>((resolve) => {
-      if (!this.server) return resolve();
-      this.server.close(() => {
+      if (!server) return resolve();
+      server.close(() => {
         try {
           unlinkSync(this.socketPath);
         } catch {

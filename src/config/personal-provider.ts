@@ -58,12 +58,24 @@ interface ProviderConfigFile {
   };
 }
 
-/** The desktop-pinned path when available, else the standard location. */
-export function personalProviderConfigPath(env: NodeJS.ProcessEnv = process.env): string {
+export interface PersonalProviderTarget {
+  /** The file the plan entry would be written to. */
+  path: string;
+  /** Set when the desktop pinned a path that was REFUSED (the pin itself). The
+   *  backend reads the pinned file, so writing the default one instead would
+   *  register the provider where nothing looks — callers should not write. */
+  rejectedPin?: string;
+}
+
+/** Where the plan entry goes: the desktop pin when it is trustworthy, else the
+ *  standard location — and, when a pin was refused, which one. */
+export function resolvePersonalProviderTarget(
+  env: NodeJS.ProcessEnv = process.env,
+): PersonalProviderTarget {
   const home = os.homedir();
   const fallback = path.join(home, ".zcode", "v2", "provider_config.json");
   const pinned = env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE?.trim();
-  if (!pinned) return fallback;
+  if (!pinned) return { path: fallback };
   // ensurePersonalGlmProvider WRITES the user's plan API key into this file. A
   // pin pointing anywhere else (a tampered profile / a spoofed "desktop host"
   // process's environ) would exfiltrate the key to an attacker-readable path.
@@ -72,19 +84,24 @@ export function personalProviderConfigPath(env: NodeJS.ProcessEnv = process.env)
   try {
     const resolved = realpathSync(pinned);
     if (path.normalize(resolved).startsWith(realpathSync(path.join(home, ".zcode")) + path.sep)) {
-      return pinned;
+      return { path: pinned };
     }
   } catch {
     // Non-existent pin: fall through to a lexical check on the (not-yet-created) path.
     if (path.normalize(pinned).startsWith(zcodeDir) && !pinned.split(/[\\/]+/).includes("..")) {
-      return pinned;
+      return { path: pinned };
     }
   }
   warn(
-    "personal-provider: ignoring untrusted ZCODE_PERSONAL_PROVIDER_CONFIG_FILE pin " +
-      "(outside ~/.zcode) — using the default provider_config.json path",
+    `personal-provider: ignoring untrusted ZCODE_PERSONAL_PROVIDER_CONFIG_FILE pin ${pinned} ` +
+      "(outside ~/.zcode)",
   );
-  return fallback;
+  return { path: fallback, rejectedPin: pinned };
+}
+
+/** The desktop-pinned path when available, else the standard location. */
+export function personalProviderConfigPath(env: NodeJS.ProcessEnv = process.env): string {
+  return resolvePersonalProviderTarget(env).path;
 }
 
 function isGlmRule(rule: ProviderRule): boolean {

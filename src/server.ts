@@ -239,7 +239,10 @@ export class ZcodeAcpServer {
 
   /** Lazily spawn the zcode backend on first use (initialize doesn't need it). */
   ensureBackend(): BridgeBackend {
-    if (this.backend && !this.backend.isDead) return this.backend;
+    // A dead marker replaces the instance — except for a backend that respawns
+    // itself: its listeners (turn loops, monitors) live on the instance, and a
+    // failed in-place respawn would otherwise split them from the replacement.
+    if (this.backend && (!this.backend.isDead || this.backend.healsInPlace)) return this.backend;
     const backendChoice = process.env.ZCODE_ACP_BACKEND?.trim();
     if (backendChoice && backendChoice.toLowerCase() !== "zserver" && backendChoice !== "direct") {
       // A typo here silently flips the identity/billing path to the direct

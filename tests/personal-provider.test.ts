@@ -57,8 +57,12 @@ vi.mock("node:fs", async () => {
   } as unknown as typeof import("node:fs");
 });
 
-const { ensurePersonalGlmProvider, personalProviderConfigPath, planApiKey } =
-  await import("../src/config/personal-provider.js");
+const {
+  ensurePersonalGlmProvider,
+  personalProviderConfigPath,
+  planApiKey,
+  resolvePersonalProviderTarget,
+} = await import("../src/config/personal-provider.js");
 
 const PROVIDER_CONFIG_PATH = `${HOME}/.zcode/v2/provider_config.json`;
 
@@ -192,6 +196,24 @@ describe("personalProviderConfigPath", () => {
 
   it("falls back to ~/.zcode/v2/provider_config.json", () => {
     expect(personalProviderConfigPath({})).toBe(`${HOME}/.zcode/v2/provider_config.json`);
+  });
+});
+
+describe("resolvePersonalProviderTarget", () => {
+  it("reports the refused pin so callers do not write somewhere the backend never reads", () => {
+    const target = resolvePersonalProviderTarget({
+      ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: "/pinned/provider_config.json",
+    });
+    expect(target.rejectedPin).toBe("/pinned/provider_config.json");
+    expect(target.path).toBe("/home/test/.zcode/v2/provider_config.json");
+  });
+
+  it("reports no rejection for a trusted pin or for no pin", () => {
+    const pinned = "/home/test/.zcode/v2/runtime/provider_config.json";
+    expect(resolvePersonalProviderTarget({ ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: pinned })).toEqual({
+      path: pinned,
+    });
+    expect(resolvePersonalProviderTarget({})).toEqual({ path: PROVIDER_CONFIG_PATH });
   });
 });
 

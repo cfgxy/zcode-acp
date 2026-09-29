@@ -9,7 +9,7 @@
 
 import { describe, expect, it } from "vitest";
 
-import { resolveInvocation } from "../src/cli.js";
+import { ensureGlmPersonalProviderAfterRefresh, resolveInvocation } from "../src/cli.js";
 
 describe("resolveInvocation", () => {
   it("routes the legacy zcode-acp-server bin alias straight to server", () => {
@@ -76,5 +76,53 @@ describe("resolveInvocation", () => {
       kind: "unknown",
       sub: "profile export a b",
     });
+  });
+});
+
+describe("profile refresh → GLM personal provider guard", () => {
+  const plan = (
+    over: Partial<Parameters<typeof ensureGlmPersonalProviderAfterRefresh>[0]> = {},
+  ) => {
+    const lines: string[] = [];
+    const written: string[] = [];
+    ensureGlmPersonalProviderAfterRefresh({
+      write: (line) => lines.push(line),
+      ensure: ((providerPath: string) => {
+        written.push(providerPath);
+        return { status: "added", providerId: "p-1" };
+      }) as never,
+      resolveTarget: () => ({ path: "/home/u/.zcode/v2/provider_config.json" }),
+      ...over,
+    });
+    return { lines, written };
+  };
+
+  it("names the file it wrote to (the user can see WHERE the plan entry went)", () => {
+    const { lines, written } = plan();
+    expect(written).toEqual(["/home/u/.zcode/v2/provider_config.json"]);
+    expect(lines.join("")).toContain("in /home/u/.zcode/v2/provider_config.json");
+  });
+
+  it("a refused desktop pin writes NOTHING and says why (no silent write to the default path)", () => {
+    const { lines, written } = plan({
+      resolveTarget: () => ({
+        path: "/home/u/.zcode/v2/provider_config.json",
+        rejectedPin: "/srv/desktop/provider_config.json",
+      }),
+    });
+    expect(written).toEqual([]);
+    expect(lines.join("")).toContain("not touched");
+    expect(lines.join("")).toContain("/srv/desktop/provider_config.json");
+  });
+
+  it("falls back to the default target when the profile cannot be loaded", () => {
+    const { written } = plan({
+      resolveTarget: () => {
+        throw new Error("no profile");
+      },
+    });
+    // The catch resolves the default target instead of aborting the refresh.
+    expect(written).toHaveLength(1);
+    expect(written[0]).toMatch(/provider_config\.json$/);
   });
 });

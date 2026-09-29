@@ -11,7 +11,12 @@ import {
   ZServerBroker,
 } from "../src/backend/zserver/broker.js";
 import { personalProviderConfigPath } from "../src/config/personal-provider.js";
-import { encodeFrame, encodeMessage } from "../src/backend/zserver/protocol.js";
+import {
+  decodeMessage,
+  encodeFrame,
+  encodeMessage,
+  FrameDecoder,
+} from "../src/backend/zserver/protocol.js";
 import { connect } from "node:net";
 
 const tempDirs: string[] = [];
@@ -63,35 +68,166 @@ describe("broker header validation (confused-deputy allowlist)", () => {
     expect(validateClientHeader([100, 1, "zcode-agent", "createSession", "extra"]).ok).toBe(false);
   });
 
-  it("a live broker disconnects a client that sends a forbidden call", async () => {
+  /** A raw broker client that collects decoded frames and closure. */
+  async function rawClient(socketPath: string): Promise<{
+    send(header: unknown, body?: unknown): void;
+    sendRaw(bytes: Buffer): void;
+    frames: Array<{ header: unknown[]; body: unknown }>;
+    closed(): boolean;
+    destroy(): void;
+  }> {
+    const raw = connect(socketPath);
+    await new Promise<void>((resolve, reject) => {
+      raw.once("connect", resolve);
+      raw.once("error", reject);
+    });
+    const frames: Array<{ header: unknown[]; body: unknown }> = [];
+    let closed = false;
+    const decoder = new FrameDecoder((payload) => {
+      const message = decodeMessage(payload);
+      frames.push({ header: message.header as unknown[], body: message.body });
+    });
+    raw.on("data", (chunk: Buffer) => decoder.push(chunk));
+    raw.on("close", () => (closed = true));
+    raw.on("error", () => undefined);
+    return {
+      send: (header, body) => raw.write(encodeFrame(encodeMessage(header, body))),
+      sendRaw: (bytes) => raw.write(bytes),
+      frames,
+      closed: () => closed,
+      destroy: () => raw.destroy(),
+    };
+  }
+
+  async function withBroker(
+    run: (broker: ZServerBroker, socketPath: string) => Promise<void>,
+  ): Promise<void> {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "zserver-sec-"));
     tempDirs.push(root);
     fs.copyFileSync(
       new URL("./fixtures/zserver-fake-server.mjs", import.meta.url).pathname,
       path.join(root, "zcode-server.cjs"),
     );
-    const socketPath = path.join(os.tmpdir(), `zsec-${Date.now()}.sock`);
+    const socketPath = path.join(
+      os.tmpdir(),
+      `zsec-${process.pid}-${Math.random().toString(36).slice(2)}.sock`,
+    );
     sockets.push(socketPath);
     const broker = new ZServerBroker(socketPath, root);
     await broker.start();
     try {
-      const raw = connect(socketPath);
-      await new Promise<void>((resolve, reject) => {
-        raw.once("connect", resolve);
-        raw.once("error", reject);
-      });
-      raw.write(encodeFrame(encodeMessage([100, 7, "credential", "load"], ["zcodejwttoken"])));
-      const deadline = Date.now() + 3000;
-      const clientsOf = (): number =>
-        (broker as unknown as { clients: Map<number, unknown> }).clients.size;
-      while (Date.now() < deadline && clientsOf() > 0) {
-        await new Promise((r) => setTimeout(r, 50));
-      }
-      raw.destroy();
-      expect(clientsOf()).toBe(0);
+      await run(broker, socketPath);
     } finally {
       await broker.stop();
     }
+  }
+
+  const untilTrue = async (cond: () => boolean, ms = 4000): Promise<boolean> => {
+    const deadline = Date.now() + ms;
+    while (Date.now() < deadline) {
+      if (cond()) return true;
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    return cond();
+  };
+
+  it("answers a forbidden call with a readable 202 error and keeps the client attached", async () => {
+    await withBroker(async (broker, socketPath) => {
+      const client = await rawClient(socketPath);
+      client.send([100, 7, "credential", "load"], ["zcodejwttoken"]);
+      expect(await untilTrue(() => client.frames.some((f) => f.header[0] === 202))).toBe(true);
+      const reply = client.frames.find((f) => f.header[0] === 202)!;
+      // The reply carries the CLIENT's id (not a broker-internal one) and names the reason.
+      expect(reply.header[1]).toBe(7);
+      expect((reply.body as { message: string }).message).toMatch(/credential\.load.*not allowed/);
+      expect(client.closed()).toBe(false);
+      expect(broker.stats().clients).toBe(1);
+      expect(broker.stats().rejected).toBe(1);
+      client.destroy();
+    });
+  });
+
+  it("cuts a client off after repeated policy violations", async () => {
+    await withBroker(async (broker, socketPath) => {
+      const client = await rawClient(socketPath);
+      for (let i = 0; i < 5; i++) client.send([100, i, "terminal", "create"], []);
+      expect(await untilTrue(() => client.closed())).toBe(true);
+      expect(await untilTrue(() => broker.stats().clients === 0)).toBe(true);
+    });
+  });
+
+  it("survives EVERY Object.prototype property name as a channel (one frame must not kill the daemon)", async () => {
+    // Regression: table[channel]?.has threw a TypeError for "__proto__" /
+    // "constructor" / "toString" …, escaping a `void` promise as an
+    // unhandledRejection that terminated the whole shared broker.
+    const names = Object.getOwnPropertyNames(Object.prototype);
+    expect(names).toContain("__proto__");
+    for (const name of names) {
+      expect(validateClientHeader([100, 1, name, "x"]).ok, `call ${name}`).toBe(false);
+      expect(validateClientHeader([102, 1, name, "x"]).ok, `event ${name}`).toBe(false);
+    }
+    await withBroker(async (broker, socketPath) => {
+      const attacker = await rawClient(socketPath);
+      const bystander = await rawClient(socketPath);
+      // Both must be attached (Initialize received) before the hostile frames.
+      expect(await untilTrue(() => attacker.frames.length > 0 && bystander.frames.length > 0)).toBe(
+        true,
+      );
+      for (const [i, name] of [
+        "__proto__",
+        "constructor",
+        "toString",
+        "hasOwnProperty",
+      ].entries()) {
+        attacker.send([100, i, name, "x"], undefined);
+      }
+      bystander.send([100, 1, "zcode-task", "listTasks"], undefined);
+      // The broker is alive and still routes for the bystander.
+      expect(await untilTrue(() => bystander.frames.some((f) => f.header[0] === 201))).toBe(true);
+      expect(broker.stats().clients).toBeGreaterThanOrEqual(1);
+      attacker.destroy();
+      bystander.destroy();
+    });
+  });
+
+  it("caps outstanding requests per client instead of growing its id maps without bound", async () => {
+    process.env.ZCODE_ACP_ZSERVER_MAX_PENDING = "3";
+    process.env.ZSERVER_FAKE_HANG_METHODS = "listTasks";
+    try {
+      await withBroker(async (broker, socketPath) => {
+        const client = await rawClient(socketPath);
+        expect(await untilTrue(() => client.frames.length > 0)).toBe(true);
+        for (let i = 0; i < 6; i++) client.send([100, i, "zcode-task", "listTasks"], undefined);
+        // The first 3 hang server-side; the other 3 are answered by the broker itself.
+        expect(
+          await untilTrue(() => client.frames.filter((f) => f.header[0] === 202).length === 3),
+        ).toBe(true);
+        const limited = client.frames.filter((f) => f.header[0] === 202);
+        expect((limited[0]!.body as { name: string }).name).toBe("BrokerLimitError");
+        expect(broker.stats().pending).toBe(3);
+        // A limit is not misbehaviour: the client stays attached.
+        expect(client.closed()).toBe(false);
+        client.destroy();
+      });
+    } finally {
+      delete process.env.ZCODE_ACP_ZSERVER_MAX_PENDING;
+      delete process.env.ZSERVER_FAKE_HANG_METHODS;
+    }
+  });
+
+  it("cuts off a client whose frame cannot be decoded at all", async () => {
+    await withBroker(async (broker, socketPath) => {
+      const client = await rawClient(socketPath);
+      expect(await untilTrue(() => client.frames.length > 0)).toBe(true);
+      // Array tag claiming 2^28 elements in a 6-byte payload: undecodable.
+      const bomb = Buffer.from([4, 0x80, 0x80, 0x80, 0x80, 0x01]);
+      const header = Buffer.alloc(13);
+      header.writeUInt8(1, 0);
+      header.writeUInt32BE(bomb.length, 9);
+      client.sendRaw(Buffer.concat([header, bomb]));
+      expect(await untilTrue(() => client.closed())).toBe(true);
+      expect(await untilTrue(() => broker.stats().clients === 0)).toBe(true);
+    });
   });
 
   it("binds the socket 0600 AT CREATION even under a hostile umask (no chmod-after-listen window)", async () => {
@@ -99,9 +235,9 @@ describe("broker header validation (confused-deputy allowlist)", () => {
     tempDirs.push(root);
     const socketPath = path.join(os.tmpdir(), `zsec-mode-${Date.now()}.sock`);
     sockets.push(socketPath);
-    // The whole bind→chmod window lives inside one event-loop tick, so no
-    // poller can observe it; the broker reports the socket's mode from inside
-    // the listen callback (before its own chmod) through a test seam instead.
+    // The bind→chmod window is unobservable by polling; the broker reports the
+    // socket's mode right after the synchronous bind (before its own chmod)
+    // through a test seam instead.
     let modeAtBirth: number | undefined;
     const previous = process.umask(0o000); // hostile: a plain bind would yield 0777
     const broker = new ZServerBroker(socketPath, root);

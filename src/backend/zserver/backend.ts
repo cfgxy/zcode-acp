@@ -60,6 +60,11 @@ export async function runtimeEnvWithProfile(base: NodeJS.ProcessEnv): Promise<No
 export class ZServerBackend implements BridgeBackend {
   isDead = false;
   deathReason: string | null = null;
+  /** `restart()` (the supervised heal) and `ensureConnection()` respawn the
+   *  transport in place, so a dead marker must never make the bridge replace
+   *  this instance: the turn loops' listeners live on it (server.ts
+   *  ensureBackend honours this). */
+  readonly healsInPlace = true;
 
   private connection: ZServerConnection | null = null;
   private readonly listeners = new Map<string, Set<EventListenerLike>>();
@@ -71,6 +76,11 @@ export class ZServerBackend implements BridgeBackend {
   /** Sessions with live server-side subscriptions (conversation/terminal/state). */
   private readonly subscribedSessions = new Set<string>();
   private readonly gatesBySession = new Map<string, TurnCompletionGate>();
+  /** Teardown for a session's three live server-side listeners (terminal
+   *  outcome / session events / conversation frames). Kept until the session is
+   *  released or the connection dies — the success path used to drop them, so
+   *  they could never be reclaimed. */
+  private readonly unsubscribersBySession = new Map<string, Array<() => void>>();
   private readonly terminalErrorBySession = new Map<string, Record<string, unknown> | undefined>();
   private spawnPromise: Promise<void> | null = null;
   private idleTimer: NodeJS.Timeout | null = null;
@@ -124,7 +134,11 @@ export class ZServerBackend implements BridgeBackend {
       await this.spawnPromise;
     }
     if (!this.connection) {
-      throw new Error("zcode backend reader exited (backend dead): zserver connection unavailable");
+      // Record why, or the classified heal-exhaustion error degrades to "(unknown)".
+      const message = "zcode backend reader exited (backend dead): zserver connection unavailable";
+      this.isDead = true;
+      this.deathReason = message;
+      throw new Error(message);
     }
     return this.connection;
   }
@@ -171,6 +185,9 @@ export class ZServerBackend implements BridgeBackend {
     // Re-establish lazily via session/resume on the heal path.
     this.subscribedSessions.clear();
     this.emittedByRow.clear();
+    // The handles belong to the dead connection's (already disposed) client:
+    // there is nothing left to unsubscribe from.
+    this.unsubscribersBySession.clear();
     connection.onExit((code, signal, detail) => {
       // Per-CONNECTION identity, not the shared `closing` flag: an old child's
       // exit can arrive after a NEW spawn cleared the flag (SIGTERM takes
@@ -251,11 +268,21 @@ export class ZServerBackend implements BridgeBackend {
       // error message "timeout" — a wedged-but-alive server must surface as a
       // retryable timeout, not hang the turn setup forever.
       let timeoutHandle: NodeJS.Timeout | undefined;
+      const abandon = new AbortController();
       try {
         const result = await Promise.race([
-          this.route(connection, method, params),
+          this.route(connection, method, params, abandon.signal),
           new Promise<never>((_, reject) => {
-            timeoutHandle = setTimeout(() => reject(new RequestTimeoutError()), timeoutMs);
+            timeoutHandle = setTimeout(() => {
+              const timedOut = new RequestTimeoutError();
+              reject(timedOut);
+              // The caller gave up: forget the calls this request still has in
+              // flight (no 101 — a sendPrompt must not be aborted server-side).
+              // Otherwise every timeout pinned a response handler for the whole
+              // life of the connection against a wedged server. A late answer
+              // is dropped.
+              abandon.abort(timedOut);
+            }, timeoutMs);
             timeoutHandle.unref?.();
           }),
         ]);
@@ -288,6 +315,7 @@ export class ZServerBackend implements BridgeBackend {
     connection: ZServerConnection,
     method: string,
     params: Record<string, unknown>,
+    signal: AbortSignal,
   ): Promise<unknown> {
     const workspace = (params["workspace"] ?? {}) as {
       workspacePath?: string;
@@ -295,8 +323,11 @@ export class ZServerBackend implements BridgeBackend {
     };
     const workspacePath = workspace.workspacePath ?? (workspace.workspaceKey as string) ?? "";
     const sessionId = (params["sessionId"] as string) ?? "";
-    const agentChannel = connection.channelOf("zcode-agent");
-    const tasks = connection.channelOf("zcode-task");
+    // Request-scoped channels: a timeout abandons whatever is still pending
+    // (and stops a multi-step route at its next call). Long-lived calls such as
+    // the conversation subscription use their own unscoped channel.
+    const agentChannel = connection.channelOf("zcode-agent", signal);
+    const tasks = connection.channelOf("zcode-task", signal);
     switch (method) {
       case "session/create": {
         if (!workspacePath) throw new Error("session/create requires workspace.workspacePath");
@@ -433,6 +464,7 @@ export class ZServerBackend implements BridgeBackend {
     // Re-subscribing after a restart replaces any gate left by the dead
     // connection (its pending timer would emit spuriously into this one).
     this.gatesBySession.get(sessionId)?.dispose();
+    this.unsubscribersBySession.delete(sessionId);
     const gate = new TurnCompletionGate((outcome) => {
       const type: ZcodeEvent["type"] = outcome === "failed" ? "turn.failed" : "turn.completed";
       const payload: Record<string, unknown> = { resultType: terminalResultType(outcome) };
@@ -492,6 +524,7 @@ export class ZServerBackend implements BridgeBackend {
         }
       }),
     );
+    this.unsubscribersBySession.set(sessionId, unsubscribers);
     agentChannel
       .call("subscribeConversationV4", {
         workspacePath,
@@ -499,6 +532,11 @@ export class ZServerBackend implements BridgeBackend {
         clientMode: "desktop-continuous",
       })
       .catch((error) => {
+        // A failure on a RETIRED connection (close()/restart() disposed it and
+        // rejected its pending calls) is expected and must not touch state that
+        // now belongs to the newer connection — deleting the marker there would
+        // let the next subscribe stack a second listener set.
+        if (this.connection !== connection) return;
         // Roll back the marker: a transient subscribe failure must not
         // permanently mark the session "subscribed" (every later
         // subscribe/resume would be no-opped and the session stay deaf).
@@ -510,8 +548,50 @@ export class ZServerBackend implements BridgeBackend {
         for (const unsubscribe of unsubscribers) unsubscribe();
         gate.dispose();
         if (this.gatesBySession.get(sessionId) === gate) this.gatesBySession.delete(sessionId);
+        if (this.unsubscribersBySession.get(sessionId) === unsubscribers) {
+          this.unsubscribersBySession.delete(sessionId);
+        }
         warn(`backend: conversation subscribe failed: ${error.message}`);
       });
+  }
+
+  /**
+   * Release a retired session's LIVE server-side state: the three listeners
+   * (the 103 unsubscribes reach the server, or the broker synthesizes them),
+   * the completion gate and the per-row streaming counters. Without it every
+   * session ever touched kept three server subscriptions for the bridge's life.
+   *
+   * Deliberately KEPT, because retirement is not deletion (a session the editor
+   * touches again must come back intact and re-subscribe lazily):
+   *  - `workspaceBySession`: session/send|read|subscribe carry only a sessionId;
+   *    this mapping is the only way to address the session again.
+   *  - `listeners`: owned by the handlers (turn loop, background-task listener),
+   *    which register once and never re-register.
+   *  - `seqBySession`: a listener's high-water mark must not see seq go back.
+   * Idempotent.
+   */
+  releaseSession(sessionId: string): void {
+    for (const unsubscribe of this.unsubscribersBySession.get(sessionId) ?? []) {
+      try {
+        unsubscribe();
+      } catch (error) {
+        warn(
+          `backend: unsubscribe failed for ${sessionId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
+    this.unsubscribersBySession.delete(sessionId);
+    this.gatesBySession.get(sessionId)?.dispose();
+    this.gatesBySession.delete(sessionId);
+    this.subscribedSessions.delete(sessionId);
+    this.terminalErrorBySession.delete(sessionId);
+    // Row keys are namespaced `${sessionId}:${rowId}` (rowIds are per-session
+    // log positions and would otherwise collide across sessions).
+    for (const key of [...this.emittedByRow.keys()]) {
+      if (key.startsWith(`${sessionId}:`)) this.emittedByRow.delete(key);
+    }
   }
 
   send(method: string, params: Record<string, unknown>): void {
@@ -537,22 +617,6 @@ export class ZServerBackend implements BridgeBackend {
     if (set.size === 0) this.listeners.delete(sessionId);
   }
 
-  /** Drop per-session streaming state (called on session close/eviction). */
-  forgetSession(sessionId: string): void {
-    this.listeners.delete(sessionId);
-    this.workspaceBySession.delete(sessionId);
-    this.seqBySession.delete(sessionId);
-    this.subscribedSessions.delete(sessionId);
-    this.terminalErrorBySession.delete(sessionId);
-    this.gatesBySession.get(sessionId)?.dispose();
-    this.gatesBySession.delete(sessionId);
-    // Row keys are namespaced `${sessionId}:${rowId}` (rowIds are per-session
-    // log positions and would otherwise collide across sessions).
-    for (const key of [...this.emittedByRow.keys()]) {
-      if (key.startsWith(`${sessionId}:`)) this.emittedByRow.delete(key);
-    }
-  }
-
   async close(): Promise<void> {
     this.closing = true;
     this.spawnGeneration++;
@@ -560,6 +624,12 @@ export class ZServerBackend implements BridgeBackend {
       clearTimeout(this.idleTimer);
       this.idleTimer = null;
     }
+    // Completion gates hold live timers that deliver turn.completed into
+    // `listeners`: one left armed across a close/heal would end the very turn
+    // the heal is about to resend. Their subscriptions die with the connection.
+    for (const gate of this.gatesBySession.values()) gate.dispose();
+    this.gatesBySession.clear();
+    this.unsubscribersBySession.clear();
     this.connection?.dispose();
     this.connection = null;
     this.spawnPromise = null;
@@ -567,9 +637,10 @@ export class ZServerBackend implements BridgeBackend {
 
   /** Supervised heal path: respawn the server connection in place. Never
    *  throws — a transient respawn failure stays visible via the next
-   *  request's error (driving the next heal round) instead of splitting
-   *  listeners across a replacement backend instance (server.ts swaps in a
-   *  new ZServerBackend when restart throws, orphaning every listener). */
+   *  request's error (driving the next heal round). The instance is kept:
+   *  server.ts ensureBackend() honours `healsInPlace`, so the dead marker left
+   *  by a failed respawn does not get this backend replaced (which would
+   *  orphan every listener registered on it). */
   async restart(_reason: string): Promise<void> {
     await this.close();
     try {

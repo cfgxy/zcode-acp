@@ -113,6 +113,45 @@ describe("session close endpoint", () => {
     expect(sessions[0]!.status).toBe("idle");
   });
 
+  it("releases the retired session's live backend state (zserver keeps 3 subscriptions per session)", async () => {
+    const server = new ZcodeAcpServer();
+    const released: string[] = [];
+    server.backend = { releaseSession: (sid: string) => released.push(sid) } as never;
+    const { acpSid, zcodeSid } = seedSession(server);
+    const base = await bootClose(server);
+
+    expect((await fetch(`${base}/sessions/${acpSid}/close`, { method: "POST" })).status).toBe(200);
+    expect(released).toEqual([zcodeSid]);
+  });
+
+  it("does NOT release backend state when the close is refused (running turn)", async () => {
+    const server = new ZcodeAcpServer();
+    const released: string[] = [];
+    server.backend = { releaseSession: (sid: string) => released.push(sid) } as never;
+    const { acpSid, zcodeSid } = seedSession(server);
+    server.pendingTurns.set(7, { zcodeSid, cancelled: false });
+    const base = await bootClose(server);
+
+    expect((await fetch(`${base}/sessions/${acpSid}/close`, { method: "POST" })).status).toBe(409);
+    expect(released).toEqual([]);
+  });
+
+  it("closes fine on a backend without releaseSession (direct backend) or without a backend at all", async () => {
+    const server = new ZcodeAcpServer();
+    server.backend = {} as never; // direct backend: the hook is optional
+    const first = seedSession(server);
+    const base = await bootClose(server);
+    expect((await fetch(`${base}/sessions/${first.acpSid}/close`, { method: "POST" })).status).toBe(
+      200,
+    );
+
+    server.backend = null as never; // bridge never spawned one
+    const second = seedSession(server);
+    expect(
+      (await fetch(`${base}/sessions/${second.acpSid}/close`, { method: "POST" })).status,
+    ).toBe(200);
+  });
+
   it("a mere registration (editor restart auto-resume) does NOT resurrect a closed session", async () => {
     const server = new ZcodeAcpServer();
     const { acpSid, zcodeSid } = seedSession(server);

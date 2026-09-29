@@ -56,6 +56,9 @@ async function handleClose(
     return;
   }
   server.sessionSummaries.delete(sessionId);
+  // Retired sessions must not pin per-session backend state (zserver mode keeps
+  // three live server subscriptions and six map entries per session touched).
+  if (zcodeSid) server.backend?.releaseSession?.(zcodeSid);
   log(`remote: session ${sessionId.slice(0, 8)} closed from remote (discovery retired)`);
   sendJson(res, 200, { ok: true });
 }

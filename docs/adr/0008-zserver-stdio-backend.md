@@ -136,8 +136,16 @@ respondElicitation / resumeTask / closeTask / deliverSessionMessage / …`；
 
 - `session/load` 的回放/tail 语义：路由直通 readSession，快照形状与
   bridge 回放 handler 的消费契合未经编辑器实测。
-- `ZServerBackend.forgetSession` 当前无调用方（bridge 会话驱逐未接线）。
-- 第七轮终扫无新增中等以上问题，深审循环终止。
+- 会话状态回收：`ZServerBackend.releaseSession`（退订三个 server 端监听、
+  销毁完成门、清流式计数）已接入 remote session-close 端点；bridge 自身的
+  会话驱逐（`BACKEND_RESIDENT_TTL_MS` 过期）不会调用它——退役发生在编辑器/
+  远程关闭会话时，而非 TTL 过期时。保留 `workspaceBySession`（后续
+  send/read 只带 sessionId，靠它寻址）、`listeners`（由 handler 持有）与
+  `seqBySession`（水位不可回退）。
+- `session/send` 的 `attachments` 在 zserver 模式被丢弃；`session/list` 忽略
+  workspace 过滤；broker 模式下无法按客户端传递任务级凭据。
+- 第七轮终扫无新增中等以上问题，深审循环终止（后续多视角审计仍发现新问题，
+  见下文各轮补记——"终止"仅指当时视角下的收敛）。
 
 ### 订阅窗口与取值保真（第八轮深审补记）
 
@@ -204,17 +212,41 @@ projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
   ServiceCollection 暴露 credential.load、terminal._、file._、git.* 等全部
   服务。broker 因此**只转发** bridge 实际使用的 (channel, method/event)
   白名单（`BROKER_ALLOWED_CALLS/EVENTS`），header 先经 `validateClientHeader`
-  严格校验（形状、numeric id、请求类型 100..103），违规客户端立即断开。
-  注意：同一 server 连接内仍无 per-client 会话隔离（事件按 workspace 键控，
-  `frameMatchesSession` 只是客户端自愿过滤）——同 workspace 的客户端互相可见，
-  属已接受的个人机器语义。
+  严格校验（形状、numeric id、请求类型 100..103）。
+  - **拒绝语义**：格式良好但被策略拒绝的请求（如 `credential.load`）由 broker
+    回一个 202 错误帧（`broker: … not allowed through the broker`，携带客户端
+    自己的 id），客户端能读到原因；同一客户端累计 5 次违规、或帧根本无法解码
+    时才断开。早期实现一律直接断 socket，客户端只能看到 "socket closed"，
+    与 server 崩溃无法区分，并会触发无意义的 heal 循环。
+  - **白名单必须按自有属性查表**：表是普通对象字面量，`table["__proto__"]`/
+    `constructor`/`toString` 会解析到继承成员，`?.has` 随即对非 Set 调用而抛
+    `TypeError`；这条抛错逃出 `void` 掉的 promise 成为 unhandledRejection，
+    **一帧即可杀死机器级共享 broker**（已实测复现，进程 6ms 退出）。现用
+    `Object.hasOwn` 查表，且 `routeClientFrame` 的返回 promise 带兜底 `.catch`
+    ——任何未预期抛错只断开该客户端，不再连坐所有客户端。
+  - **每客户端上限**：未决请求（未应答调用 + 存活订阅）默认 4096
+    （`ZCODE_ACP_ZSERVER_MAX_PENDING`），超限回 `BrokerLimitError` 而不断连；
+    此前未应答的调用只在客户端断开时才回收。
+    注意：同一 server 连接内仍无 per-client 会话隔离（事件按 workspace 键控，
+    `frameMatchesSession` 只是客户端自愿过滤）——同 workspace 的客户端互相可见，
+    属已接受的个人机器语义。白名单只约束**方法名**，不约束参数（`readSession`
+    可指向任意 workspace）；在"同 uid 已被视为可信读者"的模型内这是设计取舍，
+    不在模型内则需要参数级约束（未做）。
 - **socket 创建即 0600**：`bind()` 在 `umask(0o177)` 下执行，消除
   "listen 后才 chmod" 的窗口（`onBoundForTest` 接缝使其可确定性测试）。
+  `listen(path)` 在同一同步段内完成 `bind()`（EADDRINUSE 等以后续 `error`
+  事件到达，已实测），所以 umask 只在该同步调用内改动、绝不跨 `await`——
+  跨 await 会让同进程里无关的文件创建也被带成 0600（进程全局状态）。
 - **profile 路径类 pin 必须可信**（`isTrustedPinPath`：绝对、无 `..`、位于
   home / AppImage `/tmp/.mount_*` / `/opt` / `/usr`）；路径 pin 决定 server
   加载哪份 provider 配置、执行哪个二进制，被篡改即凭据外泄/RCE 面。
-  `profile refresh` 写入 API key 的目标（`personalProviderConfigPath`）额外
-  要求 realpath 落在 `~/.zcode/` 内，否则回退默认路径。
+  `profile refresh` 写入 API key 的目标（`resolvePersonalProviderTarget`）额外
+  要求 realpath 落在 `~/.zcode/` 内。**被拒绝的 pin 不再让 refresh 悄悄改写
+  默认路径**：后端读的是 pin 指向的文件，写到默认路径等于把 provider 登记在
+  没人读的地方却报告成功；现在 refresh 什么都不写，并输出被拒绝的 pin 路径
+  与原因。成功时的输出也带上实际写入的文件路径。两处校验口径不同
+  （`isTrustedPinPath` 放行整个 home，写入目标只放行 `~/.zcode`）是有意的：
+  读取一份 pin 的风险远低于把 API key 写进去。
 - **宿主进程识别收紧**：comm 仅接受 `zcode-host-loca`/`zcode-host-remo`
   精确截断，全名仅匹配 argv[0]（原先任一 argv token 即可冒充宿主）。
 - **broker 的 spawn env 去除任务级凭据**（`MULTICA_*`、SSH agent 变量）：
@@ -234,9 +266,13 @@ projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
 | `ZCODE_ACP_ZSERVER_IDLE_MS`             | 无会话监听且无在途请求 N ms 后回收 server 子进程                  | 0（关闭）                              |
 | `ZCODE_ACP_ZSERVER_TURN_QUIESCE_MS`     | terminal 后等流静默的宽限                                         | 300                                    |
 | `ZCODE_ACP_ZSERVER_MAX_CLIENT_BUFFER`   | broker 每客户端入站缓冲上限（字节）                               | 8MB                                    |
+| `ZCODE_ACP_ZSERVER_MAX_PENDING`         | broker 每客户端未决请求（未应答调用 + 存活订阅）上限              | 4096                                   |
 | `ZCODE_ACP_ZSERVER_BROKER_IDLE_EXIT_MS` | broker 无客户端 N ms 后自退出                                     | 0（关闭）                              |
 | `ZCODE_ACP_ZSERVER_KILL_ESCALATION_MS`  | dispose 时 SIGTERM→SIGKILL 升级延迟                               | 5000                                   |
 | `ZCODE_SERVER_RUNTIME_ROOT`             | server 部署根（`node` + `zcode-server.cjs`）                      | `~/.zcode/server`                      |
+
+本表只列生产代码读取的变量；测试夹具专用的 `ZSERVER_FAKE_*`/`ZSERVER_COALESCE`
+见 `tests/fixtures/zserver-fake-server.mjs` 文件头，不属于运行时配置面。
 
 注：`attach` 需要同时设置 `ZCODE_ACP_BACKEND=zserver` 与
 `ZCODE_ACP_ZSERVER_SOCKET`；只设 socket 变量不会切换后端。socket 路径超过
@@ -279,7 +315,7 @@ onDynamicWorkspaceEvent`。
   - `sendPrompt` 的 `content` 是**纯字符串**（非内容块数组）；`taskId` 即
     session id（`sess_*`）；事件订阅必须先于 sendPrompt（动态事件 `onDynamic*`
     携参返回 Event）。
-- **M1b（进行中，真实一轮已跑通）**：`scripts/zserver-turn-probe.mjs`
+- **M1b（已完成，真实一轮已跑通）**：`scripts/zserver-turn-probe.mjs`
   完整闭环：`createSession` → `createTask(draftSessionId)` →
   `sendPrompt`（走内层 `zcode-agent` channel 的 session/send 路径，
   **非** facade 的 v4 sendText——后者要求 agent 侧 session 行已落库，
@@ -294,10 +330,11 @@ onDynamicWorkspaceEvent`。
   agent 命令解析存在 flake（会选 `agents/glm/zcode-agent` 包装脚本，
   其 `#!/usr/bin/env node` 在净化 env 下 ENOENT），用
   `ZCODE_AGENT_SERVER_COMMAND`/`ZCODE_AGENT_SERVER_ARGS_JSON` 钉死。
-  剩余：对话内容帧走 `subscribeConversationV4`/`onDynamicConversationFrame`
-  （V4 帧订阅语义待映射）；`desktop-attached-remote` 权威下的
-  runtime-preferences 应答回路已在探针中就位（local 权威下 server 自答、
-  事件不触发）。
+  对话内容帧已由 `ZServerBackend` 经 `subscribeConversationV4`/
+  `onDynamicConversationFrame` 映射（初始帧丢弃、按 topic 过滤会话、静默门
+  控制 turn 完成）；仍未覆盖的项见"已知差距"。`desktop-attached-remote`
+  权威下的 runtime-preferences 应答回路已在探针中就位（local 权威下 server
+  自答、事件不触发）。
   **runtime-preferences 中继（已解决）**：desktop-attached-remote 权威下
   server 不自答 agent 的 `session/requestRuntimePreferences`，而是经动态事件
   `onDynamicSessionRuntimePreferencesRequest` 转发给连接客户端，须用

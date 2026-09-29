@@ -27,8 +27,9 @@ import {
 } from "./desktop-profile.js";
 import {
   ensurePersonalGlmProvider,
-  personalProviderConfigPath,
   type PersonalProviderOutcome,
+  type PersonalProviderTarget,
+  resolvePersonalProviderTarget,
 } from "./config/personal-provider.js";
 import { AGENT_INFO, ZCODE_CREDS_PATH } from "./utils.js";
 import { runRepl } from "./repl/run.js";
@@ -256,30 +257,47 @@ function exportDesktopProfile(filePath?: string): void {
  * capture proves the desktop is running and its pins are current. Best-effort:
  * outcome is reported, never thrown; refresh's exit code is untouched.
  */
-function ensureGlmPersonalProviderAfterRefresh(): void {
-  let providerPath: string;
+export function ensureGlmPersonalProviderAfterRefresh(
+  deps: {
+    resolveTarget?: () => PersonalProviderTarget;
+    ensure?: typeof ensurePersonalGlmProvider;
+    write?: (line: string) => void;
+  } = {},
+): void {
+  const write = deps.write ?? ((line: string) => void process.stdout.write(line));
+  const ensure = deps.ensure ?? ensurePersonalGlmProvider;
+  let target: PersonalProviderTarget;
   try {
-    providerPath = personalProviderConfigPath(loadDesktopProfile().env);
+    target = deps.resolveTarget
+      ? deps.resolveTarget()
+      : resolvePersonalProviderTarget(loadDesktopProfile().env);
   } catch {
-    providerPath = personalProviderConfigPath();
+    target = resolvePersonalProviderTarget();
   }
-  const outcome: PersonalProviderOutcome = ensurePersonalGlmProvider(
-    providerPath,
-    ZCODE_CREDS_PATH,
-  );
+  if (target.rejectedPin !== undefined) {
+    // The backend READS the pinned file; writing the default one instead would
+    // register the entry where nothing looks while reporting success. Say so
+    // and touch nothing.
+    write(
+      `personal provider: not touched — the desktop pins ${target.rejectedPin}, which is outside ` +
+        `~/.zcode and is refused as a write target for the plan key\n`,
+    );
+    return;
+  }
+  const outcome: PersonalProviderOutcome = ensure(target.path, ZCODE_CREDS_PATH);
   switch (outcome.status) {
     case "added":
-      process.stdout.write(
-        `personal provider: GLM Coding Plan entry re-added (${outcome.providerId})\n`,
+      write(
+        `personal provider: GLM Coding Plan entry re-added (${outcome.providerId}) in ${target.path}\n`,
       );
       break;
     case "present":
-      process.stdout.write(
-        `personal provider: GLM Coding Plan entry present (${outcome.providerId})\n`,
+      write(
+        `personal provider: GLM Coding Plan entry present (${outcome.providerId}) in ${target.path}\n`,
       );
       break;
     case "skipped":
-      process.stdout.write(`personal provider: not touched — ${outcome.reason}\n`);
+      write(`personal provider: not touched — ${outcome.reason}\n`);
       break;
   }
 }

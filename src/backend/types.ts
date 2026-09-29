@@ -196,6 +196,10 @@ export type ZcodeInteractionResponse =
 export interface BridgeBackend {
   isDead: boolean;
   deathReason: string | null;
+  /** The backend respawns its own transport in place (restart()/next request),
+   *  so `isDead` must not make the bridge replace the instance (listeners live
+   *  on it). */
+  readonly healsInPlace?: boolean;
   request(
     id: number,
     method: string,
@@ -207,6 +211,9 @@ export interface BridgeBackend {
   unregisterEventListener(zcodeSid: string, listener: EventListenerLike): void;
   restart(reason: string): Promise<void> | void;
   close(): void | Promise<void>;
+  /** Drop a retired session's per-session backend state (optional: the direct
+   *  backend keys nothing per session that outlives its process). */
+  releaseSession?(zcodeSid: string): void;
 }
 
 /** Structural mirror of client.js `EventListener` (handleEvent). */

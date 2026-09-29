@@ -39,6 +39,9 @@ export type ZServerExitHandler = (
 
 export type ZServerConnectionPhase = "spawn" | "hello" | "ready";
 
+/** Why the transport ended: the process/socket closed, or it never started. */
+type ExitKind = "exit" | "spawn-error";
+
 export class ZServerConnectionError extends Error {
   constructor(
     readonly phase: ZServerConnectionPhase,
@@ -80,7 +83,7 @@ export class ZServerConnection {
       writeFrame(payload: Buffer): void;
       shutdown(): void;
       bind(onStdout: (chunk: Buffer) => void, onStderr: (chunk: Buffer) => void): void;
-      onExit(cb: (detail: string) => void): void;
+      onExit(cb: (detail: string, kind: ExitKind) => void): void;
     },
   ) {
     this.exitFailure = new Promise<never>((_, reject) => {
@@ -122,10 +125,19 @@ export class ZServerConnection {
       (chunk) => this.onStdout(chunk),
       (chunk) => this.onStderr(chunk),
     );
-    this.io.onExit((detail) => {
+    this.io.onExit((detail, kind) => {
       this.exited = true;
       const tail = this.stderrTail.at(-1) ? `: ${this.stderrTail.at(-1)}` : "";
-      this.exitReject(new ZServerConnectionError("hello", `zcode server exited: ${detail}${tail}`));
+      // A process that never started (ENOENT/EACCES) is a PERMANENT spawn
+      // failure — phase "spawn" is what makes the backend classify it as
+      // `spawn failed:` (ERR_SPAWN_FAILED, no futile heal loop). A process that
+      // started and then died mid-handshake stays retryable ("hello").
+      this.exitReject(
+        new ZServerConnectionError(
+          kind === "spawn-error" ? "spawn" : "hello",
+          `zcode server exited: ${detail}${tail}`,
+        ),
+      );
       this.client.dispose(
         Object.assign(new Error(`zcode server exited: ${detail}${tail}`), {
           name: "ConnectionClosed",
@@ -208,7 +220,7 @@ export class ZServerConnection {
           socket.destroy();
         });
       },
-      onExit: (cb) => socket.once("close", () => cb("socket closed")),
+      onExit: (cb) => socket.once("close", () => cb("socket closed", "exit")),
     });
     try {
       await Promise.race([
@@ -306,9 +318,10 @@ export class ZServerConnection {
     return this.channel.listen(event, arg, onFire);
   }
 
-  /** Channel access for any other registered service ("zcode-task", "zcode-session", …). */
-  channelOf(name: string): ServiceChannel {
-    return new ServiceChannel(this.client, name);
+  /** Channel access for any other registered service ("zcode-task", "zcode-session", …).
+   *  With `signal`, aborting it abandons that channel's still-pending calls. */
+  channelOf(name: string, signal?: AbortSignal): ServiceChannel {
+    return new ServiceChannel(this.client, name, signal);
   }
 
   dispose(reason?: Error): void {
@@ -432,6 +445,10 @@ function childIo(child: ChildProcessWithoutNullStreams) {
   // force-kills are the proven scenario — reap the whole server process
   // group so it cannot orphan (pattern proven in backend/client.ts).
   startGroupWatchdog(child.pid);
+  // shutdown() must be idempotent: group-kill via process.kill(-pid) never sets
+  // child.killed, so without this every repeated dispose re-signalled the group
+  // and armed another escalation timer.
+  let shutdownStarted = false;
   return {
     writeFrame(payload: Buffer): void {
       if (!child.stdin.destroyed) child.stdin.write(payload);
@@ -439,7 +456,8 @@ function childIo(child: ChildProcessWithoutNullStreams) {
     shutdown(): void {
       // Group kill (child spawned detached → its pid IS its pgid), with a
       // SIGKILL escalation if SIGTERM is ignored or trapped.
-      if (child.exitCode === null && !child.killed) {
+      if (!shutdownStarted && child.exitCode === null && !child.killed) {
+        shutdownStarted = true;
         try {
           process.kill(-child.pid!, "SIGTERM");
         } catch {
@@ -464,21 +482,25 @@ function childIo(child: ChildProcessWithoutNullStreams) {
       child.stdout!.on("data", onStdout);
       child.stderr!.on("data", onStderr);
     },
-    onExit(cb: (detail: string) => void): void {
-      // Fire-once across 'exit' AND 'error': an async spawn failure (ENOENT/
-      // EACCES) emits 'error' then 'close' and NEVER 'exit' — without this the
-      // handshake sat out the full 10s hello timeout and was misclassified
-      // as a retryable death instead of a permanent spawn failure.
+    onExit(cb: (detail: string, kind: ExitKind) => void): void {
+      // Fire-once across 'exit' AND spawn 'error': an async spawn failure
+      // (ENOENT/EACCES) emits 'error' then 'close' and NEVER 'exit' — without
+      // this the handshake sat out the full 10s hello timeout.
       let fired = false;
-      const once = (detail: string): void => {
+      const once = (detail: string, kind: ExitKind): void => {
         if (fired) return;
         fired = true;
-        cb(detail);
+        cb(detail, kind);
       };
       child.once("exit", (code, signal) =>
-        once(`code=${code ?? "null"} signal=${signal ?? "null"}`),
+        once(`code=${code ?? "null"} signal=${signal ?? "null"}`, "exit"),
       );
-      child.once("error", (error) => once(`spawn error: ${error.message}`));
+      child.once("error", (error) => {
+        // 'error' is also emitted for failed kill()/IPC on a RUNNING child —
+        // that is not an exit (the real 'exit' still follows). Only a child
+        // that never got a pid is a spawn failure.
+        if (child.pid === undefined) once(`spawn error: ${error.message}`, "spawn-error");
+      });
     },
   };
 }

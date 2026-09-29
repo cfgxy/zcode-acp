@@ -1,9 +1,19 @@
 // Fake zcode-server.cjs (stdio mode) for connection tests.
 //
-// Deliberately re-implements the wire format independently from
-// src/backend/zserver/protocol.ts (hand-rolled VQL/tag/frame encoders) so the
-// two implementations cross-check each other. Speaks: banner noise →
-// zcode-hello → (ack) → Initialize frame → echo Promise responses.
+// Hand-written re-implementation of the wire format (VQL/tag/frame encoders),
+// kept separate from src/backend/zserver/protocol.ts so the two cross-check
+// each other on framing and dispatch. NOT an independent oracle for the codec
+// arithmetic: the VQL loop is the same algorithm as protocol.ts's, so a shared
+// mistake there (negative numbers, >2^31, Buffer/VSBuffer bodies, nested
+// Uint8Array, floats) would pass on both sides. Byte-level fidelity against
+// the real bundle is verified separately (see ADR-0008, "线协议事实").
+// Speaks: banner noise → zcode-hello → (ack) → Initialize frame → echo
+// Promise responses.
+//
+// Test-only knobs (read here, not runtime configuration): ZSERVER_FAKE_*
+// (SLOW_EXIT_MS, IGNORE_SIGTERM, PID_FILE, GRANDCHILD_IGNORES_SIGTERM,
+// DIE_AFTER_MS, SPAWN_LOG, FAIL_METHODS, HANG_METHODS, TERMINAL, FRAMES) and
+// ZSERVER_COALESCE.
 //
 // NOTE: executed as `<tmpdir>/zcode-server.cjs`, i.e. CommonJS — no ESM syntax.
 // `process` is a global.
