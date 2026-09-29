@@ -119,6 +119,7 @@ const handleFrame = (payload) => {
     if (t) {
       clearInterval(t);
       listeners.delete(id);
+      console.error(`ZSERVER_UNSUB:${id}`);
     }
   }
 };

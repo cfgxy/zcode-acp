@@ -110,6 +110,19 @@ respondElicitation / resumeTask / closeTask / deliverSessionMessage / …`；
 - `session/resume` 携带 workspace（bridge 侧 `workspaceFor(cwd)`），跨
   bridge 重启的 workspace 映射恢复无需额外机制（已验证调用链）。
 
+### 失败缓存与生命周期残留（第五轮深审补记）
+
+- **spawn 失败不得缓存 rejected promise**：失败的 spawnPromise 若留存，
+  backend 永久卡死（isDead 不置位、heal 不触发）。失败时清缓存并置
+  带 marker 的 isDead。
+- **V4 initial 帧是历史回放**：订阅重建（resume/heal）后的首帧携带全量
+  日志行，翻译它会把历史 assistantText 当 live 流重新发出（编辑器重复
+  显示）。只翻译 deliveryKind==="online" 的帧；历史由 readSession 快照
+  重建。
+- **broker 客户端不告而别要代发退订**：ChannelClient.dispose 不发
+  unsubscribe 帧——broker 在客户端 socket close 时代发 EventDispose，
+  否则共享 server 对已离开的客户端永久投递事件。
+
 ### 粗糙边缘（server 侧，避免踩坑）
 
 - `ProxyChannel.fromService` 对**未知事件名同步 throw**，会把整个 server 进程

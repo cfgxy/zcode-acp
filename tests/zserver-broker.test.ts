@@ -205,3 +205,26 @@ describe("ZServerBroker cross-client isolation", () => {
     }
   });
 });
+
+describe("ZServerBroker detach hygiene", () => {
+  it("synthesizes unsubscribe for subscriptions left by a detached client", async () => {
+    const socketPath = path.join(os.tmpdir(), `zserver-broker-test7-${Date.now()}.sock`);
+    sockets.push(socketPath);
+    const broker = new ZServerBroker(socketPath, makeServerRoot());
+    await broker.start();
+    const client = await ZServerConnection.attach({ socketPath, clientId: "ghost" });
+    // Leave a subscription open, then vanish WITHOUT unsubscribing
+    // (ChannelClient.dispose sends nothing).
+    client.listen("onTick", undefined, () => undefined);
+    await new Promise((r) => setTimeout(r, 250)); // let the subscribe reach the server
+    client.dispose();
+    await new Promise((r) => setTimeout(r, 400));
+    // The fixture writes ZSERVER_UNSUB:<id> to stderr when the broker's
+    // synthesized EventDispose reaches it.
+    const connection = (broker as unknown as { connection: { stderrSnapshot(): string[] } | null })
+      .connection;
+    const stderr = connection?.stderrSnapshot().join("\n") ?? "";
+    expect(stderr).toContain("ZSERVER_UNSUB:");
+    await broker.stop();
+  });
+});

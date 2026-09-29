@@ -187,6 +187,18 @@ export class ZServerBroker {
     socket.once("close", () => {
       this.clients.delete(clientId);
       log(`zserver-broker: client ${clientId} detached (${this.clients.size} attached)`);
+      // The client never sent unsubscribe frames (ChannelClient.dispose does
+      // not emit them) — synthesize EventDispose for every subscription it
+      // left open, or the shared server keeps firing events into a routed
+      // void forever. In-flight promise ids get disposed too (harmless: their
+      // responses would have nowhere to go).
+      if (this.connection && entry.idByClient.size > 0) {
+        for (const serverId of [...entry.idByClient.keys()]) {
+          this.connection.rawSend(encodeMessage([103, serverId], undefined));
+        }
+      }
+      entry.idByClient.clear();
+      entry.serverIdByClient.clear();
       this.armIdleExit();
     });
     socket.once("error", () => socket.destroy());

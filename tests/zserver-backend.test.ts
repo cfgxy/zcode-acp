@@ -12,6 +12,7 @@ afterEach(() => {
 });
 
 import {
+  shouldTranslateFrame,
   translateConversationDelta,
   TurnCompletionGate,
   ZServerBackend,
@@ -227,5 +228,32 @@ describe("ZServerBackend request timeout", () => {
       delete process.env.ZSERVER_FAKE_HANG_METHODS;
       await backend.close();
     }
+  });
+});
+
+describe("zserver round-5 audit fixes", () => {
+  it("a failed spawn marks the backend dead with the heal marker (not wedged)", async () => {
+    const backend = new ZServerBackend({ serverRoot: "/nonexistent-zserver-root" });
+    const response = await backend.request(1, "session/list", {});
+    expect(response.error?.message).toContain("backend reader exited");
+    expect(backend.isDead).toBe(true);
+    // ensureBackend-level retryability: the rejected spawn promise is not cached.
+    const second = await backend.request(2, "session/list", {});
+    expect(second.error?.message).toContain("backend reader exited");
+  });
+
+  it("history (initial) frames do not translate into streaming events", () => {
+    const { events, deliver } = collect();
+    const historyRow = {
+      op: "row.appended",
+      row: { rowId: "9", kind: "assistantText", text: "old reply" },
+    };
+    // The deliveryKind gate lives before translation; assert both layers.
+    expect(shouldTranslateFrame({ deliveryKind: "initial" })).toBe(false);
+    expect(shouldTranslateFrame({ deliveryKind: "online" })).toBe(true);
+    if (shouldTranslateFrame({ deliveryKind: "initial" })) {
+      translateConversationDelta(historyRow, "sess-h", new Map(), deliver);
+    }
+    expect(events).toEqual([]);
   });
 });

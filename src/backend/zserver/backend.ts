@@ -65,6 +65,17 @@ export class ZServerBackend implements BridgeBackend {
     if (this.connection) return this.connection;
     if (!this.spawnPromise) {
       this.spawnPromise = this.spawn();
+      // A rejected spawnPromise must never be cached: clear it on failure so
+      // the next request retries, and mark the backend dead with the heal
+      // marker so the supervised path (and ensureBackend) treats this as a
+      // restartable backend instead of a permanently wedged one.
+      this.spawnPromise.catch((error: unknown) => {
+        this.spawnPromise = null;
+        this.isDead = true;
+        this.deathReason = `zcode backend reader exited (backend dead): ${
+          error instanceof Error ? error.message : String(error)
+        }`;
+      });
     }
     await this.spawnPromise;
     return this.connection!;
@@ -353,6 +364,7 @@ export class ZServerBackend implements BridgeBackend {
       .then(() => {
         connection.listen("onDynamicConversationFrame", { workspacePath, sessionId }, (data) => {
           gate.onStreamActivity();
+          if (!shouldTranslateFrame(data)) return;
           const deltas =
             (data as { frame?: { payload?: { deltas?: Array<Record<string, unknown>> } } })?.frame
               ?.payload?.deltas ?? [];
@@ -404,6 +416,17 @@ export class ZServerBackend implements BridgeBackend {
     await this.ensureConnection();
   }
 }
+/**
+ * History gate: the V4 subscription's FIRST frame (deliveryKind "initial")
+ * replays the session's full log — rows for every past turn. Translating it
+ * would re-emit history assistantText as live model.streaming (duplicated
+ * text in the editor after every resume/heal). The bridge rebuilds history
+ * from the readSession snapshot instead, so only online frames translate.
+ */
+export function shouldTranslateFrame(data: unknown): boolean {
+  return (data as { deliveryKind?: string } | null)?.deliveryKind !== "initial";
+}
+
 /**
  * Pure translation of one conversation delta into app-server event dialect.
  * `emittedByRow` tracks per-row emitted text length so full-row upserts only
