@@ -282,3 +282,12 @@ describe("buildCreateSessionParams (bridge param fidelity)", () => {
     });
   });
 });
+
+describe("terminalResultType (outcome fidelity)", () => {
+  it("preserves cancelled and failed, normalizes the rest", async () => {
+    const { terminalResultType } = await import("../src/backend/zserver/backend.js");
+    expect(terminalResultType("succeeded")).toBe("success");
+    expect(terminalResultType("cancelled")).toBe("cancelled");
+    expect(terminalResultType("failed")).toBe("error");
+  });
+});

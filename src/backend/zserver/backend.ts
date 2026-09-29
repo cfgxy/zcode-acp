@@ -332,10 +332,7 @@ export class ZServerBackend implements BridgeBackend {
     this.gatesBySession.get(sessionId)?.dispose();
     const gate = new TurnCompletionGate((outcome) => {
       const type: ZcodeEvent["type"] = outcome === "failed" ? "turn.failed" : "turn.completed";
-      deliver({
-        type,
-        payload: { resultType: outcome === "failed" ? "error" : "success" },
-      });
+      deliver({ type, payload: { resultType: terminalResultType(outcome) } });
     });
     this.gatesBySession.set(sessionId, gate);
     connection.channelOf("zcode-task").listen("onDynamicTaskTerminalOutcome", sessionId, (data) => {
@@ -354,26 +351,25 @@ export class ZServerBackend implements BridgeBackend {
         deliver({ type: "state.updated", payload: notification });
       },
     );
-    // Conversation rows → turn lifecycle + text deltas.
+    // Conversation rows → turn lifecycle + text deltas. The listener MUST be
+    // registered BEFORE the subscribe call: the server-side subscription goes
+    // live at the ack, and frames fired between the ack and a later
+    // EventListen would be routed to a handler that does not exist yet.
+    connection.listen("onDynamicConversationFrame", { workspacePath, sessionId }, (data) => {
+      gate.onStreamActivity();
+      if (!shouldTranslateFrame(data)) return;
+      const deltas =
+        (data as { frame?: { payload?: { deltas?: Array<Record<string, unknown>> } } })?.frame
+          ?.payload?.deltas ?? [];
+      for (const delta of deltas) {
+        translateConversationDelta(delta, sessionId, this.emittedByRow, (event) => deliver(event));
+      }
+    });
     agentChannel
       .call("subscribeConversationV4", {
         workspacePath,
         sessionId,
         clientMode: "desktop-continuous",
-      })
-      .then(() => {
-        connection.listen("onDynamicConversationFrame", { workspacePath, sessionId }, (data) => {
-          gate.onStreamActivity();
-          if (!shouldTranslateFrame(data)) return;
-          const deltas =
-            (data as { frame?: { payload?: { deltas?: Array<Record<string, unknown>> } } })?.frame
-              ?.payload?.deltas ?? [];
-          for (const delta of deltas) {
-            translateConversationDelta(delta, sessionId, this.emittedByRow, (event) =>
-              deliver(event),
-            );
-          }
-        });
       })
       .catch((error) => warn(`backend: conversation subscribe failed: ${error.message}`));
   }
@@ -416,6 +412,17 @@ export class ZServerBackend implements BridgeBackend {
     await this.ensureConnection();
   }
 }
+/**
+ * Terminal outcome → translator resultType. "cancelled" is a literal the
+ * bridge keys on (turnResultType === "cancelled") for cancellation semantics —
+ * collapsing it into "success" misreports user cancels as clean completions.
+ */
+export function terminalResultType(outcome: string): string {
+  if (outcome === "failed") return "error";
+  if (outcome === "cancelled") return "cancelled";
+  return "success";
+}
+
 /**
  * Bridge session/create params → inner createSession params. The bridge sends
  * mode:"yolo" (full-auto assumption) and optional editor MCP servers — both

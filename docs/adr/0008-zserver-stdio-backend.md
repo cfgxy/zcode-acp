@@ -137,6 +137,17 @@ respondElicitation / resumeTask / closeTask / deliverSessionMessage / …`；
 - `ZServerBackend.forgetSession` 当前无调用方（bridge 会话驱逐未接线）。
 - 第七轮终扫无新增中等以上问题，深审循环终止。
 
+### 订阅窗口与取值保真（第八轮深审补记）
+
+- **帧监听器必须先于订阅调用注册**：server 端订阅在 ack 时刻即生效，
+  ack 之后才发 EventListen 的窗口内触发的帧会被投到不存在的监听器上
+  丢失（快 turn 的 turn.started 可能丢）。
+- **terminal outcome 的 "cancelled" 是字面契约**（bridge 以
+  `turnResultType === "cancelled"` 判取消）——不可折叠为 "success"，
+  否则用户取消被误报为干净完成（terminalResultType 承载映射）。
+- TurnMonitor 消费 `result.projection`：内层 readSession 快照顶层含
+  projection 键，形状契合（深层字段待编辑器实机确认）。
+
 ### 粗糙边缘（server 侧，避免踩坑）
 
 - `ProxyChannel.fromService` 对**未知事件名同步 throw**，会把整个 server 进程
