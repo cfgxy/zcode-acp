@@ -95,6 +95,21 @@ respondElicitation / resumeTask / closeTask / deliverSessionMessage / …`；
 - broker attach 失败（如 broker 死亡）回退直接 spawn；restart/heal 会
   先重试 broker。
 
+### 退化路径事实（第四轮深审补记）
+
+- **请求超时是精确契约**：EventStreamListener 的订阅重试键于
+  `error.message === "timeout"`（字面匹配）。ZServerBackend.request 必须
+  实现 per-request 超时并返回该精确文案——server 半死（不响应不退出）
+  时才能走重试/heal 而不是永久挂起。
+- **interaction 中继是 ZcodeBackend 专属能力**（pollServerRequests/
+  sendReply）；handleServerRequests 以能力守卫短路 zserver 模式，yolo
+  会话不产生交互请求。
+- **broker 只可 header-only 改写帧**：body 的 decode→encode 往返不是
+  字节保真的（顶层 VSBuffer(3) 翻为 Buffer(2)、对象全量重排）——
+  replaceHeader 重编码 header 后拼接原始 body 字节。
+- `session/resume` 携带 workspace（bridge 侧 `workspaceFor(cwd)`），跨
+  bridge 重启的 workspace 映射恢复无需额外机制（已验证调用链）。
+
 ### 粗糙边缘（server 侧，避免踩坑）
 
 - `ProxyChannel.fromService` 对**未知事件名同步 throw**，会把整个 server 进程

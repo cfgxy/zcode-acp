@@ -4,7 +4,13 @@ import os from "node:os";
 import path from "node:path";
 
 import { log, warn } from "../../utils.js";
-import { decodeMessage, encodeFrame, encodeMessage, FrameDecoder } from "./protocol.js";
+import {
+  decodeMessage,
+  encodeFrame,
+  encodeMessage,
+  FrameDecoder,
+  replaceHeader,
+} from "./protocol.js";
 import { ZServerConnection } from "./connection.js";
 import { runtimeEnvWithProfile } from "./backend.js";
 
@@ -208,8 +214,7 @@ export class ZServerBroker {
       entry.socket.destroy();
       return;
     }
-    const message = decodeMessage(payload);
-    const header = message.header as unknown[];
+    const header = decodeMessage(payload).header as unknown[];
     if (!Array.isArray(header)) return;
     const [type, clientRequestId] = header as [number, number?];
     if (typeof clientRequestId === "number") {
@@ -230,7 +235,9 @@ export class ZServerBroker {
       }
     }
     try {
-      connection.rawSend(encodeMessage(header, message.body));
+      // Header-only rewrite: the body bytes are forwarded untouched (a full
+      // decode→encode roundtrip is not byte-faithful — see replaceHeader).
+      connection.rawSend(replaceHeader(payload, header));
     } catch (error) {
       warn(
         `zserver-broker: send to shared server failed: ${error instanceof Error ? error.message : String(error)}`,
@@ -241,8 +248,7 @@ export class ZServerBroker {
 
   /** Forward one server-side frame to its owning client (or drop). */
   private routeServerPayload(payload: Buffer): void {
-    const message = decodeMessage(payload);
-    const header = message.header as unknown[];
+    const header = decodeMessage(payload).header as unknown[];
     if (!Array.isArray(header)) return;
     const [type, id] = header as [number, number?];
     if (type === 200) return; // server Initialize — synthesized per client
@@ -261,7 +267,7 @@ export class ZServerBroker {
         }
       }
       header[1] = clientRequestId;
-      entry.socket.write(encodeFrame(encodeMessage(header, message.body)));
+      entry.socket.write(encodeFrame(replaceHeader(payload, header)));
       return;
     }
   }

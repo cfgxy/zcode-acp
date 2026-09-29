@@ -269,6 +269,13 @@ export async function handleServerRequests(
   acpSid: string,
   turn?: PendingTurn,
 ): Promise<boolean> {
+  // zserver mode (ADR-0008): interaction relaying rides on pollServerRequests/
+  // sendReply, which only the direct app-server backend implements. Calling
+  // them on ZServerBackend would TypeError every turn-loop iteration; report
+  // nothing-handled instead (yolo-mode sessions raise no interactions).
+  if (typeof backend.pollServerRequests !== "function") {
+    return false;
+  }
   const pending = getPendingInteractions(server);
   let handled = false;
   const mySid = turn?.zcodeSid;

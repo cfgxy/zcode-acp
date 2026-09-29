@@ -100,6 +100,8 @@ const handleFrame = (payload) => {
   const { header, body } = decMsg(payload);
   const [type, id, , name] = header;
   if (type === 100) {
+    const hangMethods = (process.env.ZSERVER_FAKE_HANG_METHODS || "").split(",").filter(Boolean);
+    if (hangMethods.includes(name)) return; // wedged-but-alive server simulation
     process.stdout.write(encFrame(msg([201, id], `echo:${name}:${JSON.stringify(body)}`)));
   } else if (type === 102) {
     // Subscribe: fire N events with the SAME listen id (EventFire semantics),

@@ -207,3 +207,25 @@ describe("ZServerBackend broker fallback", () => {
     }
   });
 });
+
+describe("ZServerBackend request timeout", () => {
+  it("surfaces a wedged server as the exact 'timeout' error (retry semantics)", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "zserver-timeout-"));
+    tempDirs.push(root);
+    fs.copyFileSync(
+      new URL("./fixtures/zserver-fake-server.mjs", import.meta.url).pathname,
+      path.join(root, "zcode-server.cjs"),
+    );
+    process.env.ZSERVER_FAKE_HANG_METHODS = "listTasks";
+    const backend = new ZServerBackend({ serverRoot: root });
+    try {
+      const startedAt = Date.now();
+      const response = await backend.request(1, "session/list", {}, 500);
+      expect(response.error?.message).toBe("timeout");
+      expect(Date.now() - startedAt).toBeLessThan(2000);
+    } finally {
+      delete process.env.ZSERVER_FAKE_HANG_METHODS;
+      await backend.close();
+    }
+  });
+});

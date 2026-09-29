@@ -247,6 +247,20 @@ export interface DecodedMessage {
   body: unknown;
 }
 
+/**
+ * Rewrite a message's header while forwarding the ORIGINAL body bytes.
+ * Decode→re-encode roundtrips of the body are not byte-faithful (a top-level
+ * VSBuffer(3) value would come back as Buffer(2), and object bodies get full
+ * JSON re-serialization) — brokers must only touch the header.
+ */
+export function replaceHeader(payload: Buffer, header: unknown): Buffer {
+  const state = { pos: 0 };
+  decodeValue(payload, state); // consume exactly the header value
+  const parts: Buffer[] = [];
+  encodeValue(parts, header);
+  return Buffer.concat([...parts, payload.subarray(state.pos)]);
+}
+
 export function decodeMessage(payload: Buffer): DecodedMessage {
   const state = { pos: 0 };
   const header = decodeValue(payload, state);

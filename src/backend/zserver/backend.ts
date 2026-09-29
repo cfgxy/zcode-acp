@@ -157,14 +157,26 @@ export class ZServerBackend implements BridgeBackend {
     id: number,
     method: string,
     params: Record<string, unknown> = {},
-    _timeoutMs = 15000,
+    timeoutMs = 15000,
   ): Promise<ZcodeResponse> {
     this.armIdleTimer();
     try {
       const connection = await this.ensureConnection();
-      const result = await this.route(connection, method, params);
+      // Per-request timeout, mirroring the direct backend's contract: callers
+      // (EventStreamListener subscribe retry, resume retry) key on the exact
+      // error message "timeout" — a wedged-but-alive server must surface as a
+      // retryable timeout, not hang the turn setup forever.
+      const result = await Promise.race([
+        this.route(connection, method, params),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new RequestTimeoutError()), timeoutMs),
+        ),
+      ]);
       return { id, result: result as Record<string, unknown> };
     } catch (error) {
+      if (error instanceof RequestTimeoutError) {
+        return { id, error: { message: "timeout" } };
+      }
       const message = error instanceof Error ? error.message : String(error);
       // Died while this request was in flight → classify as backend-dead so
       // the supervised heal path (restart + resume) engages.
@@ -431,6 +443,13 @@ export function translateConversationDelta(
     }
   }
 }
+class RequestTimeoutError extends Error {
+  constructor() {
+    super("timeout");
+    this.name = "RequestTimeoutError";
+  }
+}
+
 export interface ScheduledHandle {
   cancel(): void;
 }

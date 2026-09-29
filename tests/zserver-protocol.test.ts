@@ -153,3 +153,24 @@ describe("zserver ChannelClient", () => {
     await expect(pending).rejects.toMatchObject({ name: "ConnectionClosed" });
   });
 });
+
+describe("replaceHeader (byte-faithful forwarding)", () => {
+  it("rewrites only the header and forwards the original body bytes", async () => {
+    const { replaceHeader, encodeValue } = await import("../src/backend/zserver/protocol.js");
+    // Handcraft: header value (via encodeValue, no implicit body) + a body
+    // using the VSBuffer tag (3) at top level — a decode→re-encode roundtrip
+    // would flip it to Buffer (2).
+    const headerParts: Buffer[] = [];
+    encodeValue(headerParts, [100, 7, "zcode-agent", "attachmentChunk"]);
+    const body = Buffer.from([DataType_VSBuffer, 0x03, 0xaa, 0xbb, 0xcc]); // VQL len 3
+    const payload = Buffer.concat([...headerParts, body]);
+    const reframed = replaceHeader(payload, [100, 4242, "zcode-agent", "attachmentChunk"]);
+    const decoded = decodeMessage(reframed);
+    expect(decoded.header).toEqual([100, 4242, "zcode-agent", "attachmentChunk"]);
+    // Body byte-identical: the VSBuffer tag survives (not flipped to Buffer).
+    expect(reframed.subarray(reframed.byteLength - 5)).toEqual(body);
+    expect(decoded.body).toBeInstanceOf(Uint8Array);
+    expect(Array.from(decoded.body as Uint8Array)).toEqual([0xaa, 0xbb, 0xcc]);
+  });
+});
+const DataType_VSBuffer = 3;
