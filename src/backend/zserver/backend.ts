@@ -219,10 +219,10 @@ export class ZServerBackend implements BridgeBackend {
     switch (method) {
       case "session/create": {
         if (!workspacePath) throw new Error("session/create requires workspace.workspacePath");
-        const snapshot = (await agentChannel.call("createSession", {
-          workspacePath,
-          persistence: "immediate",
-        })) as { session?: { sessionId?: string } };
+        const snapshot = (await agentChannel.call(
+          "createSession",
+          buildCreateSessionParams(params, workspacePath),
+        )) as { session?: { sessionId?: string } };
         const sid = snapshot?.session?.sessionId;
         if (!sid) throw new Error("createSession returned no sessionId");
         this.workspaceBySession.set(sid, workspacePath);
@@ -416,6 +416,25 @@ export class ZServerBackend implements BridgeBackend {
     await this.ensureConnection();
   }
 }
+/**
+ * Bridge session/create params → inner createSession params. The bridge sends
+ * mode:"yolo" (full-auto assumption) and optional editor MCP servers — both
+ * are valid createSession fields and MUST be forwarded: dropping the mode
+ * silently changes permission behaviour, dropping mcpServers silently loses
+ * editor-configured servers.
+ */
+export function buildCreateSessionParams(
+  params: Record<string, unknown>,
+  workspacePath: string,
+): Record<string, unknown> {
+  const out: Record<string, unknown> = { workspacePath, persistence: "immediate" };
+  if (typeof params["mode"] === "string") out.mode = params["mode"];
+  if (Array.isArray(params["mcpServers"]) && params["mcpServers"].length > 0) {
+    out.mcpServers = params["mcpServers"];
+  }
+  return out;
+}
+
 /**
  * History gate: the V4 subscription's FIRST frame (deliveryKind "initial")
  * replays the session's full log — rows for every past turn. Translating it

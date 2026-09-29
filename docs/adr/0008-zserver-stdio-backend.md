@@ -123,6 +123,20 @@ respondElicitation / resumeTask / closeTask / deliverSessionMessage / …`；
   unsubscribe 帧——broker 在客户端 socket close 时代发 EventDispose，
   否则共享 server 对已离开的客户端永久投递事件。
 
+### 参数保真（第六轮深审补记）
+
+- **bridge 的 session/create 携带 mode:"yolo" 与可选 mcpServers**（resume
+  同带 mcpServers）——zserver 路由必须转发两者：丢 mode 会静默改变权限
+  行为，丢 mcpServers 会静默丢失编辑器配置的 MCP server。
+  buildCreateSessionParams 纯函数承载该映射并有向量测试。
+
+### 已知差距（低严重度，入档待实测）
+
+- `session/load` 的回放/tail 语义：路由直通 readSession，快照形状与
+  bridge 回放 handler 的消费契合未经编辑器实测。
+- `ZServerBackend.forgetSession` 当前无调用方（bridge 会话驱逐未接线）。
+- 第七轮终扫无新增中等以上问题，深审循环终止。
+
 ### 粗糙边缘（server 侧，避免踩坑）
 
 - `ProxyChannel.fromService` 对**未知事件名同步 throw**，会把整个 server 进程

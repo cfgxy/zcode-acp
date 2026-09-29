@@ -257,3 +257,28 @@ describe("zserver round-5 audit fixes", () => {
     expect(events).toEqual([]);
   });
 });
+
+describe("buildCreateSessionParams (bridge param fidelity)", () => {
+  it("forwards mode and editor MCP servers, not just the workspace", async () => {
+    const { buildCreateSessionParams } = await import("../src/backend/zserver/backend.js");
+    const params = buildCreateSessionParams(
+      {
+        workspace: { workspacePath: "/w" },
+        mode: "yolo",
+        mcpServers: [{ name: "editor-mcp", command: "npx" }],
+      },
+      "/w",
+    );
+    expect(params).toEqual({
+      workspacePath: "/w",
+      persistence: "immediate",
+      mode: "yolo",
+      mcpServers: [{ name: "editor-mcp", command: "npx" }],
+    });
+    // Nothing to forward → stays minimal.
+    expect(buildCreateSessionParams({ workspace: { workspacePath: "/w" } }, "/w")).toEqual({
+      workspacePath: "/w",
+      persistence: "immediate",
+    });
+  });
+});
