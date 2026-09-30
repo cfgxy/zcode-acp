@@ -772,3 +772,161 @@ describe("group C: backend wiring", () => {
     }
   });
 });
+
+describe("editor-invoked extensions reach the channel (parity with direct)", () => {
+  it("session/setModel forwards the model ref to the agent channel", async () => {
+    const { root, rec } = stage();
+    vi.stubEnv("ZSERVER_FAKE_RECORD_FILE", rec);
+    const backend = new ZServerBackend({ serverRoot: root });
+    try {
+      await backend.request(1, "session/create", { workspace: { workspacePath: WS } });
+      const response = await backend.request(2, "session/setModel", {
+        sessionId: "sess_fake_1",
+        model: { providerId: "account:x", modelId: "GLM-5.3", options: { reasoningLevel: "max" } },
+        persistAsWorkspaceLastUsed: false,
+      });
+      expect(response.error).toBeUndefined();
+      const frame = callsOf(rec)
+        .filter((c) => c.method === "setModel")
+        .at(-1);
+      expect(frame?.arg).toEqual({
+        workspacePath: WS,
+        sessionId: "sess_fake_1",
+        model: { providerId: "account:x", modelId: "GLM-5.3", options: { reasoningLevel: "max" } },
+        persistAsWorkspaceLastUsed: false,
+      });
+    } finally {
+      await backend.close();
+    }
+  });
+
+  it("session/setMode forwards the mode to the agent channel", async () => {
+    const { root, rec } = stage();
+    vi.stubEnv("ZSERVER_FAKE_RECORD_FILE", rec);
+    const backend = new ZServerBackend({ serverRoot: root });
+    try {
+      await backend.request(1, "session/create", { workspace: { workspacePath: WS } });
+      const response = await backend.request(2, "session/setMode", {
+        sessionId: "sess_fake_1",
+        mode: "yolo",
+      });
+      expect(response.error).toBeUndefined();
+      const frame = callsOf(rec)
+        .filter((c) => c.method === "setMode")
+        .at(-1);
+      expect(frame?.arg).toEqual({
+        workspacePath: WS,
+        sessionId: "sess_fake_1",
+        mode: "yolo",
+      });
+    } finally {
+      await backend.close();
+    }
+  });
+
+  it("session/setThoughtLevel forwards an explicit level", async () => {
+    const { root, rec } = stage();
+    vi.stubEnv("ZSERVER_FAKE_RECORD_FILE", rec);
+    const backend = new ZServerBackend({ serverRoot: root });
+    try {
+      await backend.request(1, "session/create", { workspace: { workspacePath: WS } });
+      const response = await backend.request(2, "session/setThoughtLevel", {
+        sessionId: "sess_fake_1",
+        thoughtLevel: "high",
+      });
+      expect(response.error).toBeUndefined();
+      const frame = callsOf(rec)
+        .filter((c) => c.method === "setThoughtLevel")
+        .at(-1);
+      expect(frame?.arg).toEqual({
+        workspacePath: WS,
+        sessionId: "sess_fake_1",
+        thoughtLevel: "high",
+      });
+    } finally {
+      await backend.close();
+    }
+  });
+
+  it("session/setThoughtLevel without a level resets to the model's default", async () => {
+    const { root, rec } = stage();
+    vi.stubEnv("ZSERVER_FAKE_RECORD_FILE", rec);
+    vi.stubEnv(
+      "ZSERVER_FAKE_SNAPSHOT",
+      JSON.stringify({
+        settings: {
+          model: {
+            current: { providerId: "account:x", modelId: "GLM-5.3" },
+            available: [
+              {
+                ref: { providerId: "account:x", modelId: "GLM-5.3" },
+                reasoning: { defaultLevel: "max" },
+              },
+            ],
+          },
+        },
+      }),
+    );
+    const backend = new ZServerBackend({ serverRoot: root });
+    try {
+      await backend.request(1, "session/create", { workspace: { workspacePath: WS } });
+      const response = await backend.request(2, "session/setThoughtLevel", {
+        sessionId: "sess_fake_1",
+      });
+      expect(response.error).toBeUndefined();
+      const frame = callsOf(rec)
+        .filter((c) => c.method === "setThoughtLevel")
+        .at(-1);
+      // The channel service demands an explicit string: the reset resolves to the
+      // model's own defaultLevel from the session snapshot.
+      expect(frame?.arg?.thoughtLevel).toBe("max");
+    } finally {
+      await backend.close();
+    }
+  });
+
+  it("session/goal and session/compact address the session by taskId on the tasks channel", async () => {
+    const { root, rec } = stage();
+    vi.stubEnv("ZSERVER_FAKE_RECORD_FILE", rec);
+    const backend = new ZServerBackend({ serverRoot: root });
+    try {
+      await backend.request(1, "session/create", { workspace: { workspacePath: WS } });
+      const goal = await backend.request(2, "session/goal", {
+        sessionId: "sess_fake_1",
+        action: "show",
+      });
+      expect(goal.error).toBeUndefined();
+      const goalFrame = callsOf(rec)
+        .filter((c) => c.method === "goalSession")
+        .at(-1);
+      expect(goalFrame?.arg).toEqual({
+        taskId: "sess_fake_1",
+        workspacePath: WS,
+        action: "show",
+      });
+      const compact = await backend.request(3, "session/compact", { sessionId: "sess_fake_1" });
+      expect(compact.error).toBeUndefined();
+      const compactFrame = callsOf(rec)
+        .filter((c) => c.method === "compactSession")
+        .at(-1);
+      expect(compactFrame?.arg).toEqual({ taskId: "sess_fake_1", workspacePath: WS });
+    } finally {
+      await backend.close();
+    }
+  });
+
+  it("session/fork stays a visible not-supported error (no channel method on the server)", async () => {
+    const { root } = stage();
+    const backend = new ZServerBackend({ serverRoot: root });
+    try {
+      await backend.request(1, "session/create", { workspace: { workspacePath: WS } });
+      const response = await backend.request(2, "session/fork", {
+        sessionId: "sess_fake_1",
+        target: { checkpointId: "c1" },
+      });
+      expect(response.error?.message).toMatch(/not supported in zserver backend mode/);
+    } finally {
+      await backend.close();
+    }
+  });
+});

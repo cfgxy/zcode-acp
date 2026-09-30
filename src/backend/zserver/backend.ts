@@ -445,6 +445,96 @@ export class ZServerBackend implements BridgeBackend {
           })),
         };
       }
+      // Editor-invoked extension parity (model/mode/thought dropdowns, /goal,
+      // /compact). Verified against the deployed bundle: the agent channel carries
+      // setModel/setMode/setThoughtLevel (session-scoped, keyed by sessionId);
+      // goal/compact live on the zcode-task channel and resolve the session by
+      // `taskId` — which for a bridge-created session IS the sessionId (createTask
+      // adopts the draft under its id and returns it as taskId). session/fork and
+      // session/cancelBackgroundTask have NO channel-service counterpart (v4
+      // handles them natively; the app-server facade wire case is @deprecated) —
+      // they stay on the visible not-supported error below.
+      case "session/setModel": {
+        const target = this.workspaceBySession.get(sessionId) ?? workspacePath;
+        const model = params["model"] as
+          | { providerId?: string; modelId?: string; options?: { reasoningLevel?: string } }
+          | undefined;
+        if (!model || typeof model.modelId !== "string" || !model.modelId) {
+          throw new Error("session/setModel requires model.modelId");
+        }
+        return (await agentChannel.call("setModel", {
+          workspacePath: target,
+          sessionId,
+          model,
+          persistAsWorkspaceLastUsed: params["persistAsWorkspaceLastUsed"] === true,
+        })) as Record<string, unknown>;
+      }
+      case "session/setMode": {
+        const target = this.workspaceBySession.get(sessionId) ?? workspacePath;
+        const mode = params["mode"] as string | undefined;
+        if (!mode) throw new Error("session/setMode requires mode");
+        return (await agentChannel.call("setMode", {
+          workspacePath: target,
+          sessionId,
+          mode,
+        })) as Record<string, unknown>;
+      }
+      case "session/setThoughtLevel": {
+        const target = this.workspaceBySession.get(sessionId) ?? workspacePath;
+        let thoughtLevel = params["thoughtLevel"] as string | undefined;
+        if (!thoughtLevel) {
+          // Direct-backend parity: omitting the level resets to the model's
+          // default. The channel service requires an explicit string, so resolve
+          // the default from the session snapshot's own model entry.
+          const read = (await agentChannel.call("readSession", {
+            workspacePath: target,
+            sessionId,
+          })) as {
+            settings?: {
+              model?: {
+                current?: { modelId?: string };
+                available?: Array<{
+                  ref?: { modelId?: string };
+                  reasoning?: { defaultLevel?: string };
+                }>;
+              };
+            };
+          };
+          const currentId = read?.settings?.model?.current?.modelId?.toLowerCase();
+          thoughtLevel = read?.settings?.model?.available?.find(
+            (m) => m.ref?.modelId?.toLowerCase() === currentId,
+          )?.reasoning?.defaultLevel;
+          if (!thoughtLevel) {
+            throw new Error(
+              "session/setThoughtLevel reset needs the model's default reasoning level, " +
+                "which the session snapshot did not provide",
+            );
+          }
+        }
+        return (await agentChannel.call("setThoughtLevel", {
+          workspacePath: target,
+          sessionId,
+          thoughtLevel,
+        })) as Record<string, unknown>;
+      }
+      case "session/goal": {
+        const target = this.workspaceBySession.get(sessionId) ?? workspacePath;
+        const action = (params["action"] as string) ?? "show";
+        const goalParams: Record<string, unknown> = {
+          taskId: sessionId,
+          workspacePath: target,
+          action,
+        };
+        if (params["objective"] !== undefined) goalParams["objective"] = params["objective"];
+        return (await tasks.call("goalSession", goalParams)) as Record<string, unknown>;
+      }
+      case "session/compact": {
+        const target = this.workspaceBySession.get(sessionId) ?? workspacePath;
+        return (await tasks.call("compactSession", {
+          taskId: sessionId,
+          workspacePath: target,
+        })) as Record<string, unknown>;
+      }
       default:
         throw new Error(`method ${method} is not supported in zserver backend mode yet`);
     }
