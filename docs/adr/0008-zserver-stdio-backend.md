@@ -168,12 +168,22 @@ respondElicitation / resumeTask / closeTask / deliverSessionMessage / …`；
     出来的 sessionId"这类参数级约束）。
   - 看门狗按 pgid `kill(-pgid, SIGKILL)`：owner 死后 pgid 数字被别的进程组复用
     的窗口未量化（直连后端 `client.ts` 是同款模式，非本特性引入）。
-  - `EMFILE` 时 `spawn()` 不创建 stdio，`childIo` 抛出的是不含真因的 TypeError；
-    `EAGAIN`（瞬时资源不足）与"二进制起不来"同被归为永久 spawn 失败。
   - aborted 的调用在 Initialize 之前仍留在 `queued` 里直到握手结束（有界，
     生产路径上 `queued` 恒为空）。
   - broker 只有日志、无状态探针（`stats()` 仅进程内可用）；日志无时间戳、无 pid，
-    client id 是自增整数；退出码不区分"已在运行"与真故障。
+    client id 是自增整数；退出码不区分"已在运行"与真故障（同为 1）；启动时若已有
+    broker 在监听，新进程报 `something is already listening`，不区分"重复启动"与
+    真故障。（已修的部分见下"第十二轮：LOW 项收尾"：空闲自退不再无声、双 broker
+    抢同一陈旧 socket 不再各自 "ready"。）
+  - **bundle 缺失时的降级是静默的**：broker 起不来自己的 server（例如它的
+    `serverRoot` 下没有 bundle）时，接入它的 bridge 只会看到
+    `broker attach failed (zcode server exited: socket closed) — falling back`，
+    真因 `zcode server bundle not found` 只出现在 broker 自己的日志里。
+  - attach 失败回退到私有 server 时，一个"接受连接却永不应答"的挂死 broker 会让
+    每次 spawn（含 heal 的每一轮）白等 `READY_TIMEOUT_MS`（15s）——`request()`
+    的超时只覆盖 `route()`，不覆盖之前的 `ensureConnection()`。
+  - 二次 SIGTERM 落回默认动作（`process.once`），此时 socket 文件会残留；下次
+    启动按陈旧 socket 清理。
   - **同 uid 前提下的 pin 缺口（SECURITY.md 把"已在主机上有代码执行"列为范围外，
     这三条都需要同 uid 已能写文件，故不在项目声明的威胁模型内；如实记录并按
     性价比取舍）**。均由安全审计实测：
@@ -376,6 +386,63 @@ projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
 - 未覆盖/UNVERIFIED：profile 文件本身无完整性绑定（每次 spawn 仍应优先
   从 `/proc/<pid>/environ` 重采）、无 SO_PEERCRED（Node 原生不可得）。
 
+### 第十二轮：LOW 项收尾（二波审计遗留，逐条实测后修）
+
+每条都先复现、再修、再对修复做变异验证（备份 → 变异 → 跑 → 按拷贝还原）。
+
+- **在途请求被 `restart()` 切断**：请求所在连接被并发会话的 heal 换掉时，调用方读到
+  裸的 `zcode server channel client disposed`，没有任何 heal 分类器认得它，请求直接
+  失败；直连后端对同一场景返回 `zcode backend restarting`。现在按"错误名为
+  `ConnectionClosed` 且请求所用的连接已不是当前连接"改写成 restarting 标记。
+  两个条件缺一不可，各有测试：只看错误名会把"服务端在途死亡"（连接仍是当前的）
+  误标成 restarting；只看连接身份会把与退役竞速的**真实服务端错误**也改写掉。
+- **`session/create` 中途失败留下的映射**：`createSession` 成功、`createTask` 超时后，
+  `workspaceBySession` 里留着一个调用方永远拿不到 id 的条目。现在只在 create 完成
+  后才登记。（server 端那个未入索引的会话无法在此清理：`closeTask` 不在白名单，
+  见"最小权限"。）
+- **两个 broker 同时起在同一个陈旧 socket 上**：此前偶发**两个都 "ready"**，先到者
+  不可达。根因分两层。① 探活是异步的，探活与 `unlink` 之间另一个 broker 可能已经
+  删掉陈旧文件并 bind 了自己的活 socket，按名字 `unlink` 就删掉了活的。现在用
+  `removeStaleSocket`：`unlink` 前再 `lstat` 一次，只删探活时看到的那一个。
+  ② 第一版用 inode 号做"是不是同一个文件"的判据，**实测不够**：陈旧文件的 inode 号
+  空出来后，赢家新建的 socket 会拿到同一个号（strace 抓到一次失败运行：探活时与赢家
+  新建之后的 `statx` 返回相同的 `stx_ino`），此时输家把赢家的活 socket 当成自己探活
+  过的那个陈旧文件，按名字删掉。只比 inode 号时，全新进程各跑 1 轮的双赢家率是
+  16/60；判据补上出生时间和 ctime 后，同一方法 0/120。
+  复用与进程的冷热有关，不是文件系统的固有属性：一个最小探针（被 kill 的进程留下
+  socket → `unlink` → 本进程 bind）在**长期运行的进程**里循环数百轮从未复用
+  （xfs 与 tmpfs 都是 0），在**全新进程**里各做一轮时 xfs 上 2/60、tmpfs
+  （/dev/shm）0/60。所以只在 XFS 的冷进程里观测到；不要据此推断别的文件系统上
+  不会发生。探针的复用率（2/60）低于 broker 竞态的双赢家率（16/60），差异的原因
+  我没有查清（UNVERIFIED，不作解释）。
+  另外：bind 竞速的输家收到裸 `EADDRINUSE` 时改报 `already listening`；失败的
+  `start()` 不再保留 `server`——否则输家的 `stop()` 会去关闭一个从未 bind 过的
+  监听器，并按名字 `unlink` 那个路径（变异实测：赢家的 socket 文件随之消失）；
+  持久的 server `error` 监听改为 bind 成功之后才挂，输家不会自称 "still serving"。
+- **spawn 的 errno 分类**：`EMFILE`/`ENFILE` 时 Node 在创建 stdio 之前就返回，
+  `child.stdin` 为 `null`，`childIo` 抛的是不含真因的 TypeError；现在报出"没有 stdio
+  管道（描述符耗尽？）"并归为可重试（phase `hello`），同时给那个孩子挂上 `error`
+  监听（Node 仍会在下一个 tick 发一次 `error`，无人监听即崩进程）。`EAGAIN` 是
+  瞬时的进程数不足，此前与 `ENOENT`/`EACCES` 一并被当成永久失败，heal 会直接放弃；
+  现在可重试。`ENOENT`/`EACCES` 仍是永久的（各有测试防止过度放宽）。
+- **server 部署根的解析**：`ZCODE_SERVER_RUNTIME_ROOT=`（空）此前被 `??` 当成已设置，
+  `path.resolve("")` 即当前目录——查找结果取决于 bridge 从哪启动。现在空白视为未设置。
+  broker 之前不传 `serverRoot`，落到"env 与 profile pin 合并后的值"，pin 覆盖了运维者
+  的 env；bridge 则显式传 env。现在 broker 与 bridge 同序：运维者的 env → profile pin
+  → 默认。bundle 缺失的错误现在说明去哪装、怎么改。
+- **broker 空闲自退不再无声**：`log()` 受 `ZCODE_ACP_DEBUG` 门控，与 `Restart=always`
+  组合时守护进程每隔几秒无痕地退出重启。改为 `warn()`。
+- **此前只有变异分析、没有 killer 的项，补上测试并验证**：`releaseSession` 使已武装的
+  完成门静默（mutation.md X10）；attach socket 与子进程各管道的 `error` 监听
+  （X27/X28，按"连续两次 emit 不抛"设计——一个残留的 `once` 监听会偶然吸收第一次
+  错误，只有持久监听扛得住第二次）。broker 空闲自退（X23）：报告针对的快照
+  4cfa1d3 确实没有 killer，592c65c 加入的两个空闲自退测试之后才覆盖；本轮复测
+  确认该变异仍被它们杀死。
+
+**没有修、也没有断言的**：`session.ts` 里的 `void sendSessionUpdate(...)` 没有 `.catch`
+（审计标记为 UNVERIFIED）。blame 显示那行代码来自上游提交（2026-08-24），不在本特性
+的 diff 内；`notify` 在对端关闭后是否拒绝未在活的 SDK 连接上复现，故不动。
+
 ### 环境变量一览
 
 | 变量                                       | 作用                                                              | 默认                                   |
@@ -393,6 +460,9 @@ projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
 
 本表只列生产代码读取的变量；测试夹具专用的 `ZSERVER_FAKE_*`/`ZSERVER_COALESCE`
 见 `tests/fixtures/zserver-fake-server.mjs` 文件头，不属于运行时配置面。
+
+注：`ZCODE_SERVER_RUNTIME_ROOT` 空白视为未设置，且优先于桌面 profile 的 pin
+（bridge 与 broker 一致；此前 broker 让 pin 覆盖了运维者的值）。
 
 注：`attach` 需要同时设置 `ZCODE_ACP_BACKEND=zserver` 与
 `ZCODE_ACP_ZSERVER_SOCKET`；只设 socket 变量不会切换后端。socket 路径超过

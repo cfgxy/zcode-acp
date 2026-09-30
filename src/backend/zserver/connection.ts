@@ -151,14 +151,20 @@ export class ZServerConnection {
   }
 
   static async spawn(options: ZServerSpawnOptions = {}): Promise<ZServerConnection> {
-    const serverRoot = path.resolve(
-      options.serverRoot ??
-        options.env?.ZCODE_SERVER_RUNTIME_ROOT ??
-        path.join(os.homedir(), ".zcode", "server"),
-    );
+    // An empty or blank value counts as unset: `path.resolve("")` is the current
+    // directory, so `ZCODE_SERVER_RUNTIME_ROOT=` used to make the lookup depend on
+    // wherever the bridge happened to be started.
+    const configuredRoot = [options.serverRoot, options.env?.ZCODE_SERVER_RUNTIME_ROOT]
+      .map((value) => value?.trim())
+      .find((value) => value);
+    const serverRoot = path.resolve(configuredRoot ?? path.join(os.homedir(), ".zcode", "server"));
     const bundle = path.join(serverRoot, "zcode-server.cjs");
     if (!existsSync(bundle)) {
-      throw new ZServerConnectionError("spawn", `zcode server bundle not found: ${bundle}`);
+      throw new ZServerConnectionError(
+        "spawn",
+        `zcode server bundle not found: ${bundle} — install ZCode (the server lives under ` +
+          "~/.zcode/server) or point ZCODE_SERVER_RUNTIME_ROOT at a directory containing zcode-server.cjs",
+      );
     }
     // Prefer the deployed node (version-matched, sqlite-capable); fall back to ours.
     const deployedNode = path.join(serverRoot, "node");
@@ -540,8 +546,14 @@ function childIo(child: ChildProcessWithoutNullStreams) {
       child.once("error", (error) => {
         // 'error' is also emitted for failed kill()/IPC on a RUNNING child —
         // that is not an exit (the real 'exit' still follows). Only a child
-        // that never got a pid is a spawn failure.
-        if (child.pid === undefined) once(`spawn error: ${error.message}`, "spawn-error");
+        // that never got a pid is a spawn failure — permanent for ENOENT/EACCES
+        // (the binary cannot start), but EAGAIN is a momentary shortage of
+        // processes: reporting it as permanent would make the heal path give up
+        // on a machine that recovers a second later.
+        if (child.pid === undefined) {
+          const code = (error as NodeJS.ErrnoException).code;
+          once(`spawn error: ${error.message}`, code === "EAGAIN" ? "exit" : "spawn-error");
+        }
       });
     },
   };
@@ -552,10 +564,11 @@ function spawnChild(
   bundle: string,
   env: NodeJS.ProcessEnv,
 ): ChildProcessWithoutNullStreams {
+  let child: ChildProcessWithoutNullStreams;
   try {
     // detached: the child heads its own process group, so shutdown can reap
     // the server AND its agent grandchildren together (kill(-pgid)).
-    return spawn(nodeBin, [bundle], {
+    child = spawn(nodeBin, [bundle], {
       env,
       stdio: ["pipe", "pipe", "pipe"],
       detached: process.platform !== "win32",
@@ -563,6 +576,19 @@ function spawnChild(
   } catch (error) {
     throw new ZServerConnectionError("spawn", `zcode server spawn failed: ${String(error)}`);
   }
+  if (!child.stdin || !child.stdout || !child.stderr) {
+    // EMFILE/ENFILE: Node schedules an 'error' event and returns BEFORE creating
+    // the stdio pipes, so the streams are missing. That 'error' still arrives on
+    // the next tick and, with no listener, would kill the process — attach one
+    // before giving up. Transient (retryable), unlike ENOENT/EACCES.
+    child.on("error", (error) => warn(`zserver: child spawn error (handled): ${error.message}`));
+    throw new ZServerConnectionError(
+      "hello",
+      "zcode server spawn failed: no stdio pipes could be created " +
+        "(out of file descriptors — EMFILE/ENFILE?)",
+    );
+  }
+  return child;
 }
 
 function timeout(ms: number, phase: ZServerConnectionPhase): Promise<never> {

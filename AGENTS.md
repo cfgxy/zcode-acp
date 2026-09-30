@@ -187,6 +187,18 @@ ZCode protocol types into ACP notifications directly — always translate.
     a 202 error frame carrying the client's own id; only repeated violations or
     undecodable frames disconnect. A bare socket close is indistinguishable from
     server death and triggers futile heals.
+  - _An inode number is not a file's identity._ Once the last link is gone the
+    number can be handed to the very next file created (seen on XFS: a fresh
+    socket took a stale one's number). `removeStaleSocket` compares dev + ino +
+    birth time + ctime before it unlinks; two brokers racing on one stale socket
+    both "won" in 16 of 60 fresh-process runs with the inode number alone.
+  - _`child_process.spawn` returns early on EMFILE/ENFILE_ with `stdin`/`stdout`/
+    `stderr` still `null`, and STILL emits `'error'` on the next tick. Guard the
+    streams and keep an `'error'` listener. Only ENOENT/EACCES are permanent;
+    EAGAIN and out-of-descriptors are transient.
+  - _A blank env var is unset._ `path.resolve("")` is the current directory, so
+    `ZCODE_SERVER_RUNTIME_ROOT=` must not count as set. The operator's env wins
+    over the desktop profile's pin — in the bridge AND in the broker.
   - _Tests here are mutation-verified._ Before trusting a new regression test,
     break the fix (backup → mutate → run → restore by copy; never
     `git checkout`, it discards unrelated uncommitted work) and watch it fail.

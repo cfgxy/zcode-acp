@@ -47,6 +47,70 @@ export function assertSocketPathFits(socketPath: string): void {
   }
 }
 
+/** Injectable filesystem calls for {@link removeStaleSocket} (race tests). */
+export interface StaleSocketFs {
+  lstat(socketPath: string): fs.BigIntStats;
+  unlink(socketPath: string): void;
+}
+
+/**
+ * Identity of one filesystem object. An inode NUMBER alone does not identify a
+ * dead socket file: once its last link is gone the number is free and can be
+ * handed to the very next file created. On XFS, with two brokers starting on one
+ * stale socket, the winner's fresh socket was seen taking the stale socket's
+ * inode number (strace of a failing run), and comparing numbers alone let both
+ * brokers "win" in 16 of 60 fresh-process runs. The birth time tells the two
+ * apart; ctime backs it up on filesystems that report none. (A stale file
+ * created within the same kernel timestamp tick as its replacement would still
+ * compare equal — not a real case: a stale file is one a dead process left.)
+ */
+function socketIdentity(stats: fs.BigIntStats): string {
+  return `${stats.dev}:${stats.ino}:${stats.birthtimeNs}:${stats.ctimeNs}`;
+}
+
+/** What happened to a leftover socket that had been probed as dead. */
+export type StaleRemoval = "removed" | "gone" | "replaced";
+
+/**
+ * Remove a leftover socket file that a probe found dead, but only if the path
+ * still holds THAT socket. The probe awaits, so another broker may have removed
+ * the same stale file and bound its own live socket in the meantime; unlinking by
+ * name then deleted the live one and left two brokers "ready" with the first
+ * unreachable. `replaced` means somebody else won — the caller must not bind.
+ * A file already removed by that other broker is `gone`, not an error (a bare
+ * ENOENT used to abort the loser with a message unrelated to the real cause).
+ */
+export function removeStaleSocket(
+  socketPath: string,
+  probed: fs.BigIntStats,
+  io: StaleSocketFs = {
+    lstat: (p) => fs.lstatSync(p, { bigint: true }),
+    unlink: (p) => unlinkSync(p),
+  },
+): StaleRemoval {
+  let current: fs.BigIntStats;
+  try {
+    current = io.lstat(socketPath);
+  } catch {
+    return "gone";
+  }
+  if (!current.isSocket()) {
+    throw new Error(
+      `zserver-broker: ${socketPath} exists and is not a socket — refusing to remove it ` +
+        "(move it away or set ZCODE_ACP_ZSERVER_SOCKET to another path)",
+    );
+  }
+  if (socketIdentity(current) !== socketIdentity(probed)) return "replaced";
+  log(`zserver-broker: removing stale socket ${socketPath}`);
+  try {
+    io.unlink(socketPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    return "gone";
+  }
+  return "removed";
+}
+
 /** Idle ms with no attached client before the broker exits (0 = never). */
 function clientIdleExitMs(): number {
   return Number(process.env.ZCODE_ACP_ZSERVER_BROKER_IDLE_EXIT_MS ?? 0) || 0;
@@ -273,6 +337,12 @@ export class ZServerBroker {
     private readonly serverRoot?: string,
   ) {}
 
+  private alreadyListeningError(): Error {
+    return new Error(
+      `zserver-broker: something is already listening on ${this.socketPath} (a broker is already running?)`,
+    );
+  }
+
   async start(): Promise<void> {
     assertSocketPathFits(this.socketPath);
     // Node reports a missing parent directory of a unix socket as EACCES, which
@@ -284,9 +354,9 @@ export class ZServerBroker {
           "ZCODE_ACP_ZSERVER_SOCKET to a path in an existing directory)",
       );
     }
-    let existing: fs.Stats | null = null;
+    let existing: fs.BigIntStats | null = null;
     try {
-      existing = fs.lstatSync(this.socketPath);
+      existing = fs.lstatSync(this.socketPath, { bigint: true });
     } catch {
       /* nothing at the path */
     }
@@ -310,13 +380,13 @@ export class ZServerBroker {
         });
         probe.once("error", () => resolve(false));
       });
-      if (live) {
-        throw new Error(
-          `zserver-broker: something is already listening on ${this.socketPath} (a broker is already running?)`,
-        );
+      if (live) throw this.alreadyListeningError();
+      // The probe awaited: another broker may have replaced the stale socket
+      // with its own live one since. Only ever remove the very socket that was
+      // probed as dead.
+      if (removeStaleSocket(this.socketPath, existing) === "replaced") {
+        throw this.alreadyListeningError();
       }
-      log(`zserver-broker: removing stale socket ${this.socketPath}`);
-      unlinkSync(this.socketPath);
     }
     const server = createServer((socket) => this.onClient(socket));
     this.server = server;
@@ -324,16 +394,6 @@ export class ZServerBroker {
       server.once("listening", resolve);
       // Start-up failures (EADDRINUSE, EACCES…) reject start().
       server.once("error", reject);
-    });
-    // After start-up a `once` listener is gone: the FIRST later server error
-    // (accept failing with EMFILE/ENFILE, …) was swallowed silently and the
-    // SECOND was an uncaught exception that killed the shared daemon (and every
-    // client with it). Keep a persistent listener: a failed accept is a
-    // recoverable condition for the broker, not a reason to die.
-    server.on("error", (error: NodeJS.ErrnoException) => {
-      warn(
-        `zserver-broker: server error (${error.code ?? "unknown"}): ${error.message} — still serving`,
-      );
     });
     // bind() creates the socket file with 0777 & ~umask; tightening it with
     // chmod AFTER listen leaves a window (umask 000/002 → group/world
@@ -352,7 +412,30 @@ export class ZServerBroker {
     } finally {
       process.umask(previousUmask);
     }
-    await listening;
+    try {
+      await listening;
+    } catch (error) {
+      // Never bound: leave no half-started listener behind for stop() to act on.
+      this.server = null;
+      // Losing the bind race to another broker is the same condition the probe
+      // reports — say so, not a bare errno.
+      if ((error as NodeJS.ErrnoException).code === "EADDRINUSE") {
+        throw this.alreadyListeningError();
+      }
+      throw error;
+    }
+    // The start-up `once("error", reject)` listener is spent by the FIRST later
+    // server error (accept failing with EMFILE/ENFILE, …), which it swallows
+    // silently, and the SECOND would be an uncaught exception that kills the
+    // shared daemon (and every client with it). Keep a persistent listener: a
+    // failed accept is a recoverable condition for the broker, not a reason to
+    // die. Attached only after a successful bind so a broker that lost the start
+    // race does not claim to be "still serving".
+    server.on("error", (error: NodeJS.ErrnoException) => {
+      warn(
+        `zserver-broker: server error (${error.code ?? "unknown"}): ${error.message} — still serving`,
+      );
+    });
     // Identity of the socket file WE created: stop() must only remove it while
     // the path still holds this inode (a second broker may have replaced it).
     try {
@@ -378,7 +461,11 @@ export class ZServerBroker {
       this.spawning = (async () => {
         log("zserver-broker: spawning shared zcode-server");
         const connection = await ZServerConnection.spawn({
-          serverRoot: this.serverRoot,
+          // Same precedence as the bridge's own spawn (server.ts): the operator's
+          // ZCODE_SERVER_RUNTIME_ROOT first, then the desktop profile's pin, then
+          // the default. Left to the merged env alone, the pin silently beat the
+          // operator here while the bridge honoured the operator.
+          serverRoot: this.serverRoot ?? process.env.ZCODE_SERVER_RUNTIME_ROOT,
           clientId: "zserver-broker",
           env: await runtimeEnvWithProfile(brokerBaseEnv(process.env)),
         });
@@ -838,7 +925,10 @@ export class ZServerBroker {
     if (!idleMs || this.clients.size > 0) return;
     if (this.idleTimer) clearTimeout(this.idleTimer);
     this.idleTimer = setTimeout(() => {
-      log(`zserver-broker: idle ${idleMs}ms with no clients — exiting`);
+      // Always emitted: a daemon that ends on its own would otherwise vanish with
+      // no trace unless debug logging happened to be on (a supervisor that
+      // restarts it then loops silently).
+      warn(`zserver-broker: idle ${idleMs}ms with no clients — exiting`);
       // A failing stop() must not become an unhandledRejection; a failed clean
       // shutdown still ends the idle daemon (non-zero so a supervisor sees it).
       this.stop().then(

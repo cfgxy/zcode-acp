@@ -5,7 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { TurnCompletionGate, ZServerBackend } from "../src/backend/zserver/backend.js";
-import { ZServerBroker } from "../src/backend/zserver/broker.js";
+import { removeStaleSocket, ZServerBroker } from "../src/backend/zserver/broker.js";
 import { ChannelClient } from "../src/backend/zserver/channel-client.js";
 import { decodeMessage } from "../src/backend/zserver/protocol.js";
 import { ZServerConnection, ZServerConnectionError } from "../src/backend/zserver/connection.js";
@@ -1460,5 +1460,365 @@ describe("the client and the broker read the socket variable the same way", () =
     // Attached to the shared broker, not silently running a private server.
     expect((backend as unknown as { connection: { child: unknown } }).connection.child).toBeNull();
     expect(broker.stats().clients).toBe(1);
+  }, 20000);
+});
+
+describe("a request whose connection is retired under it is classified as healable", () => {
+  it("an in-flight read cut off by restart() reports the restarting marker, not a bare 'disposed'", async () => {
+    const { isBackendDeadMessage } = await import("../src/backend/supervise.js");
+    withEnv({ ZSERVER_FAKE_HANG_METHODS: "readSession" });
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    await backend.request(1, "session/list", {}); // connection is up
+
+    // Never answered by the fixture: stays in flight until the connection is retired.
+    const inFlight = backend.request(
+      2,
+      "session/read",
+      { sessionId: "sess_x", workspace: { workspacePath: "/tmp/ws-retired" } },
+      30_000,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    await backend.restart("a concurrent session's heal");
+
+    const response = await inFlight;
+    expect(response.error?.message).toMatch(/disposed/); // the underlying cause stays visible
+    // A heal classifier must recognise it, or the caller fails outright instead of healing.
+    expect(isBackendDeadMessage(response.error!.message)).toBe(true);
+  }, 20000);
+
+  it("a server that DIES under an in-flight request stays 'backend dead', not 'restarting'", async () => {
+    const { BACKEND_RESTARTING_MARKER, isBackendDeadMessage } =
+      await import("../src/backend/supervise.js");
+    withEnv({ ZSERVER_FAKE_HANG_METHODS: "readSession", ZSERVER_FAKE_DIE_AFTER_MS: "900" });
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    await backend.request(1, "session/list", {});
+
+    // The connection is still the CURRENT one when the server exits: a death, not a retirement.
+    const response = await backend.request(
+      2,
+      "session/read",
+      { sessionId: "sess_x", workspace: { workspacePath: "/tmp/ws-died" } },
+      30_000,
+    );
+    expect(backend.isDead).toBe(true);
+    expect(isBackendDeadMessage(response.error!.message)).toBe(true);
+    // Each marker means something different to the caller: "restarting" says a heal is already
+    // under way, "reader exited" says the backend is gone. A death must not claim the former.
+    expect(response.error!.message).toMatch(/backend reader exited \(backend dead\)/);
+    expect(response.error!.message).not.toContain(BACKEND_RESTARTING_MARKER);
+  }, 20000);
+
+  it("a genuine server error that raced the retirement keeps its own message", async () => {
+    const { isBackendDeadMessage, isSessionLostMessage } =
+      await import("../src/backend/supervise.js");
+    withEnv({ ZSERVER_FAKE_FAIL_METHODS: "readSession" });
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    await backend.request(1, "session/list", {});
+
+    // The raw-frame tap runs synchronously right AFTER the 202 rejected the pending call and
+    // BEFORE the request's continuation: restart() from here retires the connection in exactly
+    // the window where the server's own error has already been delivered.
+    const connection = (
+      backend as unknown as {
+        connection: { onRawFrame(listener: (payload: Buffer) => void): () => void };
+      }
+    ).connection;
+    let restarted = false;
+    connection.onRawFrame((payload) => {
+      const header = decodeMessage(payload).header as number[];
+      if (header[0] !== 202 || restarted) return;
+      restarted = true;
+      void backend.restart("raced the server's own answer");
+    });
+
+    const response = await backend.request(2, "session/read", {
+      sessionId: "sess_x",
+      workspace: { workspacePath: "/tmp/ws-raced" },
+    });
+    expect(restarted).toBe(true); // the race really happened, or this test proves nothing
+    // The server said "scripted failure" — an answer about the session, not about the transport.
+    // Relabelling it "restarting" would send a needless heal and hide what the server said.
+    expect(response.error?.message).toMatch(/scripted failure: readSession/);
+    expect(isBackendDeadMessage(response.error!.message)).toBe(false);
+    expect(isSessionLostMessage(response.error!.message)).toBe(false);
+  }, 20000);
+
+  it("an ordinary failure on a live connection keeps its own message", async () => {
+    const { isBackendDeadMessage } = await import("../src/backend/supervise.js");
+    withEnv({ ZSERVER_FAKE_FAIL_METHODS: "readSession" });
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    const response = await backend.request(1, "session/read", {
+      sessionId: "sess_x",
+      workspace: { workspacePath: "/tmp/ws-live" },
+    });
+    expect(response.error?.message).toMatch(/scripted failure: readSession/);
+    // A plain server-side error is not a backend death: it must not trigger a heal.
+    expect(isBackendDeadMessage(response.error!.message)).toBe(false);
+  }, 20000);
+});
+
+describe("a session/create that fails part-way leaves no addressing state behind", () => {
+  it("createTask timing out after createSession succeeded does not record the workspace", async () => {
+    withEnv({ ZSERVER_FAKE_HANG_METHODS: "createTask" });
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    const response = await backend.request(
+      1,
+      "session/create",
+      { workspace: { workspacePath: "/tmp/ws-partial" } },
+      300,
+    );
+    expect(response.error?.message).toBe("timeout");
+    const internals = backend as unknown as BackendInternals;
+    // The caller never received the session id, so nothing can ever address it.
+    expect(internals.workspaceBySession.size).toBe(0);
+    expect(internals.subscribedSessions.size).toBe(0);
+  }, 20000);
+
+  it("a create that completes still records the workspace and subscribes", async () => {
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    const response = await backend.request(1, "session/create", {
+      workspace: { workspacePath: "/tmp/ws-complete" },
+    });
+    expect(response.error).toBeUndefined();
+    const internals = backend as unknown as BackendInternals;
+    expect(internals.workspaceBySession.get("sess_fake_1")).toBe("/tmp/ws-complete");
+    expect(internals.subscribedSessions.has("sess_fake_1")).toBe(true);
+  }, 20000);
+});
+
+describe("removing a stale socket never removes a live one that replaced it", () => {
+  interface StatInit {
+    ino?: number;
+    dev?: number;
+    birth?: bigint;
+    ctime?: bigint;
+    socket?: boolean;
+  }
+  const socketStat = ({
+    ino = 11,
+    dev = 1,
+    birth = 1000n,
+    ctime = 1000n,
+    socket = true,
+  }: StatInit = {}): fs.BigIntStats =>
+    ({
+      isSocket: () => socket,
+      ino: BigInt(ino),
+      dev: BigInt(dev),
+      birthtimeNs: birth,
+      ctimeNs: ctime,
+    }) as unknown as fs.BigIntStats;
+  function fakeFs(current: fs.BigIntStats | Error, unlinkError?: NodeJS.ErrnoException) {
+    const unlinked: string[] = [];
+    return {
+      unlinked,
+      io: {
+        lstat: (): fs.BigIntStats => {
+          if (current instanceof Error) throw current;
+          return current;
+        },
+        unlink: (socketPath: string): void => {
+          if (unlinkError) throw unlinkError;
+          unlinked.push(socketPath);
+        },
+      },
+    };
+  }
+  const errno = (code: string): NodeJS.ErrnoException =>
+    Object.assign(new Error(`${code}: simulated`), { code });
+
+  it("removes the very socket that was probed as dead", () => {
+    const { io, unlinked } = fakeFs(socketStat());
+    expect(removeStaleSocket("/s", socketStat(), io)).toBe("removed");
+    expect(unlinked).toEqual(["/s"]);
+  });
+
+  it("leaves a different socket alone: another broker won the race and bound its own", () => {
+    const { io, unlinked } = fakeFs(socketStat({ ino: 99, birth: 2000n, ctime: 2000n }));
+    expect(removeStaleSocket("/s", socketStat(), io)).toBe("replaced");
+    expect(unlinked).toEqual([]); // unlinking by name here is what deleted the live broker's socket
+  });
+
+  it("a replacement that REUSED the dead socket's inode number is still a different socket", () => {
+    // The real failure: the dead socket's inode number was free again and the winner's fresh
+    // socket took it (seen in an strace of a failing run on XFS). Same dev + same ino, later
+    // birth time.
+    const { io, unlinked } = fakeFs(socketStat({ birth: 2000n, ctime: 2000n }));
+    expect(removeStaleSocket("/s", socketStat(), io)).toBe("replaced");
+    expect(unlinked).toEqual([]);
+  });
+
+  it("with no birth time reported, a changed ctime still tells the two apart", () => {
+    const { io, unlinked } = fakeFs(socketStat({ birth: 0n, ctime: 2000n }));
+    expect(removeStaleSocket("/s", socketStat({ birth: 0n }), io)).toBe("replaced");
+    expect(unlinked).toEqual([]);
+  });
+
+  it("treats a same-inode socket on ANOTHER device as a different socket", () => {
+    const { io, unlinked } = fakeFs(socketStat({ dev: 2 }));
+    expect(removeStaleSocket("/s", socketStat({ dev: 1 }), io)).toBe("replaced");
+    expect(unlinked).toEqual([]);
+  });
+
+  it("a socket already removed by the winner is 'gone', not an error", () => {
+    expect(removeStaleSocket("/s", socketStat(), fakeFs(errno("ENOENT")).io)).toBe("gone");
+  });
+
+  it("an ENOENT from the unlink itself (removed between look and remove) is 'gone' too", () => {
+    const { io } = fakeFs(socketStat(), errno("ENOENT"));
+    expect(removeStaleSocket("/s", socketStat(), io)).toBe("gone");
+  });
+
+  it("any other unlink failure is surfaced, not swallowed", () => {
+    const { io } = fakeFs(socketStat(), errno("EACCES"));
+    expect(() => removeStaleSocket("/s", socketStat(), io)).toThrow(/EACCES/);
+  });
+
+  it("refuses to remove something that is no longer a socket (a file dropped in its place)", () => {
+    const { io, unlinked } = fakeFs(socketStat({ socket: false }));
+    expect(() => removeStaleSocket("/s", socketStat(), io)).toThrow(/not a socket/);
+    expect(unlinked).toEqual([]);
+  });
+});
+
+describe("two brokers starting on the same stale socket", () => {
+  async function probeLive(socketPath: string): Promise<boolean> {
+    const { connect } = await import("node:net");
+    return new Promise((resolve) => {
+      const c = connect(socketPath);
+      c.once("connect", () => {
+        c.destroy();
+        resolve(true);
+      });
+      c.once("error", () => resolve(false));
+    });
+  }
+
+  it("exactly one wins, the loser says so, and stopping the loser leaves the winner reachable", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zhard-race-"));
+    tempDirs.push(dir);
+    const target = path.join(dir, "b.sock");
+    // A leftover socket from a process killed without cleanup.
+    const { spawn } = await import("node:child_process");
+    const dying = spawn(
+      process.execPath,
+      [
+        "-e",
+        "require('node:net').createServer().listen(process.argv[1], () => console.log('bound'));" +
+          "setInterval(() => {}, 1000);",
+        target,
+      ],
+      { stdio: ["ignore", "pipe", "ignore"] },
+    );
+    await new Promise<void>((resolve) => dying.stdout!.once("data", () => resolve()));
+    dying.kill("SIGKILL");
+    await new Promise<void>((resolve) => dying.once("exit", () => resolve()));
+    expect(await probeLive(target)).toBe(false);
+
+    // Both look at the stale file and probe it before either has removed it.
+    const a = new ZServerBroker(target, makeRoot());
+    const b = new ZServerBroker(target, makeRoot());
+    cleanups.push(() => a.stop());
+    cleanups.push(() => b.stop());
+    const [ra, rb] = await Promise.allSettled([a.start(), b.start()]);
+
+    const winners = [ra, rb].filter((r) => r.status === "fulfilled");
+    expect(winners).toHaveLength(1); // two "ready" brokers, the first unreachable, was the bug
+    const loserResult = [ra, rb].find((r) => r.status === "rejected") as PromiseRejectedResult;
+    expect(String(loserResult.reason?.message)).toMatch(/already listening/);
+    expect(await probeLive(target)).toBe(true);
+
+    const loser = ra.status === "rejected" ? a : b;
+    await loser.stop();
+    expect(await probeLive(target)).toBe(true); // Node's close() unlinks by name: must not hit the winner
+  }, 20000);
+
+  it("a broker that loses the BIND race (cross-process interleaving) says so and cannot remove the winner's socket", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zhard-bindrace-"));
+    tempDirs.push(dir);
+    const target = path.join(dir, "b.sock");
+    const winner = new ZServerBroker(target, makeRoot());
+    await winner.start();
+    cleanups.push(() => winner.stop());
+    expect(await probeLive(target)).toBe(true);
+
+    // Two processes both saw the stale file; the winner removed it and bound before the loser's
+    // own removal, which then found nothing to remove ("gone") and went on to bind. In one
+    // process that interleaving cannot happen (look, remove and bind are synchronous), so the
+    // loser's first look at the path is made to miss what the winner already bound.
+    const realLstat = fs.lstatSync.bind(fs);
+    let hidden = false;
+    const spy = vi.spyOn(fs, "lstatSync").mockImplementation(((
+      p: fs.PathLike,
+      options?: object,
+    ) => {
+      if (!hidden && p === target) {
+        hidden = true;
+        throw Object.assign(new Error("ENOENT: simulated"), { code: "ENOENT" });
+      }
+      return realLstat(p, options as never);
+    }) as typeof fs.lstatSync);
+    cleanups.push(() => spy.mockRestore());
+
+    const loser = new ZServerBroker(target, makeRoot());
+    // A bare "listen EADDRINUSE" tells the operator nothing about a broker already running.
+    await expect(loser.start()).rejects.toThrow(/already listening/);
+    expect(hidden).toBe(true); // the race really was simulated, or this test proves nothing
+    spy.mockRestore();
+
+    // Stopping the loser must not touch the path: Node's close() unlinks by name, and a
+    // listener that never bound would take the winner's socket file with it.
+    await loser.stop();
+    expect(fs.lstatSync(target).isSocket()).toBe(true);
+    expect(await probeLive(target)).toBe(true);
+  }, 20000);
+});
+
+describe("releasing a session silences its armed completion gate", () => {
+  interface GateInternals {
+    gatesBySession: Map<string, { pendingOutcome: string | null }>;
+  }
+
+  /** A session whose terminal outcome has arrived: the gate is armed and will emit
+   *  `turn.completed` once the quiet period passes, unless something disposes it first. */
+  async function armedSession(): Promise<{ backend: ZServerBackend; events: string[] }> {
+    withEnv({
+      ZSERVER_FAKE_TERMINAL: JSON.stringify({ outcome: "success" }),
+      ZCODE_ACP_ZSERVER_TURN_QUIESCE_MS: "500",
+    });
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    const events: string[] = [];
+    backend.registerEventListener("sess_fake_1", {
+      handleEvent: (event) => {
+        events.push(event.type);
+      },
+    });
+    await backend.request(1, "session/create", { workspace: { workspacePath: "/tmp/ws-gate" } });
+    const gates = (backend as unknown as GateInternals).gatesBySession;
+    // The fixture fires the terminal outcome ~200ms after the listener attaches.
+    expect(await until(() => gates.get("sess_fake_1")?.pendingOutcome === "success", 3000)).toBe(
+      true,
+    );
+    return { backend, events };
+  }
+
+  it("control: left alone, an armed gate completes the turn after the quiet period", async () => {
+    const { events } = await armedSession();
+    expect(await until(() => events.includes("turn.completed"), 3000)).toBe(true);
+  }, 20000);
+
+  it("releaseSession while the gate is armed: no turn.completed is delivered afterwards", async () => {
+    const { backend, events } = await armedSession();
+    backend.releaseSession("sess_fake_1");
+    // Past the 500ms quiet period: a gate left armed would have fired by now.
+    await new Promise((resolve) => setTimeout(resolve, 900));
+    expect(events).not.toContain("turn.completed");
   }, 20000);
 });

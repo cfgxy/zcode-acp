@@ -1,6 +1,7 @@
 import type { BridgeBackend, ZcodeEvent, ZcodeResponse } from "../types.js";
 import { loadDesktopChildEnvWithRefresh } from "../../desktop-profile.js";
 import { warn } from "../../utils.js";
+import { BACKEND_RESTARTING_MARKER } from "../supervise.js";
 import type { EventListenerLike } from "../types.js";
 import { ServiceChannel, ZServerConnection, ZServerConnectionError } from "./index.js";
 
@@ -264,12 +265,15 @@ export class ZServerBackend implements BridgeBackend {
   ): Promise<ZcodeResponse> {
     this.armIdleTimer();
     this.inFlight++;
+    let connection: ZServerConnection | undefined;
     try {
-      const connection = await this.ensureConnection();
-      // Per-request timeout, mirroring the direct backend's contract: callers
-      // (EventStreamListener subscribe retry, resume retry) key on the exact
-      // error message "timeout" — a wedged-but-alive server must surface as a
-      // retryable timeout, not hang the turn setup forever.
+      connection = await this.ensureConnection();
+      // Per-request timeout for the ROUTE phase: callers (EventStreamListener
+      // subscribe retry, resume retry) key on the exact error message "timeout"
+      // — a wedged-but-alive server must surface as a retryable timeout, not
+      // hang the turn setup forever. It does not cover ensureConnection() above:
+      // spawn/handshake has its own bounds (hello 10s, ready 15s) and reports a
+      // backend-dead marker, not "timeout", so callers heal rather than retry.
       let timeoutHandle: NodeJS.Timeout | undefined;
       const abandon = new AbortController();
       try {
@@ -298,13 +302,24 @@ export class ZServerBackend implements BridgeBackend {
         return { id, error: { message: "timeout" } };
       }
       const message = error instanceof Error ? error.message : String(error);
+      // Its connection was retired under it by restart()/close() (a concurrent
+      // session's heal): the request did not fail on its own merits, so mark it
+      // "restarting" — the same marker the direct backend resolves in-flight
+      // requests with. Left raw ("channel client disposed") no heal classifier
+      // recognises it and the caller fails outright.
+      const retired =
+        error instanceof Error &&
+        error.name === "ConnectionClosed" &&
+        connection !== undefined &&
+        this.connection !== connection;
       // Died while this request was in flight → classify as backend-dead so
       // the supervised heal path (restart + resume) engages.
       return {
         id,
         error: {
-          message:
-            this.isDead && !message.includes("backend reader exited")
+          message: retired
+            ? `${BACKEND_RESTARTING_MARKER} (${message})`
+            : this.isDead && !message.includes("backend reader exited")
               ? `zcode backend reader exited (backend dead): ${message}`
               : message,
         },
@@ -340,12 +355,15 @@ export class ZServerBackend implements BridgeBackend {
         )) as { session?: { sessionId?: string } };
         const sid = snapshot?.session?.sessionId;
         if (!sid) throw new Error("createSession returned no sessionId");
-        this.workspaceBySession.set(sid, workspacePath);
         await tasks.call("createTask", {
           workspacePath,
           draftSessionId: sid,
           clientId: this.clientId,
         });
+        // Recorded only once the create is complete: a create that fails or
+        // times out between the two calls never hands `sid` to the caller, so
+        // nothing could ever address it and an earlier entry would just leak.
+        this.workspaceBySession.set(sid, workspacePath);
         this.subscribeConversation(connection, workspacePath, sid);
         return { session: { sessionId: sid } };
       }
