@@ -157,10 +157,65 @@ respondElicitation / resumeTask / closeTask / deliverSessionMessage / …`；
   `unsubscribeConversationV4` 由 broker 本地处理并自行应答 201，不盲转发——
   盲转发要么因 id 已被替换而空转，要么在 id 恰好是当前值时切断其他持有者。
   已用真 server 验证：kill 掉持有订阅的客户端后，修复前 OWNED、修复后 NOT-OWNED。
-- `session/send` 的 `attachments` 在 zserver 模式被丢弃；`session/list` 忽略
-  workspace 过滤；broker 模式下无法按客户端传递任务级凭据。
+- `session/send` 的 `attachments` 在 zserver 模式被丢弃；broker 模式下无法按
+  客户端传递任务级凭据。（`session/list` 已修：真 server 的 `listTasks` 返回
+  **裸数组**，旧代码读 `.tasks` 因而对真 server 永远返回空——fixture 回字符串
+  所以单测因错误原因通过；现按数组解析并向 server 传 workspace 过滤。）
+- **仍未处理（如实记录，不代表不重要）**：
+  - broker 没有 per-client 会话隔离，白名单只约束方法名不约束参数：同 uid 的
+    受限主体可对别人的 sessionId 调 `sendPrompt`/`readSession`（在"同 uid 已被
+    视为可信"的模型内是设计取舍；要收紧需"客户端只能操作自己 createSession
+    出来的 sessionId"这类参数级约束）。
+  - 看门狗按 pgid `kill(-pgid, SIGKILL)`：owner 死后 pgid 数字被别的进程组复用
+    的窗口未量化（直连后端 `client.ts` 是同款模式，非本特性引入）。
+  - `EMFILE` 时 `spawn()` 不创建 stdio，`childIo` 抛出的是不含真因的 TypeError；
+    `EAGAIN`（瞬时资源不足）与"二进制起不来"同被归为永久 spawn 失败。
+  - aborted 的调用在 Initialize 之前仍留在 `queued` 里直到握手结束（有界，
+    生产路径上 `queued` 恒为空）。
+  - broker 只有日志、无状态探针（`stats()` 仅进程内可用）；日志无时间戳、无 pid，
+    client id 是自增整数；退出码不区分"已在运行"与真故障。
+  - **同 uid 前提下的 pin 缺口（SECURITY.md 把"已在主机上有代码执行"列为范围外，
+    这三条都需要同 uid 已能写文件，故不在项目声明的威胁模型内；如实记录并按
+    性价比取舍）**。均由安全审计实测：
+    - 符号链接：`isTrustedPinPath` 只做词法检查，`~/link -> /outside` 下的 pin
+      被接受并且 `${root}/node` 真的以该 uid 执行到 home 外的二进制；校验在加载期、
+      解析在 exec 期，其间没有 realpath 或 fd 固定。**未修**——修复要在 exec 时
+      改用 realpath 后的路径，牵动整个 pin 传递链；本机真实 profile 的 6 个路径
+      pin 均为直接路径（未经符号链接，只看了是否穿过链接，未读值）。
+    - 伪 AppImage 挂载点：同 uid 可自建 `/tmp/.mount_x/` 冒充。**未修**——需要
+      mountinfo 判据，而该判据基于对另一款 AppImage 的观察，ZCode 桌面端未验证。
+    - URL pin（`ZCODE_BASE_URL` 等）没有主机白名单，bridge 交给子进程的 env 里
+      会同时含被篡改的 URL 与 API key。真实 CLI 是否把 key 发往该 URL **未验证**，
+      且直连路径明确"尊重用户自定义端点"，所以加白名单会破坏一个有意的功能。
+      已修的同类问题见下"安全模型"：退化 HOME、provider 写目标的符号链接。
 - 第七轮终扫无新增中等以上问题，深审循环终止（后续多视角审计仍发现新问题，
   见下文各轮补记——"终止"仅指当时视角下的收敛）。
+- **审计方法的教训**：单视角连续审阅每轮都会发现新问题，改为多视角并行后一次
+  性发现的问题远多于任何单轮；但更大的收益来自**在真 server 上动手**——
+  `session/list` 永远为空、V4 订阅在 103 之后仍被持有、`closeTask` 可跨客户端
+  关别人会话，都是 fixture 与单测里看不见的，只有对真 server 跑一遍才暴露。
+  另外：审计员的结论要亲自重跑（曾有审计员的最终消息为空、报告只写了头部；
+  也有把"实现细节"当成"行为已被保护"的测试），对测试做变异验证之前不要信它。
+
+### 测试稳定性：`remote-file-endpoint` 偶发 502（已定位并修）
+
+该文件里每个用例都在**同一个固定端口 18700** 上起 bridge，hub 经 Node 进程全局的
+keep-alive `http.globalAgent` 代理过去。上一个用例池化的、已随 bridge 停止而关闭的
+socket 会被下一个用例的请求复用——客户端尚未看到 FIN 时写入即 `ECONNRESET`，hub
+把它报成 502。用追踪预加载在失败的运行里抓到：`ECONNRESET reusedSocket=true`（另有
+一次 `ECONNREFUSED reusedSocket=false`）。确定性复现（同一固定端口 40 轮 起服务/
+请求/停服务）：不清理 20 轮失败，每轮 `http.globalAgent.destroy()` 后 0 轮失败，
+且 destroy 之后 agent 仍可正常使用。现于该文件的 `afterEach` 里 destroy。
+
+**诚实的边界**：该测试文件的失败率**并不稳定**，我没能测出一个可引用的数字——
+不同时段的实测是 10 次里 2 次、6 次里 1 次、8 次里 2 次，而修复前后的两组交错
+对比里（12 对：origin 失败 1 次、工作树 0 次；修复之后的 20 对与 CPU 满载下的
+14 对：两边都 0 次）根本没有足够的失败样本去**统计地区分**修复前后。所以"已修"
+的依据是机制，不是 A/B 的失败次数：追踪预加载在失败的运行里抓到
+`ECONNRESET reusedSocket=true`，确定性脚本 40 轮里不清理失败 20 轮、清理后 0 轮。
+失败也不是我的改动引入的——它在未改动的 origin 树上同样出现过（上述 12 对里的
+那 1 次）。另一个同模式的测试文件 `remote-endpoint.test.ts` 我用同样的追踪跑了
+12 次，没有观察到复用池化 socket 的 `ECONNRESET`，所以没有改它。
 
 ### 订阅窗口与取值保真（第八轮深审补记）
 
@@ -274,12 +329,43 @@ projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
   home / AppImage `/tmp/.mount_*` / `/opt` / `/usr`）；路径 pin 决定 server
   加载哪份 provider 配置、执行哪个二进制，被篡改即凭据外泄/RCE 面。
   `profile refresh` 写入 API key 的目标（`resolvePersonalProviderTarget`）额外
-  要求 realpath 落在 `~/.zcode/` 内。**被拒绝的 pin 不再让 refresh 悄悄改写
+  要求**穿过符号链接解析后**落在 `~/.zcode/` 内——包括文件尚不存在的情形：
+  旧实现在 `realpath` 因 ENOENT 抛错时退化成词法检查，`~/.zcode/linkdir`
+  （指向别处的符号链接目录）下的新文件因此被放行（安全审计实测：先 resolve、
+  再由攻击者在目标目录放入合法 JSON，套餐 key 就被写到 `~/.zcode` 之外）。现在
+  逐级向上找到第一个存在的祖先做 `realpath` 再拼回不存在的尾部；悬空符号链接
+  因目标不可知而拒绝；**返回的是解析后的路径**，检查的位置就是写入的位置（旧实现
+  返回原始 pin，每次使用都重新解析符号链接，这是 TOCTOU 的根因）。**被拒绝的 pin 不再让 refresh 悄悄改写
   默认路径**：后端读的是 pin 指向的文件，写到默认路径等于把 provider 登记在
   没人读的地方却报告成功；现在 refresh 什么都不写，并输出被拒绝的 pin 路径
   与原因。成功时的输出也带上实际写入的文件路径。两处校验口径不同
   （`isTrustedPinPath` 放行整个 home，写入目标只放行 `~/.zcode`）是有意的：
   读取一份 pin 的风险远低于把 API key 写进去。
+- **provider 配置的写入不跟随符号链接**：该文件含用户的套餐 API key，却经可预测
+  的名字写入（`<file>.tmp-<pid>`、`<file>.bak-<毫秒>`）。安全审计实测：同 uid 主体
+  在这两个名字上预置符号链接，`writeFileSync`/`copyFileSync` 会**跟随**并截断覆盖
+  链接目标（内容为含套餐 key 与其它 provider key 的 JSON），随后 `chmod` 也跟随，
+  最后 `rename` 把符号链接本身换成 `provider_config.json`；备份名只含毫秒，预置
+  4000 个链接仅需约 85ms。现在两者都用 `openSync(…, "wx", 0o600)`（O_CREAT|O_EXCL：
+  对任何已存在条目，符号链接也包括在内，报 EEXIST 而不跟随；且**创建即 0600**——
+  旧的 `copyFileSync` 先按源文件的 0644 落地再 chmod，留下一个含其它 provider key
+  的备份对他人可读的窗口）；陈旧的临时文件先 `rmSync`（unlink 删链接本身）。
+  测试用 `strace` 读内核的 `openat` 记录来断言标志与创建时的权限位——进程内的
+  spy 观察不到该模块的调用（它按名字绑定了 `node:fs`）。
+- **`isTrustedPinPath` 在退化 HOME 下失效**：`HOME=/`（无 passwd 条目的 uid、部分
+  容器）或空时 `homeRoot` 变成 `/`，整个文件系统都被信任（实测 `/etc/passwd`、
+  `/tmp/evil/rg` 均返回 true）。现在 home 为空/`/`/非绝对时对 home 分支 fail-closed，
+  只剩固定根（`/tmp/.mount_*`、`/opt`、`/usr`）可匹配。
+- **broker 的其它加固**：订阅键（`workspace`+`session`）对客户端可控字符串做单射
+  编码——NUL 能穿过线协议，纯 NUL 分隔时 (`"a\0b"`,`"c"`) 与 (`"a"`,`"b\0c"`) 撞成
+  同一个键，一个客户端可以持有并（离开时）释放另一个的订阅；start 之后的 server
+  `error` 用持久监听（旧的 `once` 让第一次 accept 失败（如 EMFILE）被静默吞掉、
+  第二次变成未捕获异常，杀死整个共享守护进程，已实测）；拒绝原因与 server stderr
+  尾行里的不可信文本限长并折成单行（曾实测一帧带 4MB 通道名即向常开 warn 写 4MB，
+  换行可伪造日志行）；`attach` 在连接前校验 socket 文件属主是当前用户（Node 拿不到
+  SO_PEERCRED，文件属主是能拿到的证明）；客户端与 broker 对
+  `ZCODE_ACP_ZSERVER_SOCKET` 都 `trim()`（此前只有 broker 侧 trim，带空格的值让
+  bridge 悄悄回退到私有 server）。
 - **宿主进程识别收紧**：comm 仅接受 `zcode-host-loca`/`zcode-host-remo`
   精确截断，全名仅匹配 argv[0]（原先任一 argv token 即可冒充宿主）。
 - **broker 的 spawn env 去除任务级凭据**（`MULTICA_*`、SSH agent 变量）：

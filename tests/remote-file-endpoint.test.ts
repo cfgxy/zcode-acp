@@ -5,6 +5,7 @@
  * Root boundary (traversal, symlink escapes, unknown sessions).
  */
 
+import http from "node:http";
 import { mkdir, mkdtemp, realpath, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -31,6 +32,13 @@ afterEach(async () => {
     const stop = cleanups.pop()!;
     await stop();
   }
+  // Every test here starts its bridge on the SAME fixed port (18700), and the
+  // hub proxies to it through Node's process-global keep-alive agent. A socket
+  // pooled to the PREVIOUS test's (now stopped) bridge is reused for the next
+  // test's request before the client has seen its FIN: ECONNRESET, which the
+  // hub reports as 502 (reproduced deterministically: 20 of 40 rounds without
+  // this, 0 of 40 with it). Dropping pooled sockets makes each test start clean.
+  http.globalAgent.destroy();
 });
 
 interface Fixture {

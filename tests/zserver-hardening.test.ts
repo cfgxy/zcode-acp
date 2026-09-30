@@ -1249,3 +1249,216 @@ describe("a client that never reads its replies cannot make the broker buffer fo
     expect(await until(() => broker.stats().clients === 0, 15000)).toBe(true);
   }, 40000);
 });
+
+describe("V4 subscription keys are injective for client-controlled strings", () => {
+  // A NUL survives the wire. With a bare NUL separator, (workspace "a\0b", session
+  // "c") and (workspace "a", session "b\0c") shared one key, so client B could hold
+  // — and by leaving, release — client A's subscription.
+  it("two different (workspace, session) pairs never share a subscription: B leaving does not release A's", async () => {
+    const socketPath = path.join(
+      os.tmpdir(),
+      `zhard-key-${process.pid}-${Math.random().toString(36).slice(2)}.sock`,
+    );
+    cleanups.push(() => fs.rmSync(socketPath, { force: true }));
+    const broker = new ZServerBroker(socketPath, makeRoot());
+    await broker.start();
+    cleanups.push(() => broker.stop());
+    const unsubLines = (): string[] =>
+      (
+        (
+          broker as unknown as { connection: { stderrSnapshot(): string[] } | null }
+        ).connection?.stderrSnapshot() ?? []
+      ).filter((line) => line.startsWith("ZSERVER_V4UNSUB:"));
+
+    const a = await ZServerConnection.attach({ socketPath, clientId: "victim" });
+    const b = await ZServerConnection.attach({ socketPath, clientId: "attacker" });
+    const subscribe = (client: ZServerConnection, workspacePath: string, sessionId: string) =>
+      client.channelOf("zcode-agent").call("subscribeConversationV4", {
+        workspacePath,
+        sessionId,
+        clientMode: "desktop-continuous",
+      });
+
+    await subscribe(a, "a\0b", "c"); // victim's real subscription
+    await subscribe(b, "a", "b\0c"); // attacker's DIFFERENT pair that used to collide
+
+    // The attacker leaves: only ITS subscription may be released (sub-2), never the victim's.
+    b.dispose();
+    expect(await until(() => unsubLines().length === 1)).toBe(true);
+    expect(unsubLines()).toEqual(["ZSERVER_V4UNSUB:sub-2"]);
+
+    a.dispose();
+    expect(await until(() => unsubLines().length === 2)).toBe(true);
+    expect(unsubLines()).toEqual(["ZSERVER_V4UNSUB:sub-2", "ZSERVER_V4UNSUB:sub-1"]);
+  }, 20000);
+});
+
+describe("a server-level error after start-up must not kill the shared broker", () => {
+  // accept() failing (EMFILE/ENFILE under fd pressure) surfaces as a server 'error'.
+  // start() used a `once` listener, so the first such error after start-up was
+  // swallowed silently and the second was an uncaught exception: one fd-exhaustion
+  // episode would take down the machine-level daemon and every attached client.
+  it("survives repeated server errors, logs them, and keeps serving", async () => {
+    const socketPath = path.join(
+      os.tmpdir(),
+      `zhard-srverr-${process.pid}-${Math.random().toString(36).slice(2)}.sock`,
+    );
+    cleanups.push(() => fs.rmSync(socketPath, { force: true }));
+    const broker = new ZServerBroker(socketPath, makeRoot());
+    await broker.start();
+    cleanups.push(() => broker.stop());
+
+    const uncaught: unknown[] = [];
+    const onUncaught = (error: unknown): void => {
+      uncaught.push(error);
+    };
+    process.on("uncaughtException", onUncaught);
+    cleanups.push(() => {
+      process.off("uncaughtException", onUncaught);
+    });
+    const writes: string[] = [];
+    const spy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation((chunk: string | Uint8Array) => {
+        writes.push(String(chunk));
+        return true;
+      });
+    cleanups.push(() => spy.mockRestore());
+
+    const server = (broker as unknown as { server: import("node:net").Server }).server;
+    for (let i = 0; i < 3; i++) {
+      server.emit("error", Object.assign(new Error(`accept failed #${i}`), { code: "EMFILE" }));
+    }
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(uncaught).toEqual([]);
+    expect(writes.join("")).toMatch(/server error \(EMFILE\).*accept failed #2.*still serving/);
+    // ...and the broker still accepts and serves a client afterwards.
+    const client = await ZServerConnection.attach({ socketPath, clientId: "after-errors" });
+    cleanups.push(() => client.dispose());
+    await expect(client.channelOf("zcode-task").call("listTasks")).resolves.toBeDefined();
+  }, 20000);
+});
+
+describe("untrusted text never floods or forges logs and errors", () => {
+  it("clipDiagnostic bounds length and collapses newlines (no forged extra log lines)", async () => {
+    const { clipDiagnostic } = await import("../src/backend/zserver/connection.js");
+    expect(clipDiagnostic("short")).toBe("short");
+    expect(clipDiagnostic("a\nb\r\nc")).toBe("a b c");
+    const clipped = clipDiagnostic("x".repeat(5000), 300);
+    expect(clipped.length).toBeLessThan(340);
+    expect(clipped).toContain("[+4700 chars]");
+    expect(clipped).not.toMatch(/[\r\n]/);
+  });
+
+  it("a rejection reason carrying a huge, newline-laden channel name stays short and single-line", async () => {
+    const { validateClientHeader } = await import("../src/backend/zserver/broker.js");
+    const verdict = validateClientHeader([
+      100,
+      1,
+      `${"x".repeat(100_000)}\n[zcode-acp] zserver-broker: shared server exited (code=0)`,
+      "y\nz",
+    ]);
+    expect(verdict.ok).toBe(false);
+    const reason = verdict.ok ? "" : verdict.reason;
+    expect(reason.length).toBeLessThan(400);
+    expect(reason).not.toMatch(/[\r\n]/);
+    expect(reason).toMatch(/not allowed through the broker$/);
+  });
+
+  it("the broker's always-on warn for a hostile frame is one bounded line", async () => {
+    const socketPath = path.join(
+      os.tmpdir(),
+      `zhard-log-${process.pid}-${Math.random().toString(36).slice(2)}.sock`,
+    );
+    cleanups.push(() => fs.rmSync(socketPath, { force: true }));
+    const broker = new ZServerBroker(socketPath, makeRoot());
+    await broker.start();
+    cleanups.push(() => broker.stop());
+    const writes: string[] = [];
+    const spy = vi
+      .spyOn(process.stderr, "write")
+      .mockImplementation((chunk: string | Uint8Array) => {
+        writes.push(String(chunk));
+        return true;
+      });
+    cleanups.push(() => spy.mockRestore());
+
+    const { connect } = await import("node:net");
+    const { encodeFrame, encodeMessage } = await import("../src/backend/zserver/protocol.js");
+    const raw = connect(socketPath);
+    await new Promise<void>((resolve) => raw.once("connect", resolve));
+    raw.on("error", () => undefined);
+    cleanups.push(() => raw.destroy());
+    raw.write(
+      encodeFrame(
+        encodeMessage([100, 5, `${"z".repeat(200_000)}\nFORGED LINE`, "call"], undefined),
+      ),
+    );
+    expect(await until(() => writes.some((w) => w.includes("frame rejected")))).toBe(true);
+    const line = writes.find((w) => w.includes("frame rejected"))!;
+    expect(line.length).toBeLessThan(500);
+    expect(line.trimEnd()).not.toMatch(/\n/);
+    expect(writes.join("")).not.toContain("FORGED LINE");
+  }, 20000);
+
+  it("a server's huge last stderr line is clipped in the exit error the editor sees", async () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "zserver-hard-stderr-"));
+    tempDirs.push(root);
+    fs.writeFileSync(
+      path.join(root, "zcode-server.cjs"),
+      'console.error("E".repeat(6000) + " api_key=FAKE-NOT-A-KEY"); process.exit(3);\n',
+    );
+    const error = (await ZServerConnection.spawn({ serverRoot: root }).catch(
+      (e: unknown) => e,
+    )) as Error;
+    expect(error.message).toMatch(/zcode server exited: code=3/);
+    expect(error.message.length).toBeLessThan(900); // was ~6KB, repeated in every warn
+    expect(error.message).toContain("chars]");
+  }, 20000);
+});
+
+describe("attach refuses a socket the current user does not own", () => {
+  it("passes for our own socket, is a no-op when absent, and refuses a foreign owner", async () => {
+    const { assertSocketOwnedByUs } = await import("../src/backend/zserver/connection.js");
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zhard-owner-"));
+    tempDirs.push(dir);
+    const socketPath = path.join(dir, "b.sock");
+    const broker = new ZServerBroker(socketPath, makeRoot());
+    await broker.start();
+    cleanups.push(() => broker.stop());
+
+    expect(() => assertSocketOwnedByUs(socketPath)).not.toThrow(); // ours
+    expect(() => assertSocketOwnedByUs(path.join(dir, "nope.sock"))).not.toThrow(); // absent
+
+    // Pretend to be a different uid: the (our-owned) file now looks foreign.
+    const realUid = process.getuid!();
+    const spy = vi.spyOn(process, "getuid").mockReturnValue(realUid + 1);
+    cleanups.push(() => spy.mockRestore());
+    expect(() => assertSocketOwnedByUs(socketPath)).toThrow(/refusing to attach/);
+    await expect(ZServerConnection.attach({ socketPath, clientId: "imposter" })).rejects.toThrow(
+      /refusing to attach/,
+    );
+  }, 20000);
+});
+
+describe("the client and the broker read the socket variable the same way", () => {
+  it("a padded ZCODE_ACP_ZSERVER_SOCKET still attaches to the broker (both sides trim)", async () => {
+    const socketPath = path.join(
+      os.tmpdir(),
+      `zhard-trim-${process.pid}-${Math.random().toString(36).slice(2)}.sock`,
+    );
+    cleanups.push(() => fs.rmSync(socketPath, { force: true }));
+    const broker = new ZServerBroker(socketPath, makeRoot());
+    await broker.start();
+    cleanups.push(() => broker.stop());
+    withEnv({ ZCODE_ACP_ZSERVER_SOCKET: `  ${socketPath}  ` });
+    const backend = new ZServerBackend({ serverRoot: "/nonexistent-direct-spawn-root" });
+    cleanups.push(() => backend.close());
+    const response = await backend.request(1, "session/list", {});
+    expect(response.error).toBeUndefined();
+    // Attached to the shared broker, not silently running a private server.
+    expect((backend as unknown as { connection: { child: unknown } }).connection.child).toBeNull();
+    expect(broker.stats().clients).toBe(1);
+  }, 20000);
+});

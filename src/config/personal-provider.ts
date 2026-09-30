@@ -17,13 +17,16 @@
 
 import { randomUUID } from "node:crypto";
 import {
-  chmodSync,
-  copyFileSync,
+  closeSync,
   existsSync,
+  fchmodSync,
+  lstatSync,
+  openSync,
   readFileSync,
   realpathSync,
   renameSync,
-  writeFileSync,
+  rmSync,
+  writeSync,
 } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -58,6 +61,35 @@ interface ProviderConfigFile {
   };
 }
 
+/**
+ * Absolute path of `p` with every EXISTING component resolved through symlinks,
+ * and the not-yet-existing tail appended lexically. `realpath` alone throws for
+ * a file that does not exist yet, and falling back to a lexical check there let
+ * a symlinked DIRECTORY inside ~/.zcode carry the write out of it. Returns null
+ * for a DANGLING symlink (it exists but its target is unknown, so it cannot be
+ * trusted) or when no ancestor can be resolved.
+ */
+export function resolveThroughSymlinks(p: string): string | null {
+  const tail: string[] = [];
+  let current = p;
+  for (;;) {
+    try {
+      return path.join(realpathSync(current), ...tail.reverse());
+    } catch {
+      try {
+        lstatSync(current);
+        return null; // present but unresolvable: a dangling symlink
+      } catch {
+        /* truly absent: resolve the parent instead */
+      }
+      const parent = path.dirname(current);
+      if (parent === current) return null;
+      tail.push(path.basename(current));
+      current = parent;
+    }
+  }
+}
+
 export interface PersonalProviderTarget {
   /** The file the plan entry would be written to. */
   path: string;
@@ -79,18 +111,13 @@ export function resolvePersonalProviderTarget(
   // ensurePersonalGlmProvider WRITES the user's plan API key into this file. A
   // pin pointing anywhere else (a tampered profile / a spoofed "desktop host"
   // process's environ) would exfiltrate the key to an attacker-readable path.
-  // Only accept a pin that resolves inside ~/.zcode/ (symlinks resolved).
-  const zcodeDir = path.join(home, ".zcode") + path.sep;
-  try {
-    const resolved = realpathSync(pinned);
-    if (path.normalize(resolved).startsWith(realpathSync(path.join(home, ".zcode")) + path.sep)) {
-      return { path: pinned };
-    }
-  } catch {
-    // Non-existent pin: fall through to a lexical check on the (not-yet-created) path.
-    if (path.normalize(pinned).startsWith(zcodeDir) && !pinned.split(/[\\/]+/).includes("..")) {
-      return { path: pinned };
-    }
+  // Only accept a pin that RESOLVES (symlinks and all) inside ~/.zcode/ — also
+  // when the file does not exist yet — and hand back the RESOLVED path, so the
+  // location that was checked is the location that gets written.
+  const zcodeRoot = resolveThroughSymlinks(path.join(home, ".zcode"));
+  const resolved = resolveThroughSymlinks(pinned);
+  if (zcodeRoot !== null && resolved !== null && resolved.startsWith(zcodeRoot + path.sep)) {
+    return { path: resolved };
   }
   warn(
     `personal-provider: ignoring untrusted ZCODE_PERSONAL_PROVIDER_CONFIG_FILE pin ${pinned} ` +
@@ -194,15 +221,38 @@ export function ensurePersonalGlmProvider(
   return { status: "added", providerId };
 }
 
-/** Backup + atomic replace, matching the desktop file's 0600 expectations. */
+/**
+ * Create `target` exclusively with mode 0600 from the first byte. `wx` is
+ * O_CREAT|O_EXCL: it fails with EEXIST on ANY existing entry — a symlink planted
+ * at a predictable name included — instead of following it, and the file is never
+ * readable by others (a copy that inherits the source's 0644 and is chmod-ed
+ * afterwards leaves a window where other providers' keys are world-readable).
+ */
+function writeExclusive(target: string, data: string | Buffer): void {
+  const fd = openSync(target, "wx", 0o600);
+  try {
+    writeSync(fd, typeof data === "string" ? Buffer.from(data, "utf8") : data);
+    fchmodSync(fd, 0o600); // mode above is masked by umask only downwards; make it exact
+  } finally {
+    closeSync(fd);
+  }
+}
+
+/**
+ * Backup + atomic replace, matching the desktop file's 0600 expectations.
+ *
+ * The temp and backup names are predictable and this file holds the user's plan
+ * API key. A plain writeFileSync/copyFileSync FOLLOWS a symlink planted at such a
+ * name (verified: it overwrites the link's target with our data), so both are
+ * created exclusively. A stale temp file from an earlier crashed run is removed
+ * first (unlink never follows the link, it removes the link itself).
+ */
 function atomicWrite(filePath: string, data: string): void {
   if (existsSync(filePath)) {
-    const backup = `${filePath}.bak-${Date.now()}`;
-    copyFileSync(filePath, backup);
-    chmodSync(backup, 0o600);
+    writeExclusive(`${filePath}.bak-${Date.now()}`, readFileSync(filePath));
   }
   const tmp = `${filePath}.tmp-${process.pid}`;
-  writeFileSync(tmp, data, { mode: 0o600 });
-  chmodSync(tmp, 0o600);
+  rmSync(tmp, { force: true });
+  writeExclusive(tmp, data);
   renameSync(tmp, filePath);
 }

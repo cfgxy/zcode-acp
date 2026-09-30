@@ -152,7 +152,7 @@ export class ZServerBackend implements BridgeBackend {
     // marker (idle-recycle/close set it so the OLD child's exit was ignored;
     // without clearing here the backend could never respawn).
     this.closing = false;
-    const socketPath = process.env.ZCODE_ACP_ZSERVER_SOCKET;
+    const socketPath = process.env.ZCODE_ACP_ZSERVER_SOCKET?.trim();
     let connection: ZServerConnection | null = null;
     let attached = false;
     if (socketPath) {

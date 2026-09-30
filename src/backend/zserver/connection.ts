@@ -1,7 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { connect as netConnect } from "node:net";
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, lstatSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -127,7 +127,8 @@ export class ZServerConnection {
     );
     this.io.onExit((detail, kind) => {
       this.exited = true;
-      const tail = this.stderrTail.at(-1) ? `: ${this.stderrTail.at(-1)}` : "";
+      const last = this.stderrTail.at(-1);
+      const tail = last ? `: ${clipDiagnostic(last)}` : "";
       // A process that never started (ENOENT/EACCES) is a PERMANENT spawn
       // failure — phase "spawn" is what makes the backend classify it as
       // `spawn failed:` (ERR_SPAWN_FAILED, no futile heal loop). A process that
@@ -182,7 +183,7 @@ export class ZServerConnection {
       if (error instanceof ZServerConnectionError) {
         const tail = connection.stderrTailLines(3);
         if (tail.length > 0) {
-          error.message = `${error.message} | stderr: ${tail.join(" / ").slice(0, 400)}`;
+          error.message = `${error.message} | stderr: ${clipDiagnostic(tail.join(" / "), 400)}`;
         }
       }
       throw error;
@@ -200,6 +201,7 @@ export class ZServerConnection {
     clientId?: string;
     serverRoot?: string;
   }): Promise<ZServerConnection> {
+    assertSocketOwnedByUs(options.socketPath);
     const socket = netConnect(options.socketPath);
     await new Promise<void>((resolve, reject) => {
       socket.once("connect", resolve);
@@ -374,6 +376,41 @@ export class ZServerConnection {
       }
     }
   }
+}
+
+/**
+ * The broker socket lives at a predictable path, so another local user could
+ * pre-create a socket there and impersonate the broker. Only attach to a socket
+ * file owned by the current user (Node exposes no SO_PEERCRED, so the file's
+ * owner is the available proof). No-op where uids do not exist (Windows).
+ */
+export function assertSocketOwnedByUs(socketPath: string): void {
+  const uid = process.getuid?.();
+  if (uid === undefined) return;
+  let owner: number;
+  try {
+    owner = lstatSync(socketPath).uid;
+  } catch {
+    return; // absent: the connect below reports ENOENT/ECONNREFUSED
+  }
+  if (owner !== uid) {
+    throw new Error(
+      `broker socket ${socketPath} is owned by uid ${owner}, not ${uid} — refusing to attach`,
+    );
+  }
+}
+
+/**
+ * Server stderr is untrusted free text that ends up in error messages shown to
+ * the editor and repeated in always-on warnings: a single stderr line can be
+ * kilobytes long. Bound it and keep it on one line (a newline would forge extra
+ * log lines).
+ */
+export function clipDiagnostic(text: string, max = 300): string {
+  const oneLine = text.replace(/[\r\n]+/g, " ");
+  return oneLine.length > max
+    ? `${oneLine.slice(0, max)}… [+${oneLine.length - max} chars]`
+    : oneLine;
 }
 
 /** Delay before SIGTERM is escalated to SIGKILL on the server's process group. */

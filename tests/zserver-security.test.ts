@@ -287,6 +287,21 @@ describe("profile pin path validation", () => {
     expect(isTrustedPinPath("/tmp/.mount_x/../../evil", home)).toBe(false);
   });
 
+  it("fails closed on a degenerate home (HOME=/ or empty used to trust EVERY path)", () => {
+    // HOME=/ (a uid with no passwd entry, some containers) made homeRoot "/", so the
+    // home check accepted /etc/passwd, /tmp/evil/... and everything else.
+    for (const home of ["/", "", "relative/home", "//"]) {
+      expect(isTrustedPinPath("/etc/passwd", home), `home=${JSON.stringify(home)}`).toBe(false);
+      expect(isTrustedPinPath("/tmp/evil/rg", home), `home=${JSON.stringify(home)}`).toBe(false);
+      expect(isTrustedPinPath("/root/.ssh/x", home), `home=${JSON.stringify(home)}`).toBe(false);
+    }
+    // The fixed roots still work regardless of home...
+    expect(isTrustedPinPath("/opt/ZCode/resources/glm/zcode.cjs", "/")).toBe(true);
+    expect(isTrustedPinPath("/tmp/.mount_ZCode-6EQ0Ir/resources/tools/rg/rg", "")).toBe(true);
+    // ...and a healthy home is unaffected.
+    expect(isTrustedPinPath("/home/tester/.zcode/server/node", "/home/tester")).toBe(true);
+  });
+
   it("sanitizeDesktopEnv refuses a tampered path pin (fails closed)", () => {
     expect(() =>
       sanitizeDesktopEnv({ ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: "/tmp/attacker/provider.json" }),

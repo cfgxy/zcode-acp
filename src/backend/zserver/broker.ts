@@ -11,7 +11,7 @@ import {
   FrameDecoder,
   replaceHeader,
 } from "./protocol.js";
-import { ZServerConnection } from "./connection.js";
+import { clipDiagnostic, ZServerConnection } from "./connection.js";
 import { brokerBaseEnv, runtimeEnvWithProfile } from "./backend.js";
 
 export const DEFAULT_BROKER_SOCKET = path.join(
@@ -152,7 +152,7 @@ export function validateClientHeader(header: unknown): HeaderVerdict {
   if (!allowed?.has(name)) {
     return {
       ok: false,
-      reason: `${type === 100 ? "call" : "event"} ${channel}.${name} is not allowed through the broker`,
+      reason: `${type === 100 ? "call" : "event"} ${clipDiagnostic(channel, 80)}.${clipDiagnostic(name, 80)} is not allowed through the broker`,
       replyTo: id,
     };
   }
@@ -186,9 +186,14 @@ interface PendingSubscribe {
   cancelled: boolean;
 }
 
-/** Key of a (workspace, session) pair; NUL cannot occur in either. */
+/**
+ * Key of a (workspace, session) pair. Both parts are CLIENT-CONTROLLED strings
+ * and a NUL byte survives the wire, so a separator alone is not injective
+ * ("a\0b"+"c" and "a"+"b\0c" would collide, letting one client hold or release
+ * another's subscription). Length-prefixing the first part makes it unambiguous.
+ */
 function subscriptionKey(workspacePath: string, sessionId: string): string {
-  return `${workspacePath}\0${sessionId}`;
+  return `${workspacePath.length}:${workspacePath}\0${sessionId}`;
 }
 
 /** The (workspacePath, sessionId) of a call body `[params]`, if well-formed. */
@@ -313,10 +318,22 @@ export class ZServerBroker {
       log(`zserver-broker: removing stale socket ${this.socketPath}`);
       unlinkSync(this.socketPath);
     }
-    this.server = createServer((socket) => this.onClient(socket));
+    const server = createServer((socket) => this.onClient(socket));
+    this.server = server;
     const listening = new Promise<void>((resolve, reject) => {
-      this.server!.once("listening", resolve);
-      this.server!.once("error", reject);
+      server.once("listening", resolve);
+      // Start-up failures (EADDRINUSE, EACCES…) reject start().
+      server.once("error", reject);
+    });
+    // After start-up a `once` listener is gone: the FIRST later server error
+    // (accept failing with EMFILE/ENFILE, …) was swallowed silently and the
+    // SECOND was an uncaught exception that killed the shared daemon (and every
+    // client with it). Keep a persistent listener: a failed accept is a
+    // recoverable condition for the broker, not a reason to die.
+    server.on("error", (error: NodeJS.ErrnoException) => {
+      warn(
+        `zserver-broker: server error (${error.code ?? "unknown"}): ${error.message} — still serving`,
+      );
     });
     // bind() creates the socket file with 0777 & ~umask; tightening it with
     // chmod AFTER listen leaves a window (umask 000/002 → group/world

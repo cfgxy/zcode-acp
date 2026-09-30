@@ -179,9 +179,13 @@ export function isTrustedPinPath(value: string, home: string = os.homedir()): bo
   if (!path.isAbsolute(value)) return false;
   if (value.split(/[\\/]+/).includes("..")) return false;
   const normalized = path.normalize(value);
+  // A degenerate home ("" / "/" / relative — e.g. HOME=/ for a uid without a
+  // passwd entry) would make `homeRoot` "/" and trust EVERY path. Fail closed:
+  // then only the fixed roots below can match.
+  const homeUsable = path.isAbsolute(home) && path.normalize(home) !== path.sep;
   const homeRoot = path.normalize(home + path.sep);
   return (
-    normalized.startsWith(homeRoot) ||
+    (homeUsable && normalized.startsWith(homeRoot)) ||
     /^\/tmp\/\.mount_[A-Za-z0-9_-]+\//.test(normalized) ||
     normalized.startsWith("/opt/") ||
     normalized.startsWith("/usr/")
