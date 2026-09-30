@@ -204,6 +204,7 @@ respondElicitation / resumeTask / closeTask / deliverSessionMessage / …`；
   性发现的问题远多于任何单轮；但更大的收益来自**在真 server 上动手**——
   `session/list` 永远为空、V4 订阅在 103 之后仍被持有、`closeTask` 可跨客户端
   关别人会话，都是 fixture 与单测里看不见的，只有对真 server 跑一遍才暴露。
+  全部审计报告原件与实验脚本存档于 `docs/audits/zserver-2026-09-30/`（索引见其 README）。
   另外：审计员的结论要亲自重跑（曾有审计员的最终消息为空、报告只写了头部；
   也有把"实现细节"当成"行为已被保护"的测试），对测试做变异验证之前不要信它。
 
