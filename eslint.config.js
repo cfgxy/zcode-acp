@@ -13,6 +13,9 @@ export default [
       ".zcode/**",
       "*.config.js",
       "eslint.config.js",
+      // Verbatim audit artefacts (docs/audits): kept byte-exact on purpose —
+      // they are evidence, not maintained source. vitest excludes docs/** too.
+      "docs/audits/**",
     ],
   },
   js.configs.recommended,

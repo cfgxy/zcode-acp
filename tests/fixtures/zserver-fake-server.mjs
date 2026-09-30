@@ -225,6 +225,13 @@ const handleFrame = (payload) => {
       process.stdout.write(encFrame(msg([201, id], JSON.parse(process.env.ZSERVER_FAKE_TASKS))));
       return;
     }
+    // Scripted session snapshot (ZSERVER_FAKE_SNAPSHOT = JSON). readSession's
+    // consumer here is the setThoughtLevel reset path, which needs the model's
+    // reasoning.defaultLevel.
+    if (name === "readSession" && process.env.ZSERVER_FAKE_SNAPSHOT) {
+      process.stdout.write(encFrame(msg([201, id], JSON.parse(process.env.ZSERVER_FAKE_SNAPSHOT))));
+      return;
+    }
     process.stdout.write(encFrame(msg([201, id], `echo:${name}:${JSON.stringify(body)}`)));
   } else if (
     type === 102 &&
