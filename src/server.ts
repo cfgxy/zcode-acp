@@ -251,9 +251,12 @@ export class ZcodeAcpServer {
         `ZCODE_ACP_BACKEND="${backendChoice}" not recognized (zserver|direct) — using direct backend`,
       );
     }
-    if (backendChoice?.toLowerCase() === "zserver") {
+    // zserver is the default; `ZCODE_ACP_BACKEND=direct` opts back into the
+    // app-server subprocess. It shares one auto-launched broker (ADR-0008).
+    if (!backendChoice || backendChoice.toLowerCase() === "zserver") {
       this.backend = new ZServerBackend({
         serverRoot: process.env.ZCODE_SERVER_RUNTIME_ROOT,
+        autoBroker: true,
       });
       return this.backend;
     }

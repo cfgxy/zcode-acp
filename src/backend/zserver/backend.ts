@@ -3,11 +3,18 @@ import { loadDesktopChildEnvWithRefresh } from "../../desktop-profile.js";
 import { warn } from "../../utils.js";
 import { BACKEND_RESTARTING_MARKER } from "../supervise.js";
 import type { EventListenerLike } from "../types.js";
+import { attachOrLaunchBroker, spawnBrokerDetached } from "./autospawn.js";
 import { ServiceChannel, ZServerConnection, ZServerConnectionError } from "./index.js";
+import { isBrokerDisabled, resolveBrokerSocketPath } from "./socket-path.js";
 
 export interface ZServerBackendOptions {
   serverRoot?: string;
   clientId?: string;
+  /** Share one machine-level broker (default socket, auto-launched when absent)
+   *  instead of requiring ZCODE_ACP_ZSERVER_SOCKET. Off by default so direct
+   *  constructions (tests, tools) never touch the real broker; the bridge turns
+   *  it on. `ZCODE_ACP_ZSERVER_SOCKET=off` disables it again. */
+  autoBroker?: boolean;
 }
 
 /**
@@ -153,12 +160,26 @@ export class ZServerBackend implements BridgeBackend {
     // marker (idle-recycle/close set it so the OLD child's exit was ignored;
     // without clearing here the backend could never respawn).
     this.closing = false;
-    const socketPath = process.env.ZCODE_ACP_ZSERVER_SOCKET?.trim();
+    const explicitSocket = process.env.ZCODE_ACP_ZSERVER_SOCKET?.trim();
+    const autoBroker =
+      this.options.autoBroker === true && process.platform !== "win32" && !isBrokerDisabled();
+    const socketPath = isBrokerDisabled()
+      ? undefined
+      : explicitSocket || (autoBroker ? resolveBrokerSocketPath() : undefined);
     let connection: ZServerConnection | null = null;
     let attached = false;
     if (socketPath) {
       try {
-        connection = await ZServerConnection.attach({ socketPath, clientId: this.clientId });
+        const attach = (): Promise<ZServerConnection> =>
+          ZServerConnection.attach({ socketPath, clientId: this.clientId });
+        connection = await attachOrLaunchBroker({
+          attach,
+          // The broker is launched detached (outlives this bridge) and reclaims
+          // itself once every client has been gone for a while.
+          launch: autoBroker
+            ? () => spawnBrokerDetached(socketPath, brokerBaseEnv(process.env))
+            : undefined,
+        });
         attached = true;
       } catch (error) {
         // Broker down should not take the bridge down: fall back to a direct

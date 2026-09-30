@@ -446,18 +446,18 @@ projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
 
 ### 环境变量一览
 
-| 变量                                       | 作用                                                              | 默认                                   |
-| ------------------------------------------ | ----------------------------------------------------------------- | -------------------------------------- |
-| `ZCODE_ACP_BACKEND`                        | `zserver` 切换后端（大小写不敏感；无法识别的值会告警并用 direct） | direct                                 |
-| `ZCODE_ACP_ZSERVER_SOCKET`                 | **客户端 attach 与 broker bind 共用**的 socket 路径               | `$XDG_RUNTIME_DIR/zserver-broker.sock` |
-| `ZCODE_ACP_ZSERVER_IDLE_MS`                | 无会话监听且无在途请求 N ms 后回收 server 子进程                  | 0（关闭）                              |
-| `ZCODE_ACP_ZSERVER_TURN_QUIESCE_MS`        | terminal 后等流静默的宽限                                         | 300                                    |
-| `ZCODE_ACP_ZSERVER_MAX_CLIENT_BUFFER`      | broker 每客户端入站缓冲上限（字节）                               | 8MB                                    |
-| `ZCODE_ACP_ZSERVER_MAX_PENDING`            | broker 每客户端未决请求（未应答调用 + 存活订阅）上限              | 4096                                   |
-| `ZCODE_ACP_ZSERVER_MAX_CLIENT_WRITE_QUEUE` | broker 每客户端未读回复/事件积压上限（字节），超限断开该客户端    | 8MB                                    |
-| `ZCODE_ACP_ZSERVER_BROKER_IDLE_EXIT_MS`    | broker 无客户端 N ms 后自退出                                     | 0（关闭）                              |
-| `ZCODE_ACP_ZSERVER_KILL_ESCALATION_MS`     | dispose 时 SIGTERM→SIGKILL 升级延迟                               | 5000                                   |
-| `ZCODE_SERVER_RUNTIME_ROOT`                | server 部署根（`node` + `zcode-server.cjs`）                      | `~/.zcode/server`                      |
+| 变量                                       | 作用                                                                                         | 默认                                   |
+| ------------------------------------------ | -------------------------------------------------------------------------------------------- | -------------------------------------- |
+| `ZCODE_ACP_BACKEND`                        | `direct` 回到旧的 app-server 子进程后端（无法识别的值告警并用 direct）                       | zserver                                |
+| `ZCODE_ACP_ZSERVER_SOCKET`                 | **客户端 attach 与 broker bind 共用**的 socket 路径；`off` 关闭共享（每 bridge 私有 server） | `$XDG_RUNTIME_DIR/zserver-broker.sock` |
+| `ZCODE_ACP_ZSERVER_IDLE_MS`                | 无会话监听且无在途请求 N ms 后回收 server 子进程                                             | 0（关闭）                              |
+| `ZCODE_ACP_ZSERVER_TURN_QUIESCE_MS`        | terminal 后等流静默的宽限                                                                    | 300                                    |
+| `ZCODE_ACP_ZSERVER_MAX_CLIENT_BUFFER`      | broker 每客户端入站缓冲上限（字节）                                                          | 8MB                                    |
+| `ZCODE_ACP_ZSERVER_MAX_PENDING`            | broker 每客户端未决请求（未应答调用 + 存活订阅）上限                                         | 4096                                   |
+| `ZCODE_ACP_ZSERVER_MAX_CLIENT_WRITE_QUEUE` | broker 每客户端未读回复/事件积压上限（字节），超限断开该客户端                               | 8MB                                    |
+| `ZCODE_ACP_ZSERVER_BROKER_IDLE_EXIT_MS`    | broker 无客户端 N ms 后自退出（手动启动 broker 时）；bridge 自动拉起的 broker 默认 10 分钟   | 0（关闭）                              |
+| `ZCODE_ACP_ZSERVER_KILL_ESCALATION_MS`     | dispose 时 SIGTERM→SIGKILL 升级延迟                                                          | 5000                                   |
+| `ZCODE_SERVER_RUNTIME_ROOT`                | server 部署根（`node` + `zcode-server.cjs`）                                                 | `~/.zcode/server`                      |
 
 本表只列生产代码读取的变量；测试夹具专用的 `ZSERVER_FAKE_*`/`ZSERVER_COALESCE`
 见 `tests/fixtures/zserver-fake-server.mjs` 文件头，不属于运行时配置面。
@@ -465,11 +465,40 @@ projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
 注：`ZCODE_SERVER_RUNTIME_ROOT` 空白视为未设置，且优先于桌面 profile 的 pin
 （bridge 与 broker 一致；此前 broker 让 pin 覆盖了运维者的值）。
 
-注：`attach` 需要同时设置 `ZCODE_ACP_BACKEND=zserver` 与
-`ZCODE_ACP_ZSERVER_SOCKET`；只设 socket 变量不会切换后端。socket 路径超过
+注：自本节「默认共享 broker」起，不需要设置任何环境变量：zserver 是默认后端，
+bridge 自动 attach 默认 socket，不存在则拉起 broker。socket 路径超过
 sun_path 上限（Linux 107 / macOS 103 字节）时 broker 启动即报错而非静默
 截断；Windows 不支持 broker（无 unix socket 语义），每个 bridge 各自
 spawn server。
+
+### 默认共享 broker（自动拉起与回收）
+
+动机：每个 bridge 各开一个 `zcode-server.cjs`（~120MB + agent 子进程）既浪费又让
+各会话互不可见；而要求用户配 `ZCODE_ACP_BACKEND`/`ZCODE_ACP_ZSERVER_SOCKET` 等于
+默认不共享（实测 4 个 bridge 各有一个私有 server、socket 文件不存在）。
+
+- **默认后端是 zserver**（`ZCODE_ACP_BACKEND=direct` 回到旧路径）。`server.ts` 构造
+  `ZServerBackend` 时传 `autoBroker: true`；直接 `new ZServerBackend()`（测试、工具）
+  默认不碰真实 broker。
+- **attach 顺序**：显式 `ZCODE_ACP_ZSERVER_SOCKET` → 否则默认路径 → 失败回退私有
+  server（与原先一致）。`ZCODE_ACP_ZSERVER_SOCKET=off` 关闭共享。Windows 不做 broker。
+- **自动拉起**（`autospawn.ts`）：仅当 attach 报 `ENOENT`/`ECONNREFUSED`（没人监听）
+  才拉起；wedged broker（ready 超时）、属主不符等不触发拉起，避免叠加第二个 broker。
+  拉起后以 150ms 间隔重试 attach，最长 8s；失败后 60s 内不再拉起（一次等待，不是每次
+  请求一次）；同进程 5s 节流。
+- **生命周期（为什么 A 退出不会带走 B 正在用的 broker）**：broker 由 `detached: true`
+  新会话拉起，stdio 指向 socket 旁的 `zserver-broker.log`，`unref()`，**不是**拉起者的
+  子进程；`brokerBaseEnv` 剥掉 `MULTICA_*`/`SSH_*` 这类任务级凭据。A 退出、A 所在进程组被
+  杀、编辑器关闭都不影响它。回收靠**空闲退出而非属主**：自动拉起时默认
+  `ZCODE_ACP_ZSERVER_BROKER_IDLE_EXIT_MS=10min`，`onClient` 取消待触发计时器，最后一个
+  客户端断开才重新计时——只要还有任何 bridge 连着，broker 就不会退出。
+- **竞态**：两个 bridge 同时拉起，依赖 broker 已有的 bind 独占 + `removeStaleSocket`
+  （dev+ino+birth time+ctime）——输家报 `already listening` 退出，两边都 attach 到赢家。
+- **已知边界**：broker 是长驻进程，升级 zcode-acp 后旧 broker 继续服务到空闲退出
+  （未做版本校验）；需要立即生效时 `pkill -f 'cli.js zserver-broker'`，下一个 bridge 会拉起新的。
+  client 恰在 broker 空闲退出瞬间 attach 时，走既有 heal 路径（重新 attach/拉起）。
+- **实测**（fake server，隔离 socket 目录，idle=4s）：A、B 先后启动 → 1 个 broker + 1 个
+  server；A 退出后 broker/server 仍在；B 退出、空闲 4s 后二者都已退出、socket 已清理。
 
 ### 粗糙边缘（server 侧，避免踩坑）
 

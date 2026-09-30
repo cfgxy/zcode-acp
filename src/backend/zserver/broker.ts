@@ -1,6 +1,5 @@
 import fs, { chmodSync, existsSync, unlinkSync } from "node:fs";
 import { connect, createServer, type Server, type Socket } from "node:net";
-import os from "node:os";
 import path from "node:path";
 
 import { log, warn } from "../../utils.js";
@@ -13,18 +12,9 @@ import {
 } from "./protocol.js";
 import { clipDiagnostic, ZServerConnection } from "./connection.js";
 import { brokerBaseEnv, runtimeEnvWithProfile } from "./backend.js";
+import { resolveBrokerSocketPath } from "./socket-path.js";
 
-export const DEFAULT_BROKER_SOCKET = path.join(
-  process.env.XDG_RUNTIME_DIR || path.join(os.homedir(), ".zcode"),
-  "zserver-broker.sock",
-);
-
-/** Effective broker socket: ZCODE_ACP_ZSERVER_SOCKET wins on BOTH sides —
- *  clients attach to it and the broker must bind it, otherwise clients silently
- *  fall back to per-process servers and sharing quietly stops working. */
-export function resolveBrokerSocketPath(env: NodeJS.ProcessEnv = process.env): string {
-  return env.ZCODE_ACP_ZSERVER_SOCKET?.trim() || DEFAULT_BROKER_SOCKET;
-}
+export { DEFAULT_BROKER_SOCKET, resolveBrokerSocketPath } from "./socket-path.js";
 
 /** sun_path limits: 107 usable bytes on Linux, 103 on macOS/BSD. Longer paths
  *  are silently TRUNCATED by bind()/connect(), which breaks stale-socket
@@ -34,7 +24,7 @@ export function assertSocketPathFits(socketPath: string): void {
   if (process.platform === "win32") {
     throw new Error(
       "zserver-broker uses unix domain sockets and is not supported on Windows " +
-        "(use ZCODE_ACP_BACKEND=zserver without a broker: each bridge spawns its own server)",
+        "(set ZCODE_ACP_ZSERVER_SOCKET=off: each bridge spawns its own server)",
     );
   }
   const limit = process.platform === "darwin" ? 103 : 107;

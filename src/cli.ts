@@ -96,8 +96,10 @@ Commands:
                       rows, arrow-key permission prompts. /exit quits.
   quota [args...]   Plan usage cards (was the zcode-quota bin): -w watch,
                     -i <sec>, -d detail, -p plain, provider glm|go.
-  zserver-broker    Keep one shared zcode-server alive for multiple
-                    zcode-acp clients (ZCODE_ACP_ZSERVER_SOCKET, ADR-0008).
+  zserver-broker    Shared zcode-server for all zcode-acp clients (ADR-0008).
+                    Auto-started by the first bridge; exits after 10 min
+                    with no clients. ZCODE_ACP_ZSERVER_SOCKET=off disables
+                    sharing; ZCODE_ACP_BACKEND=direct restores the old backend.
   hub               Run the remote-access hub daemon (was zcode-acp-hub;
                     usually auto-spawned by bridges, rarely run by hand).
   profile refresh   Capture the active Linux ZCode runtime-host profile
