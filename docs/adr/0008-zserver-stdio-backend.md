@@ -500,6 +500,31 @@ spawn server。
 - **实测**（fake server，隔离 socket 目录，idle=4s）：A、B 先后启动 → 1 个 broker + 1 个
   server；A 退出后 broker/server 仍在；B 退出、空闲 4s 后二者都已退出、socket 已清理。
 
+### 下拉以后端 registry 为准（模型切换与 reasoning 档位）
+
+背景：`config.json`（桌面端维护）会漂移——上游改名后旧名留在里面（`claude-sonnet-5` →
+`claude-sonnet-5-5`、`gpt-5.6-luna` → `gpt-6-luna`），下拉里选它们只会得到
+`Provider Registry 中不存在 Model`；而后端只认 `provider_config.json` 的
+`personalModelIds` 与内置账号模板。
+
+- **personal provider 取自后端**（`config/personal-models.ts`）：`loadAllModels()` 在
+  `provider_config.json` 可读时，用它**替换** `config.json` 里的非 builtin provider；不可读/为空才
+  回退 `config.json`。builtin 模型若已由同名 personal 模型覆盖则不重复列出。`config.json` 不改。
+- **活会话再按 `session/read` 收窄 builtin**：`buildConfigOptions` 拿到 `available` 后，builtin
+  模型只在 `available` 或 personal registry 命中时保留（账号已换到 GLM-5.3，`GLM-5.2`/`GLM-4.7`
+  留在 config.json 里只会报错）。注意 `available` 本身偏窄（`GLM-5.3-Flash` 不在其中却可切换），
+  所以只用它做“排除”的一侧依据而不是白名单——与 personal registry 取并集。
+- **reasoning 档位从后端的拒绝中学**（`runtime-model.ts`）：档位词表按模型且随版本变化
+  （`gpt-6-luna` 只有 `enabled`/`disabled`，实测 max/high/…/none 全被拒；claude-* 是 low…max；
+  GLM 是 low/high/max）。收到 `Reasoning level is required` 或 `Reasoning effort "X" is not
+  supported` 时按 `max → high → enabled → medium → low → xhigh` 依次重试（有界，已试过的跳过）；
+  成功的档位按 `provider/model` 缓存，下次首发即带。不去读 `zcode-builtin.json`（随版本漂移）。
+  其他错误（如 registry 中不存在）不重试。
+- **thought 下拉**本就来自 `session/read` 的 `thoughtLevel.available`，切换后重建即跟随新模型
+  （`gpt-6-luna` 显示 `enabled/disabled`）。
+- **实测**（真实 zcode-server，私有模式）：`gpt-6-luna`（enabled）、`gpt-5.6-terra/sol`、
+  `claude-fable-5`、`claude-opus-5-5`、`claude-sonnet-5-5`、`GLM-5.3`、`GLM-5.3-Flash` 均切换成功。
+
 ### 粗糙边缘（server 侧，避免踩坑）
 
 - `ProxyChannel.fromService` 对**未知事件名同步 throw**，会把整个 server 进程

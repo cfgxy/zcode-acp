@@ -17,11 +17,38 @@
  */
 
 import { formatModelValue, parseModelValue } from "./options.js";
-import { loadDesktopProfile } from "../desktop-profile.js";
-import { personalProviderConfigPath } from "./personal-provider.js";
-import { readFileSync } from "node:fs";
+import { loadPersonalProviders } from "./personal-models.js";
 import { log, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
+
+/**
+ * Reasoning levels tried, in order, when the backend rejects a switch over the
+ * level. The vocabulary is per model AND per backend version (gpt-5.x: none…max,
+ * claude-*: low…max, GLM: disabled/high/max, unmatched models fall to a generic
+ * `enabled`/`disabled` pair), so the bridge learns it from the backend's own
+ * rejections instead of mirroring its builtin rules — those drift.
+ */
+const LEVEL_LADDER = ["max", "high", "enabled", "medium", "low", "xhigh"] as const;
+
+/** The level that last switched a model successfully, keyed `provider/model`. */
+const workingLevels = new Map<string, string>();
+
+function levelKey(ref: { providerId: string; modelId: string }): string {
+  return `${ref.providerId}/${ref.modelId}`.toLowerCase();
+}
+
+/** Backend rejected the switch over the reasoning level (missing or unsupported). */
+function isLevelError(message: string): boolean {
+  return (
+    /reasoning level is required/i.test(message) ||
+    /reasoning effort .* is not supported/i.test(message)
+  );
+}
+
+/** Test hook: forget learned levels. */
+export function resetLearnedLevels(): void {
+  workingLevels.clear();
+}
 
 /**
  * Switch a session's model via `session/setModel`.
@@ -35,10 +62,9 @@ import type { ZcodeAcpServer } from "../server.js";
  * lowercase); a unique match is used directly, an ambiguous one prefers the
  * requested providerId. When the requested model is absent from `available`
  * the ref is still sent verbatim — the backend's registry is wider than the
- * list (its precise errors drive two bounded reasoning-level retries). Models
- * truly absent from the registry (e.g. the GLM coding-plan account models for
- * bridge-created sessions — the desktop provisions those separately) fail with
- * the backend's "Provider Registry 中不存在 Model" error.
+ * list (its precise errors drive the bounded reasoning-level retries). Models
+ * truly absent from the registry fail with the backend's "Provider Registry
+ * 中不存在 Model" error.
  *
  * `persistAsWorkspaceLastUsed: false` keeps this a runtime-only change.
  * Invalidates the model cache on success.
@@ -61,33 +87,46 @@ export async function applyModelSwitch(
   //      personal providers from provider_config.json under fresh UUIDs. Map
   //      via personalModelIds membership.
   //   2. verbatim requested ref.
-  const mappedProviderId = resolved ? null : resolvePersonalProviderId(requested.modelId);
+  const mappedProviderId = resolved ? null : resolvePersonalProviderId(requested);
   const ref = resolved ?? {
     providerId: mappedProviderId ?? requested.providerId,
     modelId: requested.modelId,
   };
-  const send = (model: typeof ref) =>
+  const send = (model: { providerId: string; modelId: string; options?: unknown }) =>
     backend.request(
       server.nextId(),
       "session/setModel",
       { sessionId: zcodeSid, model, persistAsWorkspaceLastUsed: false },
       15000,
     );
-  let resp = await send(ref);
-  // Providers with mandatory reasoning effort reject a bare ref ("Reasoning
-  // level is required for …") and their entry may be missing from `available`
-  // (so no defaultLevel was attached). Retry with the observed template
-  // defaults, bounded to two attempts.
-  for (const level of ["max", "high"]) {
-    if (!resp.error || !/reasoning level is required/i.test(resp.error.message) || ref.options) {
-      break;
-    }
+
+  // A level that worked before beats a bare ref (saves a round-trip); the
+  // backend's own defaultLevel (already on `ref`) beats the cache.
+  const key = levelKey(ref);
+  const learned = workingLevels.get(key);
+  const first = ref.options
+    ? ref
+    : learned
+      ? { ...ref, options: { reasoningLevel: learned } }
+      : ref;
+  let used = first.options?.reasoningLevel;
+  let resp = await send(first);
+
+  // The backend rejects a bad level with a precise error but never lists the
+  // valid ones, so walk the ladder — bounded, skipping what was already tried.
+  const tried = new Set<string>(used ? [used] : []);
+  for (const level of LEVEL_LADDER) {
+    if (!resp.error || !isLevelError(resp.error.message)) break;
+    if (tried.has(level)) continue;
+    tried.add(level);
     resp = await send({ ...ref, options: { reasoningLevel: level } });
+    used = level;
   }
   if (resp.error) {
     warn(`runtime-model: switch failed: ${resp.error.message}`);
     return false;
   }
+  if (used) workingLevels.set(key, used);
   invalidateModelCache(server, zcodeSid);
   return true;
 }
@@ -112,54 +151,27 @@ function extractAvailableModels(result: unknown): BackendModelEntry[] {
   );
 }
 
-interface PersonalProviderRule {
+/**
+ * Map a requested ref onto the backend-registered personal provider that
+ * carries the model (provider_config.json; config.json's provider UUIDs are
+ * desktop-legacy and unknown to the backend). The requested provider wins when
+ * it really carries the model, else the first provider that does. Best-effort —
+ * null when the file is missing, unreadable, or lists no match.
+ */
+function resolvePersonalProviderId(requested: {
   providerId: string;
-  config?: { personalModelIds?: unknown };
-}
-
-/**
- * Where provider_config.json lives. The desktop profile's pin wins when the
- * profile is usable, but the profile goes `stale`/`missing` whenever ZCodeDesktop
- * is closed — and the file itself does not move. Falling back to the operator's
- * env pin / the standard ~/.zcode/v2 location keeps the personal-provider
- * lookup working without the desktop (every non-default model switch used to
- * fail with "Provider Registry 中不存在 Model" once the desktop was closed).
- */
-function personalProviderConfigFile(): string {
-  let pinEnv: NodeJS.ProcessEnv = process.env;
+  modelId: string;
+}): string | null {
   try {
-    pinEnv = { ...process.env, ...loadDesktopProfile().env };
-  } catch (e) {
-    log(
-      `runtime-model: desktop profile unusable, using default provider path: ${
-        e instanceof Error ? e.message : String(e)
-      }`,
+    const want = requested.modelId.toLowerCase();
+    const carriers = loadPersonalProviders().filter((p) =>
+      p.modelIds.some((m) => m.toLowerCase() === want),
     );
-  }
-  return personalProviderConfigPath(pinEnv);
-}
-
-/**
- * Map a modelId to the backend-registered personal provider that carries it,
- * reading provider_config.json (see `personalProviderConfigFile`). config.json's
- * provider UUIDs are desktop-legacy and unknown to the backend registry.
- * Best-effort — null when the file is missing, unreadable, or lists no match.
- */
-function resolvePersonalProviderId(modelId: string): string | null {
-  try {
-    const configPath = personalProviderConfigFile();
-    const raw = JSON.parse(readFileSync(configPath, "utf8")) as {
-      config?: { providerConfigRules?: { providerRules?: PersonalProviderRule[] } };
-    };
-    const rules = raw.config?.providerConfigRules?.providerRules ?? [];
-    const hit = rules.find((r) => {
-      const ids = r.config?.personalModelIds;
-      return (
-        Array.isArray(ids) &&
-        ids.some((m) => typeof m === "string" && m.toLowerCase() === modelId.toLowerCase())
-      );
-    });
-    return hit?.providerId ?? null;
+    return (
+      carriers.find((p) => p.providerId === requested.providerId)?.providerId ??
+      carriers[0]?.providerId ??
+      null
+    );
   } catch (e) {
     log(
       `runtime-model: personal provider map unavailable: ${e instanceof Error ? e.message : String(e)}`,
