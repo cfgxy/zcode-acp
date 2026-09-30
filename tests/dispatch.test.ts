@@ -308,6 +308,103 @@ describe("dispatchEvent", () => {
     });
   });
 
+  it("Bash exit 3 via generic branch (no terminal_output) reports status failed", async () => {
+    // Headless ACP consumers (multica hermes, ...) never declare the
+    // terminal_output capability, so their Bash frames all take the generic
+    // branch — the backend's "completed" pass-through would hide the failure.
+    const { cx, sent } = mockContext();
+    const server = makeServer(false);
+    const ev: InternalEvent = {
+      kind: "ToolCallUpdate",
+      callId: "c1",
+      tool: "Bash",
+      status: "completed",
+      rawOutput: "cat: nope: No such file\n",
+      output: "cat: nope: No such file\n",
+      rawResult: { success: false, content: "cat: nope: No such file\n", perf: { exitCode: 3 } },
+    };
+    await dispatchEvent(server, cx, SID, ev, CHUNK);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "c1",
+      status: "failed",
+      rawOutput: "cat: nope: No such file\n",
+      _meta: { claudeCode: { toolName: "Bash" } },
+    });
+    const meta = (sent[0] as { _meta?: Record<string, unknown> })._meta;
+    expect(meta?.terminal_output).toBeUndefined();
+    expect(meta?.terminal_exit).toBeUndefined();
+  });
+
+  it("Bash success:false without perf.exitCode via generic branch reports status failed", async () => {
+    const { cx, sent } = mockContext();
+    const server = makeServer(false);
+    const ev: InternalEvent = {
+      kind: "ToolCallUpdate",
+      callId: "c1",
+      tool: "Bash",
+      status: "completed",
+      rawOutput: "boom\n",
+      output: "boom\n",
+      rawResult: { success: false, content: "boom\n" },
+    };
+    await dispatchEvent(server, cx, SID, ev, CHUNK);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ status: "failed" });
+  });
+
+  it("Bash exit 0 via generic branch keeps status completed (no regression)", async () => {
+    const { cx, sent } = mockContext();
+    const server = makeServer(false);
+    const ev: InternalEvent = {
+      kind: "ToolCallUpdate",
+      callId: "c1",
+      tool: "Bash",
+      status: "completed",
+      rawOutput: "ok\n",
+      output: "ok\n",
+      rawResult: { success: true, content: "ok\n", perf: { exitCode: 0 } },
+    };
+    await dispatchEvent(server, cx, SID, ev, CHUNK);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ status: "completed" });
+  });
+
+  it("generic branch keeps non-Bash status passthrough (no agreed rawResult shape)", async () => {
+    const { cx, sent } = mockContext();
+    const server = makeServer(false);
+    const ev: InternalEvent = {
+      kind: "ToolCallUpdate",
+      callId: "c2",
+      tool: "Read",
+      status: "completed",
+      output: "file body",
+      rawResult: { success: false, perf: { exitCode: 3 } },
+    };
+    await dispatchEvent(server, cx, SID, ev, CHUNK);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ status: "completed" });
+  });
+
+  it("generic branch keeps background Bash status passthrough (listener owns completion)", async () => {
+    const { cx, sent } = mockContext();
+    const server = makeServer(false);
+    const ev: InternalEvent = {
+      kind: "ToolCallUpdate",
+      callId: "c1",
+      tool: "Bash",
+      status: "completed",
+      background: true,
+      rawOutput: "Command running in background with ID: exec_1\n",
+      output: "Command running in background with ID: exec_1\n",
+      rawResult: { success: false, content: "Command running in background with ID: exec_1\n" },
+    };
+    await dispatchEvent(server, cx, SID, ev, CHUNK);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ status: "completed" });
+  });
+
   it("non-Bash ToolCallUpdate emits single update with status + content", async () => {
     const { cx, sent } = mockContext();
     const server = makeServer(true); // terminal supported but tool is Read, not Bash
