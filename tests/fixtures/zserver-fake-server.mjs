@@ -13,7 +13,7 @@
 // Test-only knobs (read here, not runtime configuration): ZSERVER_FAKE_*
 // (SLOW_EXIT_MS, IGNORE_SIGTERM, PID_FILE, GRANDCHILD_IGNORES_SIGTERM,
 // DIE_AFTER_MS, SPAWN_LOG, FAIL_METHODS, HANG_METHODS, DELAY_METHODS, TERMINAL,
-// FRAMES, BIG_FRAMES, TASKS, PREFS) and ZSERVER_COALESCE.
+// FRAMES, BIG_FRAMES, TASKS, PREFS, EVICT_SESSIONS) and ZSERVER_COALESCE.
 //
 // NOTE: executed as `<tmpdir>/zcode-server.cjs`, i.e. CommonJS — no ESM syntax.
 // `process` is a global.
@@ -76,6 +76,12 @@ process.stdout.write(
 
 let acc = Buffer.alloc(0);
 let acked = false;
+
+// ZSERVER_FAKE_EVICT_SESSIONS: sessionIds whose resident is "gone" (see the
+// readSession handler below).
+const evictedSessions = new Set(
+  (process.env.ZSERVER_FAKE_EVICT_SESSIONS || "").split(",").filter(Boolean),
+);
 
 const vql = (v) => {
   const out = [];
@@ -167,6 +173,27 @@ const handleFrame = (payload) => {
     }
     const hangMethods = (process.env.ZSERVER_FAKE_HANG_METHODS || "").split(",").filter(Boolean);
     if (hangMethods.includes(name)) return; // wedged-but-alive server simulation
+    // Scripted resident eviction (ZSERVER_FAKE_EVICT_SESSIONS = comma-separated
+    // sessionIds): readSession for those ids answers 202 "Session is not active:
+    // <sid>" (the real server's require-gate, -32004) until a resumeTask call
+    // names the same taskId — on the real server only the task facade's
+    // resumeTask re-hydrates a persisted session, so the read keeps failing
+    // until the revive actually happened.
+    const callArg = Array.isArray(body) ? body[0] : body;
+    if (name === "readSession" && evictedSessions.has(callArg?.sessionId)) {
+      process.stdout.write(
+        encFrame(
+          msg([202, id], {
+            code: -32004,
+            message: `Session is not active: ${callArg.sessionId}`,
+          }),
+        ),
+      );
+      return;
+    }
+    if (name === "resumeTask" && evictedSessions.delete(callArg?.taskId)) {
+      console.error(`ZSERVER_RESUMETASK:${callArg.taskId}`);
+    }
     if (name === "createSession") {
       process.stdout.write(
         encFrame(

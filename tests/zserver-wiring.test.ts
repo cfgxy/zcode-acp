@@ -271,7 +271,14 @@ describe("group B: broker security", () => {
       // No closeTask: the server binds no task to its creator (cross-client close).
       // goalSession/compactSession (and setModel/setMode/setThoughtLevel above) mutate a
       // session, so the broker only forwards them for the session's owner.
-      "zcode-task": ["compactSession", "createTask", "goalSession", "listTasks", "stopGeneration"],
+      "zcode-task": [
+        "compactSession",
+        "createTask",
+        "goalSession",
+        "listTasks",
+        "resumeTask",
+        "stopGeneration",
+      ],
     });
     expect(sorted(BROKER_ALLOWED_EVENTS)).toEqual({
       // No prefs-request event: only the broker's own connection listens for it.
@@ -771,6 +778,37 @@ describe("group C: backend wiring", () => {
       ]) {
         expect(events.has(e), `server saw listen ${e}`).toBe(true);
       }
+    } finally {
+      await backend.close();
+      await broker.stop();
+    }
+  });
+
+  it("session/resume of an evicted session revives through a LIVE broker (resumeTask is forwarded, not owner-guarded)", async () => {
+    const { root, rec, sock } = stage();
+    vi.stubEnv("ZSERVER_FAKE_RECORD_FILE", rec);
+    vi.stubEnv("ZSERVER_FAKE_EVICT_SESSIONS", "sess_evicted");
+    const broker = new ZServerBroker(sock, root);
+    await broker.start();
+    vi.stubEnv("ZCODE_ACP_ZSERVER_SOCKET", sock);
+    const backend = new ZServerBackend({ serverRoot: "/nonexistent-direct-spawn-root" });
+    try {
+      // No owner has claimed the session yet (subscribe comes after the resume),
+      // so a guarded resumeTask would be rejected here.
+      const response = await backend.request(1, "session/resume", {
+        sessionId: "sess_evicted",
+        workspace: { workspacePath: WS },
+      });
+      expect(response.error).toBeUndefined();
+      expect(backend.isDead).toBe(false);
+      const calls = callsOf(rec).map((c) => c.method);
+      expect(calls).toContain("resumeTask");
+      // read (rejected) -> resumeTask -> read (served)
+      expect(calls.filter((m) => m === "readSession").length).toBe(2);
+      expect(callsOf(rec).find((c) => c.method === "resumeTask")?.arg).toEqual({
+        taskId: "sess_evicted",
+        workspacePath: WS,
+      });
     } finally {
       await backend.close();
       await broker.stop();

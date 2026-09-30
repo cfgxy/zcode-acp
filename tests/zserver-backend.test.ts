@@ -344,6 +344,75 @@ describe("multi-agent audit round fixes", () => {
   });
 });
 
+describe("zserver session/resume revive (persisted-but-inactive session)", () => {
+  // The server keeps only sessions with a live resident; after a restart or
+  // idle eviction the session exists solely on disk and readSession answers
+  // "Session is not active" (-32004). Only the task channel's resumeTask
+  // re-hydrates it (the desktop's own continue-task path).
+  it("revives an evicted session via resumeTask and retries the read", async () => {
+    process.env.ZSERVER_FAKE_EVICT_SESSIONS = "sess_evicted";
+    const backend = new ZServerBackend({ serverRoot: makeFakeRoot() });
+    try {
+      const response = await backend.request(1, "session/resume", {
+        sessionId: "sess_evicted",
+        workspace: { workspacePath: "/tmp/evicted-ws" },
+      });
+      expect(response.error).toBeUndefined();
+      // The fake server only clears the eviction on a resumeTask naming the
+      // same taskId, so a success here proves the revive + read retry ran.
+      // Result is the fake server's readSession echo.
+      expect(String(response.result)).toContain("readSession");
+      expect(String(response.result)).toContain("sess_evicted");
+      expect(
+        (backend as unknown as { workspaceBySession: Map<string, string> }).workspaceBySession.get(
+          "sess_evicted",
+        ),
+      ).toBe("/tmp/evicted-ws");
+    } finally {
+      delete process.env.ZSERVER_FAKE_EVICT_SESSIONS;
+      await backend.close();
+    }
+  });
+
+  it("session/load revives through the same path (same route case)", async () => {
+    process.env.ZSERVER_FAKE_EVICT_SESSIONS = "sess_load_evicted";
+    const backend = new ZServerBackend({ serverRoot: makeFakeRoot() });
+    try {
+      const response = await backend.request(1, "session/load", {
+        sessionId: "sess_load_evicted",
+        workspace: { workspacePath: "/tmp/evicted-ws2" },
+      });
+      expect(response.error).toBeUndefined();
+      expect(String(response.result)).toContain("readSession");
+    } finally {
+      delete process.env.ZSERVER_FAKE_EVICT_SESSIONS;
+      await backend.close();
+    }
+  });
+
+  it("propagates a failed revive instead of the original not-active error", async () => {
+    // resumeTask fails (e.g. the session file is gone) → its error surfaces so
+    // the upstream classifier sees the real cause ("Session not found" keeps
+    // the zcode_session_lost classification); the stale "not active" read
+    // error must not mask it.
+    process.env.ZSERVER_FAKE_EVICT_SESSIONS = "sess_gone";
+    process.env.ZSERVER_FAKE_FAIL_METHODS = "resumeTask";
+    const backend = new ZServerBackend({ serverRoot: makeFakeRoot() });
+    try {
+      const response = await backend.request(1, "session/resume", {
+        sessionId: "sess_gone",
+        workspace: { workspacePath: "/tmp/gone-ws" },
+      });
+      expect(response.error?.message).toContain("scripted failure: resumeTask");
+      expect(response.error?.message).not.toContain("Session is not active");
+    } finally {
+      delete process.env.ZSERVER_FAKE_EVICT_SESSIONS;
+      delete process.env.ZSERVER_FAKE_FAIL_METHODS;
+      await backend.close();
+    }
+  });
+});
+
 function makeFakeRoot(): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "zserver-int-"));
   tempDirs.push(root);

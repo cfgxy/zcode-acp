@@ -1157,6 +1157,7 @@ describe("least privilege on the broker allowlist", () => {
       ["zcode-task", "createTask"],
       ["zcode-task", "listTasks"],
       ["zcode-task", "stopGeneration"],
+      ["zcode-task", "resumeTask"],
       ["zcode-task", "goalSession"],
       ["zcode-task", "compactSession"],
     ] as const) {

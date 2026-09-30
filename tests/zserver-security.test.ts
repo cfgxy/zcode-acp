@@ -56,6 +56,13 @@ describe("broker header validation (confused-deputy allowlist)", () => {
     expect(validateClientHeader([102, 1, "credential", "onDidMutate"]).ok).toBe(false);
   });
 
+  it("forwards the session-resume revive primitive (zcode-task.resumeTask)", () => {
+    // session/resume must be able to revive a persisted-but-inactive session
+    // through the broker — removing this from the allowlist breaks resume
+    // across server restarts with a 202 policy rejection.
+    expect(validateClientHeader([100, 1, "zcode-task", "resumeTask"]).ok).toBe(true);
+  });
+
   it("rejects malformed shapes that would bypass id rewriting", () => {
     expect(validateClientHeader([100, "x", "zcode-agent", "createSession"]).ok).toBe(false); // string id
     expect(validateClientHeader([100, -1, "zcode-agent", "createSession"]).ok).toBe(false);

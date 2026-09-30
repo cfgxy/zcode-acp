@@ -133,10 +133,17 @@ export const BROKER_ALLOWED_CALLS: Readonly<Record<string, ReadonlySet<string>>>
   // No closeTask: ZServerBackend never closes server-side tasks, and the server
   // does not bind a task to its creator — an attached client could close (mark
   // deleted) another client's session. Add it back only with an owner check.
+  // resumeTask: the revive primitive for session/resume — a persisted-but-
+  // inactive session (server restart/eviction) must be re-hydrated before
+  // readSession can serve it. Deliberately NOT owner-guarded: the resume runs
+  // before subscribeConversationV4, i.e. before any owner has claimed the
+  // session. Same trust level as createTask (it only wakes an existing session,
+  // sends no prompt); the bridge never passes the automation/offPeak params.
   "zcode-task": new Set([
     "createTask",
     "listTasks",
     "stopGeneration",
+    "resumeTask",
     "goalSession",
     "compactSession",
   ]),

@@ -317,6 +317,17 @@ projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
     抗 NUL 拼接碰撞），渠道/方法名查表用 `Object.hasOwn`。此前 broker 模式下
     `session/set_model` 被白名单拒绝（`setModel is not allowed through the
     broker`），是 RUYI-318 里 set_model 失败的另一个独立原因。
+  - **resumeTask（session/resume 的复活原语）**：channel 的 `readSession` 只服务
+    有存活 resident 的会话，server 重启/空闲驱逐后只剩磁盘记录的会话会回
+    `Session is not active`（-32004）；direct 后端的 `session/resume` 自带从
+    session store 重载，channel 版没有。`ZServerBackend.readSessionReviving`
+    遇到该错误时调 `zcode-task.resumeTask({taskId, workspacePath})`
+    （resumeSnapshotOrLegacy → agent resumeSession，与桌面端“继续任务”同一条
+    路径），再重读一次；`resumeTask` 自身的错误原样抛出，保证 `Session not
+    found` 仍归类为 `zcode_session_lost`。白名单放行 `resumeTask`，但**不**进
+    属主守卫：resume 发生在 `subscribeConversationV4` 之前，属主尚未认领，加守
+    卫会把自己挡死。其信任级别与 `createTask` 相同——只唤醒既有会话、不发 prompt，
+    桥接器也不传 automation/offPeak 等元参数。`sendPrompt` 非幂等，不做自动重试。
   - **不读回复的客户端**：Node 对未刷出的写入无界排队，而 broker 会应答每个被
     拒/被限/被退订的请求，并转发 server 事件。所有向客户端的写入统一走
     `sendToClient`，未读积压超过 `ZCODE_ACP_ZSERVER_MAX_CLIENT_WRITE_QUEUE`

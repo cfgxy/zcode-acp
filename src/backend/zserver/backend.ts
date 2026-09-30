@@ -430,7 +430,7 @@ export class ZServerBackend implements BridgeBackend {
         // (no workspace), and after a bridge restart this is the only place
         // the mapping is rebuilt.
         this.workspaceBySession.set(sessionId, target);
-        const result = await agentChannel.call("readSession", { workspacePath: target, sessionId });
+        const result = await this.readSessionReviving(agentChannel, tasks, target, sessionId);
         // The heal path resumes after a backend restart; server-side
         // subscriptions died with the old connection — re-establish them so
         // the turn loop sees events again (idempotent via subscribedSessions).
@@ -558,6 +558,39 @@ export class ZServerBackend implements BridgeBackend {
       }
       default:
         throw new Error(`method ${method} is not supported in zserver backend mode yet`);
+    }
+  }
+
+  /**
+   * readSession with revive-on-eviction. readSession only serves sessions with
+   * a live resident in the zcode-server; a persisted-but-inactive session
+   * (idle eviction, server restart — the session exists only on disk) fails
+   * with "Session is not active" (-32004). Unlike the direct backend, where
+   * session/resume itself re-hydrates from the session store, the channel
+   * readSession can never activate anything. Revive via the task channel's
+   * resumeTask (resumeSnapshotOrLegacy → agent resumeSession → the hydrating
+   * session/resume — the same path the desktop's continue-task flow uses),
+   * then retry the read once. A resumeTask error propagates as-is so the
+   * upstream classifiers keep their meaning ("Session not found" →
+   * zcode_session_lost).
+   */
+  private async readSessionReviving(
+    agentChannel: ServiceChannel,
+    tasks: ServiceChannel,
+    workspacePath: string,
+    sessionId: string,
+  ): Promise<unknown> {
+    try {
+      return await agentChannel.call("readSession", { workspacePath, sessionId });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/session is not active/i.test(message)) throw error;
+      warn(
+        `zserver: session ${sessionId} has no live resident in the server ` +
+          `(restart/eviction) — reviving via resumeTask`,
+      );
+      await tasks.call("resumeTask", { taskId: sessionId, workspacePath });
+      return await agentChannel.call("readSession", { workspacePath, sessionId });
     }
   }
 
