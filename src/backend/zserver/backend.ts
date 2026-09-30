@@ -36,21 +36,6 @@ export interface ZServerBackendOptions {
  * authority mode, which is a verified-working fallback (billing resolves via
  * ~/.zcode/v2/config.json either way).
  */
-/** Env keys that carry ONE task's/session's credentials or identity. The broker
- *  is a machine-level daemon shared by every client, so a token inherited from
- *  whichever process happened to start it must never reach other clients'
- *  agent shells (credential mixing + silent expiry breakage). */
-const TASK_SCOPED_ENV = /^(MULTICA_|SSH_AUTH_SOCK$|SSH_AGENT_PID$|SSH_CONNECTION$|SSH_CLIENT$)/;
-
-/** Broker-mode env: everything except task-scoped credentials. */
-export function brokerBaseEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const out: NodeJS.ProcessEnv = {};
-  for (const [key, value] of Object.entries(base)) {
-    if (!TASK_SCOPED_ENV.test(key)) out[key] = value;
-  }
-  return out;
-}
-
 export async function runtimeEnvWithProfile(base: NodeJS.ProcessEnv): Promise<NodeJS.ProcessEnv> {
   try {
     const pins = loadDesktopChildEnvWithRefresh();
@@ -176,9 +161,7 @@ export class ZServerBackend implements BridgeBackend {
           attach,
           // The broker is launched detached (outlives this bridge) and reclaims
           // itself once every client has been gone for a while.
-          launch: autoBroker
-            ? () => spawnBrokerDetached(socketPath, brokerBaseEnv(process.env))
-            : undefined,
+          launch: autoBroker ? () => spawnBrokerDetached(socketPath, process.env) : undefined,
         });
         attached = true;
       } catch (error) {

@@ -289,11 +289,11 @@ projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
 应用、被限制文件写入的 agent、仅能 exec 的工具子进程）是本特性真正防御
 的对象，因为它们本无凭据/执行权，却可能借 broker 或 profile 获得。
 
-- **broker 是 confused deputy 的天然候选**：共享 server 的
+- **broker 不限制 (channel, method/event)**：共享 server 的
   ServiceCollection 暴露 credential.load、terminal._、file._、git.* 等全部
-  服务。broker 因此**只转发** bridge 实际使用的 (channel, method/event)
-  白名单（`BROKER_ALLOWED_CALLS/EVENTS`），header 先经 `validateClientHeader`
-  严格校验（形状、numeric id、请求类型 100..103）。
+  服务，任何能连上 socket 的同 uid 进程都可以调用。原有的
+  `BROKER_ALLOWED_CALLS/EVENTS` 白名单已移除；header 仍经 `validateClientHeader`
+  校验形状（numeric id、请求类型 100..103），会话归属检查保持不变。
   - **拒绝语义**：格式良好但被策略拒绝的请求（如 `credential.load`）由 broker
     回一个 202 错误帧（`broker: … not allowed through the broker`，携带客户端
     自己的 id），客户端能读到原因；**只有无法解码/没有可回复 id 的帧才断开**。
@@ -401,9 +401,9 @@ projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
   bridge 悄悄回退到私有 server）。
 - **宿主进程识别收紧**：comm 仅接受 `zcode-host-loca`/`zcode-host-remo`
   精确截断，全名仅匹配 argv[0]（原先任一 argv token 即可冒充宿主）。
-- **broker 的 spawn env 去除任务级凭据**（`MULTICA_*`、SSH agent 变量）：
-  broker 是机器级共享守护，继承启动者任务的令牌会让所有客户端 agent shell
-  带着别人的凭据。直连模式保持原语义（daemon 注入的任务凭据是设计需要）。
+- **broker 的 spawn env 不做任何过滤**：`MULTICA_*` 等变量原样透传，否则 agent
+  shell 里的 `multica` CLI 会因缺少任务级 `MULTICA_TOKEN` 而失败。代价：broker
+  是机器级共享守护，会带着拉起者的环境变量。
 - profile export 以 `O_NOFOLLOW` + `fchmod` 写入，不跟随预置符号链接。
 - 每客户端入站缓冲上限默认 8MB（`replaceHeader` 对大帧有线性放大）。
 - 未覆盖/UNVERIFIED：profile 文件本身无完整性绑定（每次 spawn 仍应优先
@@ -470,7 +470,7 @@ projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
 
 | 变量                                       | 作用                                                                                         | 默认                                   |
 | ------------------------------------------ | -------------------------------------------------------------------------------------------- | -------------------------------------- |
-| `ZCODE_ACP_BACKEND`                        | `direct` 回到旧的 app-server 子进程后端（无法识别的值告警并用 direct）                       | zserver                                |
+| `ZCODE_ACP_BACKEND`                        | `thin` 直接拉起 zcode-cli、env 原样透传；`zserver` 走共享 broker；`direct` 旧的桌面 profile 后端（无法识别的值告警并用 direct） | thin                                   |
 | `ZCODE_ACP_ZSERVER_SOCKET`                 | **客户端 attach 与 broker bind 共用**的 socket 路径；`off` 关闭共享（每 bridge 私有 server） | `$XDG_RUNTIME_DIR/zserver-broker.sock` |
 | `ZCODE_ACP_ZSERVER_IDLE_MS`                | 无会话监听且无在途请求 N ms 后回收 server 子进程                                             | 0（关闭）                              |
 | `ZCODE_ACP_ZSERVER_TURN_QUIESCE_MS`        | terminal 后等流静默的宽限                                                                    | 300                                    |
@@ -499,7 +499,12 @@ spawn server。
 各会话互不可见；而要求用户配 `ZCODE_ACP_BACKEND`/`ZCODE_ACP_ZSERVER_SOCKET` 等于
 默认不共享（实测 4 个 bridge 各有一个私有 server、socket 文件不存在）。
 
-- **默认后端是 zserver**（`ZCODE_ACP_BACKEND=direct` 回到旧路径）。`server.ts` 构造
+- **默认后端是 thin**（`ZCODE_ACP_BACKEND` 未设或 `thin`）：zcode-acp 直接拉起 `zcode app-server --stdio`，无 broker、
+  无 zcode-server；子进程拿到 zcode-acp 的完整 `process.env`（每个任务各自的
+  `MULTICA_TOKEN` 等能到达 agent shell），再按 zcode-server 的构造方式覆盖 profile 键
+  （`ZCODE_RUNTIME_ENV`/`ZCODE_BASE_URL`/provider 配置路径/bfs·rg·ugrep）与 8 个基础键
+  的缺省值（`src/backend/thin-env.ts`）。不读桌面 profile、不注入凭据。
+- **zserver 需显式开启**（`ZCODE_ACP_BACKEND=zserver`；`direct` 回到旧路径）。`server.ts` 构造
   `ZServerBackend` 时传 `autoBroker: true`；直接 `new ZServerBackend()`（测试、工具）
   默认不碰真实 broker。
 - **attach 顺序**：显式 `ZCODE_ACP_ZSERVER_SOCKET` → 否则默认路径 → 失败回退私有
@@ -510,7 +515,7 @@ spawn server。
   请求一次）；同进程 5s 节流。
 - **生命周期（为什么 A 退出不会带走 B 正在用的 broker）**：broker 由 `detached: true`
   新会话拉起，stdio 指向 socket 旁的 `zserver-broker.log`，`unref()`，**不是**拉起者的
-  子进程；`brokerBaseEnv` 剥掉 `MULTICA_*`/`SSH_*` 这类任务级凭据。A 退出、A 所在进程组被
+  子进程；env 原样继承自拉起者。A 退出、A 所在进程组被
   杀、编辑器关闭都不影响它。回收靠**空闲退出而非属主**：自动拉起时默认
   `ZCODE_ACP_ZSERVER_BROKER_IDLE_EXIT_MS=10min`，`onClient` 取消待触发计时器，最后一个
   客户端断开才重新计时——只要还有任何 bridge 连着，broker 就不会退出。

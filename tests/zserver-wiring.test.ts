@@ -7,12 +7,7 @@ import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import {
-  BROKER_ALLOWED_CALLS,
-  BROKER_ALLOWED_EVENTS,
-  validateClientHeader,
-  ZServerBroker,
-} from "../src/backend/zserver/broker.js";
+import { validateClientHeader, ZServerBroker } from "../src/backend/zserver/broker.js";
 import { TurnCompletionGate, ZServerBackend } from "../src/backend/zserver/backend.js";
 import {
   ChannelClient,
@@ -254,39 +249,6 @@ describe("group A: survivors of the requested list", () => {
 // Group B — broker security wiring
 // ---------------------------------------------------------------------------
 describe("group B: broker security", () => {
-  it("[X7,X15,X16] the allowlist is EXACTLY this literal surface (a widening/narrowing must be deliberate)", () => {
-    const sorted = (table: Readonly<Record<string, ReadonlySet<string>>>) =>
-      Object.fromEntries(Object.entries(table).map(([k, v]) => [k, [...v].sort()]));
-    expect(sorted(BROKER_ALLOWED_CALLS)).toEqual({
-      "zcode-agent": [
-        "createSession",
-        "readSession",
-        "sendPrompt",
-        "setMode",
-        "setModel",
-        "setThoughtLevel",
-        "subscribeConversationV4",
-        "unsubscribeConversationV4",
-      ],
-      // No closeTask: the server binds no task to its creator (cross-client close).
-      // goalSession/compactSession (and setModel/setMode/setThoughtLevel above) mutate a
-      // session, so the broker only forwards them for the session's owner.
-      "zcode-task": [
-        "compactSession",
-        "createTask",
-        "goalSession",
-        "listTasks",
-        "resumeTask",
-        "stopGeneration",
-      ],
-    });
-    expect(sorted(BROKER_ALLOWED_EVENTS)).toEqual({
-      // No prefs-request event: only the broker's own connection listens for it.
-      "zcode-agent": ["onDynamicConversationFrame", "onDynamicSessionEvent"],
-      "zcode-task": ["onDynamicTaskTerminalOutcome"],
-    });
-  });
-
   it("[M6] client-routed ids never collide with the broker's OWN request ids on the shared wire", async () => {
     // The broker's own ChannelClient (runtime-preferences listen + respond) allocates
     // from 0 on the same connection the clients are multiplexed onto. If routed ids
@@ -321,46 +283,6 @@ describe("group B: broker security", () => {
       expect(routed.filter((r) => ownIds.has(idOf(r)))).toEqual([]);
     } finally {
       client.dispose();
-      await broker.stop();
-    }
-  });
-
-  it("[X22] a rejected client frame is ANSWERED with a readable error and never forwarded to the shared server", async () => {
-    const { root, rec, sock } = stage();
-    vi.stubEnv("ZSERVER_FAKE_RECORD_FILE", rec);
-    const broker = new ZServerBroker(sock, root);
-    await broker.start();
-    const legit = await ZServerConnection.attach({ socketPath: sock, clientId: "legit" });
-    try {
-      // Non-vacuity: the recorder does see frames the broker forwards.
-      await legit.channelOf("zcode-task").call("listTasks");
-      expect(callsOf(rec).map((c) => c.method)).toContain("listTasks");
-
-      // A second, hostile client sends a forbidden call and reads the reply.
-      const raw = connect(sock);
-      await new Promise<void>((resolve, reject) => {
-        raw.once("connect", resolve);
-        raw.once("error", reject);
-      });
-      const replies: Array<{ header: unknown[]; body: unknown }> = [];
-      const decoder = new FrameDecoder((payload) => {
-        const message = decodeMessage(payload);
-        replies.push({ header: message.header as unknown[], body: message.body });
-      });
-      raw.on("data", (chunk: Buffer) => decoder.push(chunk));
-      raw.write(encodeFrame(encodeMessage([100, 7, "credential", "load"], ["placeholder"])));
-      expect(await until(() => replies.some((r) => r.header[0] === 202))).toBe(true);
-      const reply = replies.find((r) => r.header[0] === 202)!;
-      expect(reply.header[1]).toBe(7);
-      expect((reply.body as { message: string }).message).toMatch(/credential\.load.*not allowed/);
-
-      // Ordering barrier: the server handles stdin sequentially, so once this echo
-      // returns, anything the broker forwarded earlier has already been recorded.
-      await legit.channelOf("zcode-task").call("listTasks");
-      expect(callsOf(rec).filter((c) => c.channel === "credential")).toEqual([]);
-      raw.destroy();
-    } finally {
-      legit.dispose();
       await broker.stop();
     }
   });
@@ -415,16 +337,9 @@ describe("group B: broker security", () => {
     }
   });
 
-  it("[X6,X11] the shared server never inherits task-scoped credentials from the broker's env", async () => {
+  it("the shared server inherits the broker's full env, MULTICA_* included", async () => {
     const { root, rec, sock } = stage();
-    const scoped = [
-      "MULTICA_AUDIT_SENTINEL",
-      "SSH_AUTH_SOCK",
-      "SSH_AGENT_PID",
-      "SSH_CONNECTION",
-      "SSH_CLIENT",
-    ];
-    for (const name of scoped) vi.stubEnv(name, "audit-placeholder");
+    vi.stubEnv("MULTICA_AUDIT_SENTINEL", "audit-placeholder");
     vi.stubEnv("ZSERVER_FAKE_RECORD_FILE", rec);
     const broker = new ZServerBroker(sock, root);
     await broker.start();
@@ -432,8 +347,8 @@ describe("group B: broker security", () => {
     try {
       expect(await until(() => startupPids(rec).length > 0)).toBe(true);
       const keys = readRecs(rec).find((r) => r.startup)!.envKeys!;
-      expect(keys).toContain("ZSERVER_FAKE_RECORD_FILE"); // non-vacuity: env does flow through
-      expect(keys.filter((k) => scoped.includes(k))).toEqual([]);
+      expect(keys).toContain("ZSERVER_FAKE_RECORD_FILE");
+      expect(keys).toContain("MULTICA_AUDIT_SENTINEL");
     } finally {
       client.dispose();
       await broker.stop();

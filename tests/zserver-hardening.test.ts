@@ -892,58 +892,6 @@ describe("broker startup and shutdown safety", () => {
   });
 });
 
-describe("an allowlist rejection is readable and does not look like a server death", () => {
-  // Field evidence (E1/E2 on the previous snapshot): dropping one allowlisted
-  // call made the broker cut the socket; the client saw "backend reader exited",
-  // ran its heal loop against the same rejection forever, and the bridge shut
-  // itself down with exit code 0. The rejection must now name itself.
-  it("ZServerBackend gets a 'broker:' error, stays alive, and the broker keeps the connection", async () => {
-    const { BROKER_ALLOWED_CALLS } = await import("../src/backend/zserver/broker.js");
-    const tasksAllowed = BROKER_ALLOWED_CALLS["zcode-task"] as Set<string>;
-    tasksAllowed.delete("listTasks");
-    cleanups.push(() => {
-      tasksAllowed.add("listTasks");
-    });
-
-    const socketPath = path.join(
-      os.tmpdir(),
-      `zhard-rej-${process.pid}-${Math.random().toString(36).slice(2)}.sock`,
-    );
-    cleanups.push(() => fs.rmSync(socketPath, { force: true }));
-    const broker = new ZServerBroker(socketPath, makeRoot());
-    await broker.start();
-    cleanups.push(() => broker.stop());
-    withEnv({ ZCODE_ACP_ZSERVER_SOCKET: socketPath });
-
-    const backend = new ZServerBackend({ serverRoot: makeRoot() });
-    cleanups.push(() => backend.close());
-    const first = await backend.request(1, "session/list", {});
-
-    expect(first.error?.message).toMatch(/^broker: .*zcode-task\.listTasks.*not allowed/);
-    // Not classified as infrastructure death: no heal loop, no bridge shutdown.
-    expect(first.error?.message).not.toMatch(/backend reader exited/);
-    expect(backend.isDead).toBe(false);
-    expect(backend.deathReason).toBeNull();
-    expect(broker.stats().clients).toBe(1);
-    expect(broker.stats().rejected).toBe(1);
-
-    // The same connection keeps working for allowed calls afterwards.
-    const created = await backend.request(2, "session/create", {
-      workspace: { workspacePath: "/tmp/ws-after-reject" },
-    });
-    expect(created.error).toBeUndefined();
-    expect(backend.isDead).toBe(false);
-    expect(broker.stats().clients).toBe(1);
-  }, 30000);
-
-  it("a rejection is not swallowed by the supervision classifiers", async () => {
-    const { isBackendDeadMessage } = await import("../src/backend/supervise.js");
-    expect(
-      isBackendDeadMessage("broker: call zcode-task.listTasks is not allowed through the broker"),
-    ).toBe(false);
-  });
-});
-
 describe("V4 conversation subscriptions are released on the server", () => {
   // Field evidence (real server): an EventDispose (103) stops OUR delivery but the
   // server keeps the V4 subscription OWNED until unsubscribeConversationV4 names
@@ -1121,56 +1069,6 @@ describe("V4 conversation subscriptions are released on the server", () => {
     await call;
     expect(await until(() => unsubLines().length === 1, 6000)).toBe(true);
   }, 20000);
-});
-
-describe("least privilege on the broker allowlist", () => {
-  it("does not expose closeTask (the server binds no task to its creator: cross-client close)", async () => {
-    const { BROKER_ALLOWED_CALLS, validateClientHeader } =
-      await import("../src/backend/zserver/broker.js");
-    expect(BROKER_ALLOWED_CALLS["zcode-task"]!.has("closeTask")).toBe(false);
-    expect(validateClientHeader([100, 1, "zcode-task", "closeTask"]).ok).toBe(false);
-  });
-
-  it("does not let attach clients listen for runtime-preferences requests (the broker alone answers)", async () => {
-    const { BROKER_ALLOWED_EVENTS, validateClientHeader } =
-      await import("../src/backend/zserver/broker.js");
-    expect(
-      BROKER_ALLOWED_EVENTS["zcode-agent"]!.has("onDynamicSessionRuntimePreferencesRequest"),
-    ).toBe(false);
-    expect(
-      validateClientHeader([102, 1, "zcode-agent", "onDynamicSessionRuntimePreferencesRequest"]).ok,
-    ).toBe(false);
-  });
-
-  it("still allows everything ZServerBackend really emits in attach mode", async () => {
-    const { BROKER_ALLOWED_CALLS, BROKER_ALLOWED_EVENTS } =
-      await import("../src/backend/zserver/broker.js");
-    for (const call of [
-      ["zcode-agent", "createSession"],
-      ["zcode-agent", "readSession"],
-      ["zcode-agent", "sendPrompt"],
-      ["zcode-agent", "subscribeConversationV4"],
-      ["zcode-agent", "unsubscribeConversationV4"],
-      ["zcode-agent", "setModel"],
-      ["zcode-agent", "setMode"],
-      ["zcode-agent", "setThoughtLevel"],
-      ["zcode-task", "createTask"],
-      ["zcode-task", "listTasks"],
-      ["zcode-task", "stopGeneration"],
-      ["zcode-task", "resumeTask"],
-      ["zcode-task", "goalSession"],
-      ["zcode-task", "compactSession"],
-    ] as const) {
-      expect(BROKER_ALLOWED_CALLS[call[0]]!.has(call[1]), call.join(".")).toBe(true);
-    }
-    for (const event of [
-      ["zcode-agent", "onDynamicConversationFrame"],
-      ["zcode-agent", "onDynamicSessionEvent"],
-      ["zcode-task", "onDynamicTaskTerminalOutcome"],
-    ] as const) {
-      expect(BROKER_ALLOWED_EVENTS[event[0]]!.has(event[1]), event.join(".")).toBe(true);
-    }
-  });
 });
 
 describe("session-mutating calls are owner-guarded on the broker", () => {
@@ -1446,57 +1344,6 @@ describe("untrusted text never floods or forges logs and errors", () => {
     expect(clipped).toContain("[+4700 chars]");
     expect(clipped).not.toMatch(/[\r\n]/);
   });
-
-  it("a rejection reason carrying a huge, newline-laden channel name stays short and single-line", async () => {
-    const { validateClientHeader } = await import("../src/backend/zserver/broker.js");
-    const verdict = validateClientHeader([
-      100,
-      1,
-      `${"x".repeat(100_000)}\n[zcode-acp] zserver-broker: shared server exited (code=0)`,
-      "y\nz",
-    ]);
-    expect(verdict.ok).toBe(false);
-    const reason = verdict.ok ? "" : verdict.reason;
-    expect(reason.length).toBeLessThan(400);
-    expect(reason).not.toMatch(/[\r\n]/);
-    expect(reason).toMatch(/not allowed through the broker$/);
-  });
-
-  it("the broker's always-on warn for a hostile frame is one bounded line", async () => {
-    const socketPath = path.join(
-      os.tmpdir(),
-      `zhard-log-${process.pid}-${Math.random().toString(36).slice(2)}.sock`,
-    );
-    cleanups.push(() => fs.rmSync(socketPath, { force: true }));
-    const broker = new ZServerBroker(socketPath, makeRoot());
-    await broker.start();
-    cleanups.push(() => broker.stop());
-    const writes: string[] = [];
-    const spy = vi
-      .spyOn(process.stderr, "write")
-      .mockImplementation((chunk: string | Uint8Array) => {
-        writes.push(String(chunk));
-        return true;
-      });
-    cleanups.push(() => spy.mockRestore());
-
-    const { connect } = await import("node:net");
-    const { encodeFrame, encodeMessage } = await import("../src/backend/zserver/protocol.js");
-    const raw = connect(socketPath);
-    await new Promise<void>((resolve) => raw.once("connect", resolve));
-    raw.on("error", () => undefined);
-    cleanups.push(() => raw.destroy());
-    raw.write(
-      encodeFrame(
-        encodeMessage([100, 5, `${"z".repeat(200_000)}\nFORGED LINE`, "call"], undefined),
-      ),
-    );
-    expect(await until(() => writes.some((w) => w.includes("frame rejected")))).toBe(true);
-    const line = writes.find((w) => w.includes("frame rejected"))!;
-    expect(line.length).toBeLessThan(500);
-    expect(line.trimEnd()).not.toMatch(/\n/);
-    expect(writes.join("")).not.toContain("FORGED LINE");
-  }, 20000);
 
   it("a server's huge last stderr line is clipped in the exit error the editor sees", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "zserver-hard-stderr-"));

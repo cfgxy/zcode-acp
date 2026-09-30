@@ -11,7 +11,7 @@ import {
   replaceHeader,
 } from "./protocol.js";
 import { clipDiagnostic, ZServerConnection } from "./connection.js";
-import { brokerBaseEnv, runtimeEnvWithProfile } from "./backend.js";
+import { runtimeEnvWithProfile } from "./backend.js";
 import { resolveBrokerSocketPath } from "./socket-path.js";
 
 export { DEFAULT_BROKER_SOCKET, resolveBrokerSocketPath } from "./socket-path.js";
@@ -111,45 +111,6 @@ function maxClientBufferBytes(): number {
 }
 
 /**
- * Broker method allowlist. A broker client speaks raw channel frames straight
- * into ONE shared, already-authenticated zcode-server whose ServiceCollection
- * exposes every service (credential.load, terminal.*, file.*, git.*, …).
- * Forwarding unrestricted frames would make any process able to reach the
- * socket a full confused-deputy of the user's credentials. Only the RPC
- * surface ZServerBackend actually uses is forwarded; everything else is
- * rejected and the offending client disconnected.
- */
-export const BROKER_ALLOWED_CALLS: Readonly<Record<string, ReadonlySet<string>>> = {
-  "zcode-agent": new Set([
-    "createSession",
-    "readSession",
-    "sendPrompt",
-    "subscribeConversationV4",
-    "unsubscribeConversationV4",
-    "setModel",
-    "setMode",
-    "setThoughtLevel",
-  ]),
-  // No closeTask: ZServerBackend never closes server-side tasks, and the server
-  // does not bind a task to its creator — an attached client could close (mark
-  // deleted) another client's session. Add it back only with an owner check.
-  // resumeTask: the revive primitive for session/resume — a persisted-but-
-  // inactive session (server restart/eviction) must be re-hydrated before
-  // readSession can serve it. Deliberately NOT owner-guarded: the resume runs
-  // before subscribeConversationV4, i.e. before any owner has claimed the
-  // session. Same trust level as createTask (it only wakes an existing session,
-  // sends no prompt); the bridge never passes the automation/offPeak params.
-  "zcode-task": new Set([
-    "createTask",
-    "listTasks",
-    "stopGeneration",
-    "resumeTask",
-    "goalSession",
-    "compactSession",
-  ]),
-};
-
-/**
  * Session-mutating calls the broker only forwards for the session's OWNER (see
  * `sessionOwners`), mapped to the body field that names the session. The server
  * binds no session to its creator, so without this check any attached client
@@ -173,12 +134,6 @@ function guardedSessionKey(channel: unknown, name: unknown, body: unknown): stri
   if (typeof workspacePath !== "string" || typeof sessionId !== "string") return "";
   return subscriptionKey(workspacePath, sessionId);
 }
-export const BROKER_ALLOWED_EVENTS: Readonly<Record<string, ReadonlySet<string>>> = {
-  // No onDynamicSessionRuntimePreferencesRequest: only the broker's OWN
-  // connection listens for it (it answers, attach clients must not).
-  "zcode-agent": new Set(["onDynamicConversationFrame", "onDynamicSessionEvent"]),
-  "zcode-task": new Set(["onDynamicTaskTerminalOutcome"]),
-};
 
 /** umask in force while the socket file is created (=> mode 0600 at birth). */
 export const BROKER_BIND_UMASK = 0o177;
@@ -215,8 +170,9 @@ export type HeaderVerdict =
 
 /**
  * Validate a client frame header BEFORE any forwarding/re-encoding: exact shape
- * (bounded array, numeric type in 100..103, integer id), and — for calls and
- * subscriptions — an allowlisted (channel, name). 101/103 carry only [type,id].
+ * (bounded array, numeric type in 100..103, integer id, string channel/name for
+ * calls and subscriptions). 101/103 carry only [type,id]. Which (channel, name)
+ * pairs a client may use is NOT restricted.
  */
 export function validateClientHeader(header: unknown): HeaderVerdict {
   if (!Array.isArray(header) || header.length < 2 || header.length > 4) {
@@ -238,18 +194,6 @@ export function validateClientHeader(header: unknown): HeaderVerdict {
   }
   if (header.length !== 4 || typeof channel !== "string" || typeof name !== "string") {
     return { ok: false, reason: "call/listen header must be [type,id,channel,name]" };
-  }
-  const table = type === 100 ? BROKER_ALLOWED_CALLS : BROKER_ALLOWED_EVENTS;
-  // Own-property lookup: the tables are plain objects, so a bare index would
-  // resolve "__proto__"/"constructor"/"toString" to inherited members and
-  // `?.has` would then throw on a non-Set — killing the broker from one frame.
-  const allowed = Object.hasOwn(table, channel) ? table[channel] : undefined;
-  if (!allowed?.has(name)) {
-    return {
-      ok: false,
-      reason: `${type === 100 ? "call" : "event"} ${clipDiagnostic(channel, 80)}.${clipDiagnostic(name, 80)} is not allowed through the broker`,
-      replyTo: id,
-    };
   }
   return { ok: true };
 }
@@ -505,7 +449,7 @@ export class ZServerBroker {
           // operator here while the bridge honoured the operator.
           serverRoot: this.serverRoot ?? process.env.ZCODE_SERVER_RUNTIME_ROOT,
           clientId: "zserver-broker",
-          env: await runtimeEnvWithProfile(brokerBaseEnv(process.env)),
+          env: await runtimeEnvWithProfile(process.env),
         });
         connection.onExit((code, signal) => {
           warn(

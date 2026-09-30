@@ -5,11 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { isTrustedPinPath, sanitizeDesktopEnv } from "../src/desktop-profile.js";
-import {
-  BROKER_ALLOWED_CALLS,
-  validateClientHeader,
-  ZServerBroker,
-} from "../src/backend/zserver/broker.js";
+import { validateClientHeader, ZServerBroker } from "../src/backend/zserver/broker.js";
 import { personalProviderConfigPath } from "../src/config/personal-provider.js";
 import {
   decodeMessage,
@@ -26,41 +22,24 @@ afterEach(() => {
   for (const s of sockets.splice(0)) fs.rmSync(s, { force: true });
 });
 
-describe("broker header validation (confused-deputy allowlist)", () => {
-  it("allows exactly the RPC surface the bridge uses", () => {
-    for (const [channel, methods] of Object.entries(BROKER_ALLOWED_CALLS)) {
-      for (const method of methods) {
-        expect(validateClientHeader([100, 1, channel, method]).ok).toBe(true);
-      }
-    }
-    expect(validateClientHeader([102, 2, "zcode-agent", "onDynamicConversationFrame"]).ok).toBe(
-      true,
-    );
-    expect(validateClientHeader([103, 2]).ok).toBe(true);
-    expect(validateClientHeader([101, 2]).ok).toBe(true);
-  });
-
-  it("rejects credential/terminal/file/git and every non-allowlisted method", () => {
+describe("broker header validation", () => {
+  it("does not restrict which (channel, name) a well-formed header names", () => {
     for (const [channel, method] of [
+      ["zcode-agent", "createSession"],
+      ["zcode-task", "resumeTask"],
       ["credential", "load"],
       ["terminal", "create"],
       ["file", "readFile"],
       ["git", "commit"],
-      ["setting", "get"],
-      ["zcode-agent", "disposeAll"],
-      ["zcode-task", "enqueueTaskCommand"],
     ] as const) {
-      const verdict = validateClientHeader([100, 1, channel, method]);
-      expect(verdict.ok, `${channel}.${method}`).toBe(false);
+      expect(validateClientHeader([100, 1, channel, method]).ok, `${channel}.${method}`).toBe(true);
     }
-    expect(validateClientHeader([102, 1, "credential", "onDidMutate"]).ok).toBe(false);
-  });
-
-  it("forwards the session-resume revive primitive (zcode-task.resumeTask)", () => {
-    // session/resume must be able to revive a persisted-but-inactive session
-    // through the broker — removing this from the allowlist breaks resume
-    // across server restarts with a 202 policy rejection.
-    expect(validateClientHeader([100, 1, "zcode-task", "resumeTask"]).ok).toBe(true);
+    expect(validateClientHeader([102, 2, "zcode-agent", "onDynamicConversationFrame"]).ok).toBe(
+      true,
+    );
+    expect(validateClientHeader([102, 1, "credential", "onDidMutate"]).ok).toBe(true);
+    expect(validateClientHeader([103, 2]).ok).toBe(true);
+    expect(validateClientHeader([101, 2]).ok).toBe(true);
   });
 
   it("rejects malformed shapes that would bypass id rewriting", () => {
@@ -137,81 +116,6 @@ describe("broker header validation (confused-deputy allowlist)", () => {
     }
     return cond();
   };
-
-  it("answers a forbidden call with a readable 202 error and keeps the client attached", async () => {
-    await withBroker(async (broker, socketPath) => {
-      const client = await rawClient(socketPath);
-      client.send([100, 7, "credential", "load"], ["zcodejwttoken"]);
-      expect(await untilTrue(() => client.frames.some((f) => f.header[0] === 202))).toBe(true);
-      const reply = client.frames.find((f) => f.header[0] === 202)!;
-      // The reply carries the CLIENT's id (not a broker-internal one) and names the reason.
-      expect(reply.header[1]).toBe(7);
-      expect((reply.body as { message: string }).message).toMatch(/credential\.load.*not allowed/);
-      expect(client.closed()).toBe(false);
-      expect(broker.stats().clients).toBe(1);
-      expect(broker.stats().rejected).toBe(1);
-      client.destroy();
-    });
-  });
-
-  it("keeps answering a client that is rejected over and over (a cut-off reads as server death)", async () => {
-    await withBroker(async (broker, socketPath) => {
-      const client = await rawClient(socketPath);
-      expect(await untilTrue(() => client.frames.length > 0)).toBe(true);
-      // Far past the old 5-violation cutoff: every one must still get its own reply.
-      for (let i = 0; i < 25; i++) client.send([100, 100 + i, "terminal", "create"], []);
-      expect(
-        await untilTrue(() => client.frames.filter((f) => f.header[0] === 202).length === 25),
-      ).toBe(true);
-      const ids = client.frames.filter((f) => f.header[0] === 202).map((f) => f.header[1]);
-      expect(ids).toEqual(Array.from({ length: 25 }, (_, i) => 100 + i));
-      expect(client.closed()).toBe(false);
-      expect(broker.stats().clients).toBe(1);
-      expect(broker.stats().rejected).toBe(25);
-      // ...and a legitimate request on the same connection still works.
-      client.send([100, 900, "zcode-task", "listTasks"], undefined);
-      expect(
-        await untilTrue(() =>
-          client.frames.some((f) => f.header[0] === 201 && f.header[1] === 900),
-        ),
-      ).toBe(true);
-      client.destroy();
-    });
-  });
-
-  it("survives EVERY Object.prototype property name as a channel (one frame must not kill the daemon)", async () => {
-    // Regression: table[channel]?.has threw a TypeError for "__proto__" /
-    // "constructor" / "toString" …, escaping a `void` promise as an
-    // unhandledRejection that terminated the whole shared broker.
-    const names = Object.getOwnPropertyNames(Object.prototype);
-    expect(names).toContain("__proto__");
-    for (const name of names) {
-      expect(validateClientHeader([100, 1, name, "x"]).ok, `call ${name}`).toBe(false);
-      expect(validateClientHeader([102, 1, name, "x"]).ok, `event ${name}`).toBe(false);
-    }
-    await withBroker(async (broker, socketPath) => {
-      const attacker = await rawClient(socketPath);
-      const bystander = await rawClient(socketPath);
-      // Both must be attached (Initialize received) before the hostile frames.
-      expect(await untilTrue(() => attacker.frames.length > 0 && bystander.frames.length > 0)).toBe(
-        true,
-      );
-      for (const [i, name] of [
-        "__proto__",
-        "constructor",
-        "toString",
-        "hasOwnProperty",
-      ].entries()) {
-        attacker.send([100, i, name, "x"], undefined);
-      }
-      bystander.send([100, 1, "zcode-task", "listTasks"], undefined);
-      // The broker is alive and still routes for the bystander.
-      expect(await untilTrue(() => bystander.frames.some((f) => f.header[0] === 201))).toBe(true);
-      expect(broker.stats().clients).toBeGreaterThanOrEqual(1);
-      attacker.destroy();
-      bystander.destroy();
-    });
-  });
 
   it("caps outstanding requests per client instead of growing its id maps without bound", async () => {
     process.env.ZCODE_ACP_ZSERVER_MAX_PENDING = "3";
@@ -348,20 +252,5 @@ describe("API-key write target confinement", () => {
       ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: link,
     } as NodeJS.ProcessEnv);
     expect(resolved).toBe(path.join(os.homedir(), ".zcode", "v2", "provider_config.json"));
-  });
-});
-
-describe("broker spawn env hygiene", () => {
-  it("strips task-scoped credentials (MULTICA_*, SSH agent) but keeps ordinary env", async () => {
-    const { brokerBaseEnv } = await import("../src/backend/zserver/backend.js");
-    const scrubbed = brokerBaseEnv({
-      PATH: "/usr/bin",
-      HOME: "/home/u",
-      MULTICA_TOKEN: "secret-task-token",
-      MULTICA_TASK_ID: "t-1",
-      SSH_AUTH_SOCK: "/tmp/agent.sock",
-      ZCODE_ENV: "production",
-    });
-    expect(scrubbed).toEqual({ PATH: "/usr/bin", HOME: "/home/u", ZCODE_ENV: "production" });
   });
 });

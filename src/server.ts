@@ -15,6 +15,7 @@ import {
   ZcodeBackend,
   type BridgeBackend,
 } from "./backend/index.js";
+import { buildThinBackendEnv } from "./backend/thin-env.js";
 import { ZServerBackend } from "./backend/zserver/backend.js";
 import { loadDesktopChildEnvWithRefresh } from "./desktop-profile.js";
 import { BackgroundTaskListener } from "./handlers/background-tasks.js";
@@ -244,20 +245,32 @@ export class ZcodeAcpServer {
     // failed in-place respawn would otherwise split them from the replacement.
     if (this.backend && (!this.backend.isDead || this.backend.healsInPlace)) return this.backend;
     const backendChoice = process.env.ZCODE_ACP_BACKEND?.trim();
-    if (backendChoice && backendChoice.toLowerCase() !== "zserver" && backendChoice !== "direct") {
+    const choice = backendChoice?.toLowerCase();
+    if (backendChoice && choice !== "zserver" && choice !== "thin" && backendChoice !== "direct") {
       // A typo here silently flips the identity/billing path to the direct
       // backend — say so once instead of failing open in silence.
       warn(
-        `ZCODE_ACP_BACKEND="${backendChoice}" not recognized (zserver|direct) — using direct backend`,
+        `ZCODE_ACP_BACKEND="${backendChoice}" not recognized (zserver|thin|direct) — using direct backend`,
       );
     }
-    // zserver is the default; `ZCODE_ACP_BACKEND=direct` opts back into the
-    // app-server subprocess. It shares one auto-launched broker (ADR-0008).
-    if (!backendChoice || backendChoice.toLowerCase() === "zserver") {
+    // thin is the default (unset or "thin"). `ZCODE_ACP_BACKEND=zserver` opts
+    // into the shared auto-launched broker (ADR-0008); `direct` into the
+    // desktop-profile app-server subprocess.
+    if (choice === "zserver") {
       this.backend = new ZServerBackend({
         serverRoot: process.env.ZCODE_SERVER_RUNTIME_ROOT,
         autoBroker: true,
       });
+      return this.backend;
+    }
+    // thin: spawn the app-server directly with zcode-acp's own env unchanged
+    // (per-task MULTICA_* survive), plus the profile/base keys built the way
+    // zcode-server builds them. No broker, no desktop profile, no credentials.
+    if (!choice || choice === "thin") {
+      const thinEnv = buildThinBackendEnv();
+      this.backend = new ZcodeBackend(resolveZcodeCommand(thinEnv), thinEnv, () =>
+        buildThinBackendEnv(),
+      );
       return this.backend;
     }
     const profileEnv = loadDesktopChildEnvWithRefresh();
