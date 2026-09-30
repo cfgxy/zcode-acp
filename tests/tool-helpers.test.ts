@@ -67,6 +67,97 @@ describe("extractExitCode", () => {
     expect(extractExitCode("ok")).toBe(0);
     expect(extractExitCode(null)).toBe(0);
   });
+
+  it("parses the exact zcode 0.16.9 string payload 'Exit code N'", () => {
+    // Real 0.16.9 failure shape (QA r3 probe, zcode_part_exit3.jsonl): the
+    // WHOLE result is the plain string "Exit code 3" — no perf/success
+    // fields, event still labelled completed.
+    expect(extractExitCode("Exit code 3")).toBe(3);
+    expect(extractExitCode("Exit code 127")).toBe(127);
+    expect(extractExitCode("Exit code 1")).toBe(1);
+    expect(extractExitCode("Exit code 0")).toBe(0);
+  });
+
+  it("keeps anchored matching: surrounding text or trailing newline never reads as failure", () => {
+    // echo "Exit code 3" emits a trailing newline — a SUCCESS shape the
+    // anchored match must not convert into a failure; same for the sentinel
+    // embedded inside larger output.
+    expect(extractExitCode("Exit code 3\n")).toBe(0);
+    expect(extractExitCode("prefix\nExit code 3")).toBe(0);
+    expect(extractExitCode("Exit code 3 (state.status=completed)")).toBe(0);
+    expect(extractExitCode("exit code 3")).toBe(0);
+    expect(extractExitCode("Exit code: 3")).toBe(0);
+    // Registered in-band boundary: a command whose ENTIRE output is exactly
+    // "Exit code 3" (e.g. printf without newline) is indistinguishable from
+    // the failure sentinel — the anchored match deliberately resolves it as
+    // a failure.
+  });
+
+  it("reads perf.detail.command.exitCode — the real 0.16.9 result shape", () => {
+    // Verbatim payloads captured by the r3 isolated probe against real
+    // zcode 0.16.9 (bridge-level session/event tool result). The landmine:
+    // `success` stays TRUE for a failed command — the exit code lives
+    // nested at perf.detail.command.exitCode, with status:"failed" alongside.
+    const failed = {
+      success: true,
+      content: "Exit code 3",
+      perf: {
+        totalMs: 2048,
+        detail: {
+          kind: "command",
+          command: {
+            runMs: 1867,
+            noOutputMs: 1867,
+            exitCode: 3,
+            timedOut: false,
+            outputBytes: 0,
+            category: "other",
+            count: 1,
+            name: "other",
+            status: "failed",
+            hash: "24688a57dbe66df2",
+          },
+        },
+      },
+      truncated: false,
+      originalBytes: 11,
+      returnedBytes: 11,
+      budgetStrategy: "artifact",
+    };
+    expect(extractExitCode(failed)).toBe(3);
+    const ok = {
+      success: true,
+      content: "ok",
+      perf: {
+        totalMs: 4101,
+        detail: {
+          kind: "command",
+          command: {
+            runMs: 3957,
+            noOutputMs: 3957,
+            exitCode: 0,
+            timedOut: false,
+            outputBytes: 3,
+            category: "other",
+            count: 1,
+            name: "echo",
+            status: "completed",
+            hash: "290ab66316e211b0",
+          },
+        },
+      },
+      truncated: false,
+      originalBytes: 2,
+      returnedBytes: 2,
+      budgetStrategy: "artifact",
+    };
+    expect(extractExitCode(ok)).toBe(0);
+  });
+
+  it("falls back to perf.detail.command.status when exitCode is absent", () => {
+    expect(extractExitCode({ perf: { detail: { command: { status: "failed" } } } })).toBe(1);
+    expect(extractExitCode({ perf: { detail: { command: { status: "completed" } } } })).toBe(0);
+  });
 });
 
 describe("buildDiffContent", () => {
