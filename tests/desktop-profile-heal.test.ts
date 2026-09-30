@@ -3,7 +3,25 @@ import {
   isBackendDeadMessage,
   isDesktopProfileMissingMessage,
   isSessionLostMessage,
+  isStaleAgentClientMessage,
 } from "../src/backend/supervise.js";
+
+describe("isStaleAgentClientMessage", () => {
+  it("matches the server's recycled-client refusal, wrapped or bare", () => {
+    expect(isStaleAgentClientMessage("ZCode Protocol client is disposed")).toBe(true);
+    expect(
+      isStaleAgentClientMessage(
+        'Internal error (code=-32603, data={"details":"ZCode Protocol client is disposed"})',
+      ),
+    ).toBe(true);
+  });
+
+  it("stays distinct from backend death and unrelated errors", () => {
+    expect(isStaleAgentClientMessage("zcode server channel client disposed")).toBe(false);
+    expect(isStaleAgentClientMessage("Session not found: zs_123")).toBe(false);
+    expect(isBackendDeadMessage("ZCode Protocol client is disposed")).toBe(false);
+  });
+});
 
 describe("isDesktopProfileMissingMessage", () => {
   it("matches the verified backend refusal, case-insensitively", () => {

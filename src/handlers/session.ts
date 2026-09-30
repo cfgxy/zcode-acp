@@ -26,6 +26,7 @@ import {
   isBackendDeadMessage,
   isDesktopProfileMissingMessage,
   isSessionLostMessage,
+  isStaleAgentClientMessage,
 } from "../backend/supervise.js";
 import type { ZcodeCreateResult, ZcodeListResult, ZcodeSnapshot } from "../backend/types.js";
 import {
@@ -201,6 +202,12 @@ async function createBackendSessionWithHeal(
   const tryCreate = () =>
     server.ensureBackend().request(server.nextId(), "session/create", createParams, 15000);
   let resp = await tryCreate();
+  // A recycled agent-process client is not a dead backend: the server evicts
+  // the stale entry on detection, so retry once in place before judging.
+  if (resp.error && isStaleAgentClientMessage(resp.error.message ?? "")) {
+    warn(`session/create hit a stale agent client (${resp.error.message}) — retrying`);
+    resp = await tryCreate();
+  }
   if (!resp.error) return (resp.result ?? {}) as ZcodeCreateResult;
   const first = resp.error.message ?? "";
   if (!isBackendDeadMessage(first)) throw new Error(`zcode create failed: ${first}`);

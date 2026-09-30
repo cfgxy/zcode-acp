@@ -122,7 +122,10 @@ function stubCx(): acp.AgentContext {
  * the fake (clears the dead markers) instead of spawning a real process, and
  * counts restarts.
  */
-function setup(backend: ZcodeBackend, revive: () => void): { server: ZcodeAcpServer; restarts: () => number } {
+function setup(
+  backend: ZcodeBackend,
+  revive: () => void,
+): { server: ZcodeAcpServer; restarts: () => number } {
   const server = new ZcodeAcpServer();
   server.backend = backend;
   let restartCount = 0;
@@ -180,9 +183,10 @@ describe("backend self-heal: mid-turn death (P3)", () => {
 
 describe("backend self-heal: session lost (P3 terminal case)", () => {
   it("② prefixes a Session-not-found resume failure with zcode_session_lost (no restart)", async () => {
-    const { backend, calls, revive } = fakeBackend([], [
-      { error: { code: -32603, message: "Session not found: zs_lost" } },
-    ]);
+    const { backend, calls, revive } = fakeBackend(
+      [],
+      [{ error: { code: -32603, message: "Session not found: zs_lost" } }],
+    );
     const { server, restarts } = setup(backend, revive);
     server.registerSession("sess_lost", "zs_lost");
 
@@ -202,11 +206,14 @@ describe("backend self-heal: session lost (P3 terminal case)", () => {
   it("classifies zcode_session_lost when the session dies WITH the backend and cannot be reloaded", async () => {
     // Resume hits a dead backend → heal restarts it → the reload finds the
     // session file gone → classified terminal error, not a retry loop.
-    const { backend, revive } = fakeBackend([], [
-      { error: { message: DEAD_MSG } }, // initial resume: backend dead
-      { error: { code: -32603, message: "Session not found: zs_gone" } }, // post-restart reload
-      { error: { code: -32603, message: "Session not found: zs_gone" } }, // (overlay retry, same answer)
-    ]);
+    const { backend, revive } = fakeBackend(
+      [],
+      [
+        { error: { message: DEAD_MSG } }, // initial resume: backend dead
+        { error: { code: -32603, message: "Session not found: zs_gone" } }, // post-restart reload
+        { error: { code: -32603, message: "Session not found: zs_gone" } }, // (overlay retry, same answer)
+      ],
+    );
     const { server, restarts } = setup(backend, revive);
     server.registerSession("sess_gone", "zs_gone");
 
@@ -258,5 +265,102 @@ describe("backend self-heal: create path (P4)", () => {
 
     expect(sid).toBe("zs_new");
     expect(createCount).toBe(2);
+  });
+});
+
+/**
+ * RUYI-318: the desktop recycles an agent process (request timeout / workspace
+ * dispose / app exit) while the server is mid-create, so `session/create` is
+ * refused with "ZCode Protocol client is disposed". The backend itself is alive
+ * and the server has already evicted the stale pool entry, so the bridge must
+ * retry once IN PLACE — no restart, no heal loop.
+ */
+describe("session/create over a recycled agent client (RUYI-318)", () => {
+  const STALE_MSG =
+    'Internal error (code=-32603, data={"details":"ZCode Protocol client is disposed"})';
+
+  /** `script[i]` answers the i-th session/create; exhaustion means success. */
+  function createScript(script: Array<{ message: string } | "ok">) {
+    const calls: Call[] = [];
+    let createCount = 0;
+    const backend = {
+      isDead: false,
+      deathReason: null as string | null,
+      request: async (_id: number, method: string, params: Record<string, unknown>) => {
+        calls.push({ method, params });
+        if (method === "session/create") {
+          const step = script[createCount++] ?? "ok";
+          if (step === "ok") return { result: { session: { sessionId: "zs_new", title: "t" } } };
+          return { error: step };
+        }
+        return { result: {} };
+      },
+      send: () => {},
+      pollServerRequests: () => [],
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+    let restarts = 0;
+    server.restartBackend = async () => {
+      restarts++;
+      return backend;
+    };
+    server.pendingSessions.set("sess_lazy", { cwd: "/tmp" });
+    return { server, creates: () => createCount, restarts: () => restarts, calls };
+  }
+
+  it("retries once in place and succeeds, without restarting the backend", async () => {
+    const { server, creates, restarts } = createScript([{ message: STALE_MSG }, "ok"]);
+
+    await expect(ensureRealSession(server, "sess_lazy")).resolves.toBe("zs_new");
+
+    expect(creates()).toBe(2);
+    expect(restarts()).toBe(0);
+    expect(server.backendHealing).toBe(false);
+  });
+
+  it("retries only once: a second stale refusal surfaces as a plain create failure", async () => {
+    const { server, creates, restarts } = createScript([
+      { message: STALE_MSG },
+      { message: STALE_MSG },
+      "ok",
+    ]);
+
+    await expect(ensureRealSession(server, "sess_lazy")).rejects.toThrow(
+      /^zcode create failed: .*client is disposed/,
+    );
+
+    expect(creates()).toBe(2);
+    // A recycled client is not a dead backend: it must never enter the heal loop.
+    expect(restarts()).toBe(0);
+  });
+
+  it("still heals when the in-place retry finds a genuinely dead backend", async () => {
+    const { server, creates, restarts } = createScript([
+      { message: STALE_MSG },
+      { message: DEAD_MSG },
+      "ok",
+    ]);
+
+    await expect(ensureRealSession(server, "sess_lazy")).resolves.toBe("zs_new");
+
+    expect(creates()).toBe(3);
+    expect(restarts()).toBe(1);
+  });
+
+  it("does not retry an unrelated create error", async () => {
+    const { server, creates, restarts } = createScript([
+      { message: "Provider Registry has no such model" },
+      "ok",
+    ]);
+
+    await expect(ensureRealSession(server, "sess_lazy")).rejects.toThrow(
+      "zcode create failed: Provider Registry has no such model",
+    );
+
+    expect(creates()).toBe(1);
+    expect(restarts()).toBe(0);
   });
 });

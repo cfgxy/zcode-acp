@@ -65,6 +65,18 @@ export function isDesktopProfileMissingMessage(message: string): boolean {
   return /desktop profile missing/i.test(message);
 }
 
+/**
+ * Whether an error means the zcode server picked a cached agent-process
+ * protocol client that had already been recycled (verified shape:
+ * `ZCode Protocol client is disposed`, from the server's assertNotDisposed).
+ * The backend itself is healthy and the server evicts the stale entry when it
+ * notices (isReusableActiveClientEntry), so a plain retry is the right answer —
+ * NOT a backend restart, which would tear down every other session.
+ */
+export function isStaleAgentClientMessage(message: string): boolean {
+  return /protocol client is disposed/i.test(message);
+}
+
 /** Prefix an error message with a stable classification marker. */
 export function classified(prefix: string, message: string): string {
   return message.startsWith(prefix) ? message : `${prefix}: ${message}`;
