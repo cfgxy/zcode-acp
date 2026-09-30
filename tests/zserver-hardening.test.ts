@@ -744,3 +744,508 @@ describe("session/list against the real listTasks shape", () => {
     expect(listCalls[1]!.body).toEqual([{}]);
   }, 20000);
 });
+
+describe("broker startup and shutdown safety", () => {
+  function sockPath(dir: string): string {
+    return path.join(dir, "b.sock");
+  }
+  function tempDir(): string {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zhard-life-"));
+    tempDirs.push(dir);
+    return dir;
+  }
+  async function probe(socketPath: string): Promise<boolean> {
+    const { connect } = await import("node:net");
+    return new Promise((resolve) => {
+      const c = connect(socketPath);
+      c.once("connect", () => {
+        c.destroy();
+        resolve(true);
+      });
+      c.once("error", () => resolve(false));
+    });
+  }
+
+  it("refuses to delete a plain file sitting at the socket path (was silently unlinked)", async () => {
+    const dir = tempDir();
+    const target = sockPath(dir);
+    fs.writeFileSync(target, "PRECIOUS-USER-DATA");
+    const broker = new ZServerBroker(target, makeRoot());
+    await expect(broker.start()).rejects.toThrow(/not a socket/);
+    expect(fs.readFileSync(target, "utf8")).toBe("PRECIOUS-USER-DATA");
+  });
+
+  it("refuses to follow or delete a symlink at the socket path", async () => {
+    const dir = tempDir();
+    const victim = path.join(dir, "victim.txt");
+    fs.writeFileSync(victim, "keep");
+    const target = sockPath(dir);
+    fs.symlinkSync(victim, target);
+    const broker = new ZServerBroker(target, makeRoot());
+    await expect(broker.start()).rejects.toThrow(/not a socket/);
+    expect(fs.readFileSync(victim, "utf8")).toBe("keep");
+    expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+  });
+
+  it("does not treat a symlink to a stale socket as a stale socket (lstat, not stat)", async () => {
+    const dir = tempDir();
+    const realSock = path.join(dir, "real.sock");
+    const { spawn } = await import("node:child_process");
+    const dying = spawn(
+      process.execPath,
+      [
+        "-e",
+        "require('node:net').createServer().listen(process.argv[1], () => console.log('bound'));" +
+          "setInterval(() => {}, 1000);",
+        realSock,
+      ],
+      { stdio: ["ignore", "pipe", "ignore"] },
+    );
+    await new Promise<void>((resolve) => dying.stdout!.once("data", () => resolve()));
+    dying.kill("SIGKILL");
+    await new Promise<void>((resolve) => dying.once("exit", () => resolve()));
+    const target = sockPath(dir);
+    fs.symlinkSync(realSock, target);
+    // stat() would report "socket" through the link and unlink the LINK to bind
+    // over it; the path holds somebody's symlink, so refuse instead.
+    const broker = new ZServerBroker(target, makeRoot());
+    await expect(broker.start()).rejects.toThrow(/not a socket/);
+    expect(fs.lstatSync(target).isSymbolicLink()).toBe(true);
+    expect(fs.lstatSync(realSock).isSocket()).toBe(true);
+  }, 20000);
+
+  it("removes a genuinely stale socket and starts", async () => {
+    const dir = tempDir();
+    const target = sockPath(dir);
+    // A stale socket is what a process killed WITHOUT cleanup leaves behind
+    // (closing the handle in-process would make libuv unlink the file itself).
+    const { spawn } = await import("node:child_process");
+    const dying = spawn(
+      process.execPath,
+      [
+        "-e",
+        "require('node:net').createServer().listen(process.argv[1], () => console.log('bound'));" +
+          "setInterval(() => {}, 1000);",
+        target,
+      ],
+      { stdio: ["ignore", "pipe", "ignore"] },
+    );
+    await new Promise<void>((resolve) => dying.stdout!.once("data", () => resolve()));
+    dying.kill("SIGKILL");
+    await new Promise<void>((resolve) => dying.once("exit", () => resolve()));
+    expect(fs.lstatSync(target).isSocket()).toBe(true);
+    expect(await probe(target)).toBe(false);
+
+    const broker = new ZServerBroker(target, makeRoot());
+    await broker.start();
+    cleanups.push(() => broker.stop());
+    expect(await probe(target)).toBe(true);
+  }, 20000);
+
+  it("says something is already listening instead of evicting it", async () => {
+    const dir = tempDir();
+    const target = sockPath(dir);
+    const first = new ZServerBroker(target, makeRoot());
+    await first.start();
+    cleanups.push(() => first.stop());
+    const second = new ZServerBroker(target, makeRoot());
+    await expect(second.start()).rejects.toThrow(/already listening/);
+    expect(await probe(target)).toBe(true);
+  });
+
+  it("names a missing socket directory instead of Node's misleading EACCES", async () => {
+    const broker = new ZServerBroker(
+      path.join(os.tmpdir(), `zhard-nodir-${process.pid}`, "b.sock"),
+      makeRoot(),
+    );
+    await expect(broker.start()).rejects.toThrow(/does not exist/);
+  });
+
+  it("a loser's stop() must not delete the winner's socket", async () => {
+    const dir = tempDir();
+    const target = sockPath(dir);
+    const loser = new ZServerBroker(target, makeRoot());
+    await loser.start();
+    // A second broker takes over the path (the two-brokers start race).
+    fs.unlinkSync(target);
+    const winner = new ZServerBroker(target, makeRoot());
+    await winner.start();
+    cleanups.push(() => winner.stop());
+    expect(await probe(target)).toBe(true);
+
+    await loser.stop();
+
+    expect(fs.existsSync(target)).toBe(true);
+    expect(await probe(target)).toBe(true);
+    // No parked leftovers.
+    expect(fs.readdirSync(dir).filter((name) => name.includes("parked"))).toEqual([]);
+  });
+
+  it("a normal stop() still removes its own socket file", async () => {
+    const dir = tempDir();
+    const target = sockPath(dir);
+    const broker = new ZServerBroker(target, makeRoot());
+    await broker.start();
+    expect(fs.existsSync(target)).toBe(true);
+    await broker.stop();
+    expect(fs.existsSync(target)).toBe(false);
+  });
+});
+
+describe("an allowlist rejection is readable and does not look like a server death", () => {
+  // Field evidence (E1/E2 on the previous snapshot): dropping one allowlisted
+  // call made the broker cut the socket; the client saw "backend reader exited",
+  // ran its heal loop against the same rejection forever, and the bridge shut
+  // itself down with exit code 0. The rejection must now name itself.
+  it("ZServerBackend gets a 'broker:' error, stays alive, and the broker keeps the connection", async () => {
+    const { BROKER_ALLOWED_CALLS } = await import("../src/backend/zserver/broker.js");
+    const tasksAllowed = BROKER_ALLOWED_CALLS["zcode-task"] as Set<string>;
+    tasksAllowed.delete("listTasks");
+    cleanups.push(() => {
+      tasksAllowed.add("listTasks");
+    });
+
+    const socketPath = path.join(
+      os.tmpdir(),
+      `zhard-rej-${process.pid}-${Math.random().toString(36).slice(2)}.sock`,
+    );
+    cleanups.push(() => fs.rmSync(socketPath, { force: true }));
+    const broker = new ZServerBroker(socketPath, makeRoot());
+    await broker.start();
+    cleanups.push(() => broker.stop());
+    withEnv({ ZCODE_ACP_ZSERVER_SOCKET: socketPath });
+
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    const first = await backend.request(1, "session/list", {});
+
+    expect(first.error?.message).toMatch(/^broker: .*zcode-task\.listTasks.*not allowed/);
+    // Not classified as infrastructure death: no heal loop, no bridge shutdown.
+    expect(first.error?.message).not.toMatch(/backend reader exited/);
+    expect(backend.isDead).toBe(false);
+    expect(backend.deathReason).toBeNull();
+    expect(broker.stats().clients).toBe(1);
+    expect(broker.stats().rejected).toBe(1);
+
+    // The same connection keeps working for allowed calls afterwards.
+    const created = await backend.request(2, "session/create", {
+      workspace: { workspacePath: "/tmp/ws-after-reject" },
+    });
+    expect(created.error).toBeUndefined();
+    expect(backend.isDead).toBe(false);
+    expect(broker.stats().clients).toBe(1);
+  }, 30000);
+
+  it("a rejection is not swallowed by the supervision classifiers", async () => {
+    const { isBackendDeadMessage } = await import("../src/backend/supervise.js");
+    expect(
+      isBackendDeadMessage("broker: call zcode-task.listTasks is not allowed through the broker"),
+    ).toBe(false);
+  });
+});
+
+describe("V4 conversation subscriptions are released on the server", () => {
+  // Field evidence (real server): an EventDispose (103) stops OUR delivery but the
+  // server keeps the V4 subscription OWNED until unsubscribeConversationV4 names
+  // its subscriptionId. The fixture reproduces that (ZSERVER_V4UNSUB marker on the
+  // real unsubscribe RPC only).
+  const WS = "/tmp/ws-v4";
+
+  async function startBroker(): Promise<{
+    broker: ZServerBroker;
+    socketPath: string;
+    unsubLines: () => string[];
+  }> {
+    const socketPath = path.join(
+      os.tmpdir(),
+      `zhard-v4-${process.pid}-${Math.random().toString(36).slice(2)}.sock`,
+    );
+    cleanups.push(() => fs.rmSync(socketPath, { force: true }));
+    const broker = new ZServerBroker(socketPath, makeRoot());
+    await broker.start();
+    cleanups.push(() => broker.stop());
+    const unsubLines = (): string[] => {
+      const conn = (broker as unknown as { connection: { stderrSnapshot(): string[] } | null })
+        .connection;
+      return (conn?.stderrSnapshot() ?? []).filter((line) => line.startsWith("ZSERVER_V4UNSUB:"));
+    };
+    return { broker, socketPath, unsubLines };
+  }
+
+  const subscribe = (client: ZServerConnection, sessionId: string): Promise<unknown> =>
+    client.channelOf("zcode-agent").call("subscribeConversationV4", {
+      workspacePath: WS,
+      sessionId,
+      clientMode: "desktop-continuous",
+    });
+  const unsubscribe = (client: ZServerConnection, sessionId: string): Promise<unknown> =>
+    client.channelOf("zcode-agent").call("unsubscribeConversationV4", {
+      workspacePath: WS,
+      sessionId,
+      subscriptionId: "irrelevant-client-side-id",
+    });
+
+  it("ZServerBackend.releaseSession sends the real unsubscribeConversationV4 with the acked id", async () => {
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    await backend.request(1, "session/create", { workspace: { workspacePath: WS } });
+    const stderr = (): string[] =>
+      (backend as unknown as { connection: { stderrSnapshot(): string[] } }).connection
+        .stderrSnapshot()
+        .filter((line) => line.startsWith("ZSERVER_V4UNSUB:"));
+    // Let the fire-and-forget subscribe ack land so its id is known.
+    await new Promise((r) => setTimeout(r, 300));
+    expect(stderr()).toEqual([]);
+
+    backend.releaseSession("sess_fake_1");
+
+    expect(await until(() => stderr().length === 1)).toBe(true);
+    expect(stderr()[0]).toMatch(/^ZSERVER_V4UNSUB:sub-\d+$/);
+  }, 20000);
+
+  it("a listen refused AFTER the subscribe was acked releases the server subscription too", async () => {
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    await backend.request(1, "session/create", { workspace: { workspacePath: WS } });
+    const stderr = (): string[] =>
+      (backend as unknown as { connection: { stderrSnapshot(): string[] } }).connection
+        .stderrSnapshot()
+        .filter((line) => line.startsWith("ZSERVER_V4UNSUB:"));
+    await new Promise((r) => setTimeout(r, 300)); // the subscribe ack has landed
+    expect(stderr()).toEqual([]);
+
+    // The broker now refuses the frame listen (e.g. a limit): the whole
+    // subscription rolls back, and the acked server subscription must go with it.
+    const client = (
+      backend as unknown as {
+        connection: {
+          client: {
+            handlers: Map<number, (r: { type: number; id?: number; data?: unknown }) => void>;
+            eventListeners: Map<number, unknown>;
+          };
+        };
+      }
+    ).connection.client;
+    const frameListenId = [...client.eventListeners.keys()].at(-1)!;
+    client.handlers.get(frameListenId)!({
+      type: 202,
+      id: frameListenId,
+      data: { message: "broker: refused", name: "BrokerLimitError" },
+    });
+
+    expect(await until(() => stderr().length === 1)).toBe(true);
+  }, 20000);
+
+  it("releaseSession while the subscribe is still IN FLIGHT releases it as soon as the ack lands", async () => {
+    withEnv({ ZSERVER_FAKE_DELAY_METHODS: "subscribeConversationV4:400" });
+    const backend = new ZServerBackend({ serverRoot: makeRoot() });
+    cleanups.push(() => backend.close());
+    await backend.request(1, "session/create", { workspace: { workspacePath: WS } });
+    const stderr = (): string[] =>
+      (backend as unknown as { connection: { stderrSnapshot(): string[] } }).connection
+        .stderrSnapshot()
+        .filter((line) => line.startsWith("ZSERVER_V4UNSUB:"));
+
+    backend.releaseSession("sess_fake_1"); // ack has NOT arrived yet
+    expect(stderr()).toEqual([]);
+    expect(await until(() => stderr().length === 1, 6000)).toBe(true);
+  }, 20000);
+
+  it("a client killed WITHOUT unsubscribing does not leave its subscription owned (kill -9)", async () => {
+    const { broker, socketPath, unsubLines } = await startBroker();
+    const client = await ZServerConnection.attach({ socketPath, clientId: "victim" });
+    await subscribe(client, "sess-a");
+    expect(broker.stats().clients).toBe(1);
+    expect(unsubLines()).toEqual([]);
+
+    // Hard disconnect: no unsubscribe, no goodbye.
+    (client as unknown as { io: { shutdown(): void } }).io.shutdown();
+
+    expect(await until(() => unsubLines().length === 1)).toBe(true);
+  }, 20000);
+
+  it("a shared subscription is released only when the LAST holder leaves", async () => {
+    const { socketPath, unsubLines } = await startBroker();
+    const a = await ZServerConnection.attach({ socketPath, clientId: "holder-a" });
+    const b = await ZServerConnection.attach({ socketPath, clientId: "holder-b" });
+    await subscribe(a, "sess-shared");
+    await subscribe(b, "sess-shared"); // the server replaces the id; both share one subscription
+
+    a.dispose();
+    await new Promise((r) => setTimeout(r, 400));
+    expect(unsubLines()).toEqual([]); // b still holds it
+
+    b.dispose();
+    expect(await until(() => unsubLines().length === 1)).toBe(true);
+    // ...and it named the server's CURRENT id (the newer ack), not the first one.
+    expect(unsubLines()[0]).toBe("ZSERVER_V4UNSUB:sub-2");
+  }, 20000);
+
+  it("a client's own unsubscribe is answered by the broker and never forwarded blindly", async () => {
+    const { broker, socketPath, unsubLines } = await startBroker();
+    const a = await ZServerConnection.attach({ socketPath, clientId: "leaver" });
+    const b = await ZServerConnection.attach({ socketPath, clientId: "stayer" });
+    await subscribe(a, "sess-u");
+    await subscribe(b, "sess-u");
+
+    // a's unsubscribe carries a client-side id the server never issued; it must
+    // resolve (like the real server's no-op) and must NOT cut b off.
+    await expect(unsubscribe(a, "sess-u")).resolves.toBeUndefined();
+    await new Promise((r) => setTimeout(r, 300));
+    expect(unsubLines()).toEqual([]);
+    expect(broker.stats().clients).toBe(2);
+
+    await unsubscribe(b, "sess-u"); // last holder out
+    expect(await until(() => unsubLines().length === 1)).toBe(true);
+  }, 20000);
+
+  it("a subscribe whose client vanished before the ack is released when the ack lands", async () => {
+    withEnv({ ZSERVER_FAKE_DELAY_METHODS: "subscribeConversationV4:500" });
+    const { socketPath, unsubLines } = await startBroker();
+    const client = await ZServerConnection.attach({ socketPath, clientId: "vanisher" });
+    void subscribe(client, "sess-late").catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 100)); // request is at the server, ack not yet
+    (client as unknown as { io: { shutdown(): void } }).io.shutdown();
+    expect(await until(() => unsubLines().length === 1, 6000)).toBe(true);
+  }, 20000);
+
+  it("a cancelled (101) subscribe is released when its ack lands", async () => {
+    withEnv({ ZSERVER_FAKE_DELAY_METHODS: "subscribeConversationV4:500" });
+    const { socketPath, unsubLines } = await startBroker();
+    const client = await ZServerConnection.attach({ socketPath, clientId: "canceller" });
+    const call = subscribe(client, "sess-cancel").catch(() => undefined);
+    await new Promise((r) => setTimeout(r, 100));
+    (client as unknown as { client: ChannelClient }).client.cancel(
+      [...(client as unknown as { client: ChannelInternals }).client.pendingRejections.keys()][0]!,
+    );
+    await call;
+    expect(await until(() => unsubLines().length === 1, 6000)).toBe(true);
+  }, 20000);
+});
+
+describe("least privilege on the broker allowlist", () => {
+  it("does not expose closeTask (the server binds no task to its creator: cross-client close)", async () => {
+    const { BROKER_ALLOWED_CALLS, validateClientHeader } =
+      await import("../src/backend/zserver/broker.js");
+    expect(BROKER_ALLOWED_CALLS["zcode-task"]!.has("closeTask")).toBe(false);
+    expect(validateClientHeader([100, 1, "zcode-task", "closeTask"]).ok).toBe(false);
+  });
+
+  it("does not let attach clients listen for runtime-preferences requests (the broker alone answers)", async () => {
+    const { BROKER_ALLOWED_EVENTS, validateClientHeader } =
+      await import("../src/backend/zserver/broker.js");
+    expect(
+      BROKER_ALLOWED_EVENTS["zcode-agent"]!.has("onDynamicSessionRuntimePreferencesRequest"),
+    ).toBe(false);
+    expect(
+      validateClientHeader([102, 1, "zcode-agent", "onDynamicSessionRuntimePreferencesRequest"]).ok,
+    ).toBe(false);
+  });
+
+  it("still allows everything ZServerBackend really emits in attach mode", async () => {
+    const { BROKER_ALLOWED_CALLS, BROKER_ALLOWED_EVENTS } =
+      await import("../src/backend/zserver/broker.js");
+    for (const call of [
+      ["zcode-agent", "createSession"],
+      ["zcode-agent", "readSession"],
+      ["zcode-agent", "sendPrompt"],
+      ["zcode-agent", "subscribeConversationV4"],
+      ["zcode-agent", "unsubscribeConversationV4"],
+      ["zcode-task", "createTask"],
+      ["zcode-task", "listTasks"],
+      ["zcode-task", "stopGeneration"],
+    ] as const) {
+      expect(BROKER_ALLOWED_CALLS[call[0]]!.has(call[1]), call.join(".")).toBe(true);
+    }
+    for (const event of [
+      ["zcode-agent", "onDynamicConversationFrame"],
+      ["zcode-agent", "onDynamicSessionEvent"],
+      ["zcode-task", "onDynamicTaskTerminalOutcome"],
+    ] as const) {
+      expect(BROKER_ALLOWED_EVENTS[event[0]]!.has(event[1]), event.join(".")).toBe(true);
+    }
+  });
+});
+
+describe("a client that never reads its replies cannot make the broker buffer forever", () => {
+  it("is cut off once its unread backlog passes the cap, and the broker survives", async () => {
+    withEnv({ ZCODE_ACP_ZSERVER_MAX_CLIENT_WRITE_QUEUE: "2048" });
+    const socketPath = path.join(
+      os.tmpdir(),
+      `zhard-wq-${process.pid}-${Math.random().toString(36).slice(2)}.sock`,
+    );
+    cleanups.push(() => fs.rmSync(socketPath, { force: true }));
+    const broker = new ZServerBroker(socketPath, makeRoot());
+    await broker.start();
+    cleanups.push(() => broker.stop());
+
+    // A raw client that PAUSES its socket: the kernel buffers fill, then Node's
+    // writable queue grows with every reply the broker sends it.
+    const { connect } = await import("node:net");
+    const { encodeFrame, encodeMessage } = await import("../src/backend/zserver/protocol.js");
+    const stuck = connect(socketPath);
+    await new Promise<void>((resolve) => stuck.once("connect", resolve));
+    stuck.on("error", () => undefined);
+    let closed = false;
+    stuck.on("close", () => (closed = true));
+    stuck.pause();
+    // Shrink what the kernel will absorb so the backlog reaches Node quickly.
+    (stuck as unknown as { setRecvBufferSize?: (n: number) => void }).setRecvBufferSize?.(1024);
+
+    const noisy = encodeFrame(encodeMessage([100, 1, "credential", "load"], undefined));
+    const deadline = Date.now() + 8000;
+    while (!closed && Date.now() < deadline) {
+      for (let i = 0; i < 200 && !stuck.destroyed; i++) stuck.write(noisy);
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(closed).toBe(true);
+    expect(await until(() => broker.stats().clients === 0)).toBe(true);
+
+    // The broker is unaffected: a fresh client still gets served.
+    const ok = await ZServerConnection.attach({ socketPath, clientId: "after-stuck" });
+    cleanups.push(() => ok.dispose());
+    await expect(ok.channelOf("zcode-task").call("listTasks")).resolves.toBeDefined();
+  }, 30000);
+
+  it("also bounds FORWARDED server events (a paused subscriber must not grow the broker)", async () => {
+    // Realistic volume: conversation frames carry text. 40 x ~60KB comfortably
+    // exceeds what the kernel absorbs for a peer that stopped reading.
+    withEnv({
+      ZCODE_ACP_ZSERVER_MAX_CLIENT_WRITE_QUEUE: "65536",
+      // Generated inside the fixture: 40 x 60KB frames, far past what the kernel
+      // absorbs for a peer that stopped reading. (As an env var this would be
+      // ~2.4MB and fail exec with E2BIG — the server would never start.)
+      ZSERVER_FAKE_BIG_FRAMES: "40:60000",
+    });
+    const socketPath = path.join(
+      os.tmpdir(),
+      `zhard-wq2-${process.pid}-${Math.random().toString(36).slice(2)}.sock`,
+    );
+    cleanups.push(() => fs.rmSync(socketPath, { force: true }));
+    const broker = new ZServerBroker(socketPath, makeRoot());
+    await broker.start();
+    cleanups.push(() => broker.stop());
+
+    const { connect } = await import("node:net");
+    const { encodeFrame, encodeMessage } = await import("../src/backend/zserver/protocol.js");
+    const sub = connect(socketPath);
+    await new Promise<void>((resolve) => sub.once("connect", resolve));
+    sub.on("error", () => undefined);
+    cleanups.push(() => sub.destroy());
+    sub.pause(); // stuck from the start; it never reads a byte
+    sub.write(
+      encodeFrame(
+        encodeMessage([102, 1, "zcode-agent", "onDynamicConversationFrame"], {
+          workspacePath: "/w",
+          sessionId: "x",
+        }),
+      ),
+    );
+
+    // The shared server must really be running (a failed spawn also drops clients).
+    expect(await until(() => broker.stats().sharedServerPid !== null, 5000)).toBe(true);
+    // Observe the BROKER's view (a paused raw socket may never emit 'close').
+    expect(await until(() => broker.stats().clients === 1, 3000)).toBe(true);
+    expect(await until(() => broker.stats().clients === 0, 15000)).toBe(true);
+  }, 40000);
+});

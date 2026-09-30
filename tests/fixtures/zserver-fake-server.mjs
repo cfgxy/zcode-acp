@@ -12,8 +12,8 @@
 //
 // Test-only knobs (read here, not runtime configuration): ZSERVER_FAKE_*
 // (SLOW_EXIT_MS, IGNORE_SIGTERM, PID_FILE, GRANDCHILD_IGNORES_SIGTERM,
-// DIE_AFTER_MS, SPAWN_LOG, FAIL_METHODS, HANG_METHODS, TERMINAL, FRAMES, TASKS)
-// and ZSERVER_COALESCE.
+// DIE_AFTER_MS, SPAWN_LOG, FAIL_METHODS, HANG_METHODS, DELAY_METHODS, TERMINAL,
+// FRAMES, BIG_FRAMES, TASKS, PREFS) and ZSERVER_COALESCE.
 //
 // NOTE: executed as `<tmpdir>/zcode-server.cjs`, i.e. CommonJS — no ESM syntax.
 // `process` is a global.
@@ -152,6 +152,8 @@ const decMsg = (payload) => {
 };
 
 const listeners = new Map();
+let subscriptionCounter = 0;
+const ownedSubscriptions = new Set();
 const handleFrame = (payload) => {
   const { header, body } = decMsg(payload);
   const [type, id, , name] = header;
@@ -177,6 +179,45 @@ const handleFrame = (payload) => {
       process.stdout.write(encFrame(msg([201, id], { taskId: "sess_fake_1" })));
       return;
     }
+    // Real-server shape: subscribeConversationV4 answers {ack:{subscriptionId,…}}
+    // and the server OWNS that subscription until unsubscribeConversationV4 names
+    // its id (a 103 EventDispose does not release it — verified on the real
+    // server). ZSERVER_FAKE_DELAY_METHODS="subscribeConversationV4:400" delays the
+    // answer so a release can race an in-flight subscribe.
+    if (name === "subscribeConversationV4") {
+      const subscriptionId = `sub-${++subscriptionCounter}`;
+      ownedSubscriptions.add(subscriptionId);
+      const delayMs = Number(
+        (process.env.ZSERVER_FAKE_DELAY_METHODS || "")
+          .split(",")
+          .map((entry) => entry.split(":"))
+          .find(([method]) => method === name)?.[1] ?? 0,
+      );
+      const answer = () =>
+        process.stdout.write(
+          encFrame(
+            msg([201, id], {
+              ack: { subscriptionId, mode: "snapshot", logEpoch: "e1", openTiming: {} },
+            }),
+          ),
+        );
+      if (delayMs > 0) setTimeout(answer, delayMs);
+      else answer();
+      return;
+    }
+    if (name === "unsubscribeConversationV4") {
+      const subscriptionId = Array.isArray(body) ? body[0]?.subscriptionId : undefined;
+      if (ownedSubscriptions.delete(subscriptionId)) {
+        console.error(`ZSERVER_V4UNSUB:${subscriptionId}`);
+      }
+      // Like the real server: an unknown id is a silent no-op.
+      process.stdout.write(encFrame(msg([201, id], undefined)));
+      return;
+    }
+    // A prefs answer is observable: the broker must be the only responder.
+    if (name === "respondSessionRuntimePreferences") {
+      console.error("ZSERVER_PREFS_ANSWER");
+    }
     // Scripted listTasks payload (ZSERVER_FAKE_TASKS = JSON). Unset keeps the
     // legacy echo string the connection/broker tests key on. The real server
     // answers with a BARE ARRAY of task metas.
@@ -185,6 +226,18 @@ const handleFrame = (payload) => {
       return;
     }
     process.stdout.write(encFrame(msg([201, id], `echo:${name}:${JSON.stringify(body)}`)));
+  } else if (
+    type === 102 &&
+    name === "onDynamicSessionRuntimePreferencesRequest" &&
+    process.env.ZSERVER_FAKE_PREFS === "1"
+  ) {
+    // Scripted runtime-preferences request (the broker answers it on its own
+    // connection, with ids from the LOW range).
+    setTimeout(() => {
+      process.stdout.write(
+        encFrame(msg([204, id], { requestId: "req-1", scope: "runtime-materialization" })),
+      );
+    }, 100);
   } else if (
     type === 102 &&
     name === "onDynamicTaskTerminalOutcome" &&
@@ -196,7 +249,19 @@ const handleFrame = (payload) => {
     }, 200);
   } else if (type === 102 && name === "onDynamicConversationFrame") {
     // Scripted conversation frames (ZSERVER_FAKE_FRAMES = JSON array of frames).
+    // ZSERVER_FAKE_BIG_FRAMES="count:bytes" generates that many large frames
+    // HERE — an env var carrying them would exceed the exec argument limit
+    // (E2BIG) and the server would never start.
     const frames = JSON.parse(process.env.ZSERVER_FAKE_FRAMES || "[]");
+    const [bigCount, bigBytes] = (process.env.ZSERVER_FAKE_BIG_FRAMES || "0:0")
+      .split(":")
+      .map(Number);
+    for (let i = 0; i < bigCount; i++) {
+      frames.push({
+        deliveryKind: "online",
+        frame: { topic: "conversation/x", payload: { text: "y".repeat(bigBytes) } },
+      });
+    }
     setTimeout(() => {
       for (const frame of frames) process.stdout.write(encFrame(msg([204, id], frame)));
     }, 150);

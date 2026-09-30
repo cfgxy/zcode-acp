@@ -73,22 +73,34 @@ export const BROKER_ALLOWED_CALLS: Readonly<Record<string, ReadonlySet<string>>>
     "subscribeConversationV4",
     "unsubscribeConversationV4",
   ]),
-  "zcode-task": new Set(["createTask", "listTasks", "stopGeneration", "closeTask"]),
+  // No closeTask: ZServerBackend never closes server-side tasks, and the server
+  // does not bind a task to its creator — an attached client could close (mark
+  // deleted) another client's session. Add it back only with an owner check.
+  "zcode-task": new Set(["createTask", "listTasks", "stopGeneration"]),
 };
 export const BROKER_ALLOWED_EVENTS: Readonly<Record<string, ReadonlySet<string>>> = {
-  "zcode-agent": new Set([
-    "onDynamicConversationFrame",
-    "onDynamicSessionEvent",
-    "onDynamicSessionRuntimePreferencesRequest",
-  ]),
+  // No onDynamicSessionRuntimePreferencesRequest: only the broker's OWN
+  // connection listens for it (it answers, attach clients must not).
+  "zcode-agent": new Set(["onDynamicConversationFrame", "onDynamicSessionEvent"]),
   "zcode-task": new Set(["onDynamicTaskTerminalOutcome"]),
 };
 
 /** umask in force while the socket file is created (=> mode 0600 at birth). */
 export const BROKER_BIND_UMASK = 0o177;
 
-/** Policy rejections tolerated per client before it is disconnected. */
-const MAX_VIOLATIONS_PER_CLIENT = 5;
+/** Policy rejections LOGGED per client; further ones are counted, not logged.
+ *  A well-formed rejection is answered and never disconnects the client: a
+ *  disconnect reads as "server died" to it (misleading, and it arms the
+ *  bridge's backend-death shutdown), while a same-uid flooder can send ALLOWED
+ *  calls just as cheaply — a violation cap protected nothing and cost a
+ *  legitimate client its link on allowlist drift. */
+const MAX_LOGGED_VIOLATIONS_PER_CLIENT = 5;
+
+/** Unread bytes queued to one client before it is cut off: a client that never
+ *  reads its replies must not make the shared broker buffer them forever. */
+function maxClientWriteQueueBytes(): number {
+  return Number(process.env.ZCODE_ACP_ZSERVER_MAX_CLIENT_WRITE_QUEUE ?? 0) || 8 * 1024 * 1024;
+}
 
 /** Outstanding (un-answered calls + live subscriptions) requests allowed per
  *  client. Bounds the broker's id maps against a client that never completes. */
@@ -147,16 +159,64 @@ export function validateClientHeader(header: unknown): HeaderVerdict {
   return { ok: true };
 }
 
+/**
+ * The shared server's V4 conversation subscription for one (workspace, session).
+ * The server keys ownership by (workspace, topic, CONNECTION) and every broker
+ * client rides the broker's single connection, so clients on the same session
+ * share ONE subscription: a newer subscribe replaces the older id, and releasing
+ * it would cut every other holder off. Hence: refcounted by holder, released
+ * only when the last one leaves, always with the server's CURRENT id.
+ */
+interface SharedSubscription {
+  workspacePath: string;
+  sessionId: string;
+  /** The server's current subscriptionId for this (workspace, session). */
+  subscriptionId: string;
+  /** Broker client ids currently holding it. */
+  holders: Set<number>;
+}
+
+/** A subscribeConversationV4 call forwarded to the server whose ack is pending. */
+interface PendingSubscribe {
+  clientId: number;
+  key: string;
+  workspacePath: string;
+  sessionId: string;
+  /** The client cancelled (101) before the ack: release it the moment it lands. */
+  cancelled: boolean;
+}
+
+/** Key of a (workspace, session) pair; NUL cannot occur in either. */
+function subscriptionKey(workspacePath: string, sessionId: string): string {
+  return `${workspacePath}\0${sessionId}`;
+}
+
+/** The (workspacePath, sessionId) of a call body `[params]`, if well-formed. */
+function subscriptionParams(body: unknown): { workspacePath: string; sessionId: string } | null {
+  const params = Array.isArray(body) ? (body[0] as Record<string, unknown> | undefined) : undefined;
+  if (typeof params?.workspacePath === "string" && typeof params.sessionId === "string") {
+    return { workspacePath: params.workspacePath, sessionId: params.sessionId };
+  }
+  return null;
+}
+
+/** In-flight subscribes tracked at once (bounds memory if the server never answers). */
+const MAX_TRACKED_SUBSCRIBES = 4096;
+
 interface ClientEntry {
   /** Broker-local client number, for log correlation only. */
   id: number;
-  /** Policy rejections so far; the client is cut off at MAX_VIOLATIONS_PER_CLIENT. */
+  /** Policy rejections so far (drives log throttling only). */
   violations: number;
   socket: Socket;
   /** server-side request id → client-side request id (route responses/events back). */
   idByClient: Map<number, number>;
   /** client-side request id → server-side request id (translate cancel/dispose). */
   serverIdByClient: Map<number, number>;
+  /** Keys of the shared V4 subscriptions this client holds. The server owns them
+   *  on the BROKER's single connection, so a client that dies without
+   *  unsubscribing (kill -9) would leave them owned for the shared server's life. */
+  subscriptions: Set<string>;
 }
 
 /**
@@ -179,6 +239,15 @@ export class ZServerBroker {
   private spawning: Promise<void> | null = null;
   private stopped = false;
   private rejectedFrames = 0;
+  /** Inode of the socket file this broker bound (null until bound). */
+  private socketIno: number | null = null;
+  /** In-flight subscribeConversationV4 calls by server request id. Dropped when
+   *  the ack arrives, or when the shared server exits (its subscriptions die with
+   *  it). A client that vanishes mid-subscribe leaves its entry until the ack
+   *  lands so that subscription can still be released. */
+  private readonly pendingSubscribes = new Map<number, PendingSubscribe>();
+  /** Live V4 conversation subscriptions on the shared server, by session key. */
+  private readonly sharedSubscriptions = new Map<string, SharedSubscription>();
   /** Test seam: invoked with the socket file's mode at the instant of creation. */
   onBoundForTest?: (mode: number) => void;
   /** Process exit used by the idle-exit path (replaceable so tests can observe it). */
@@ -201,9 +270,33 @@ export class ZServerBroker {
 
   async start(): Promise<void> {
     assertSocketPathFits(this.socketPath);
-    if (existsSync(this.socketPath)) {
-      // Probe before unlinking: a live broker would accept the connection; a
-      // stale file refuses it. Never evict a live broker's socket.
+    // Node reports a missing parent directory of a unix socket as EACCES, which
+    // sends an operator hunting for a permissions problem that does not exist.
+    const parent = path.dirname(this.socketPath);
+    if (!existsSync(parent)) {
+      throw new Error(
+        `zserver-broker: socket directory ${parent} does not exist (create it, or set ` +
+          "ZCODE_ACP_ZSERVER_SOCKET to a path in an existing directory)",
+      );
+    }
+    let existing: fs.Stats | null = null;
+    try {
+      existing = fs.lstatSync(this.socketPath);
+    } catch {
+      /* nothing at the path */
+    }
+    if (existing) {
+      // Only ever remove a leftover SOCKET. A plain file or a symlink at this
+      // path is somebody's data (or a planted link): unlinking it silently
+      // destroyed the file — refuse and say so instead.
+      if (!existing.isSocket()) {
+        throw new Error(
+          `zserver-broker: ${this.socketPath} exists and is not a socket — refusing to remove it ` +
+            "(move it away or set ZCODE_ACP_ZSERVER_SOCKET to another path)",
+        );
+      }
+      // Probe before unlinking: a live listener would accept the connection; a
+      // stale socket file refuses it. Never evict a live listener's socket.
       const live = await new Promise<boolean>((resolve) => {
         const probe = connect(this.socketPath);
         probe.once("connect", () => {
@@ -213,8 +306,11 @@ export class ZServerBroker {
         probe.once("error", () => resolve(false));
       });
       if (live) {
-        throw new Error(`zserver-broker: a live broker is already listening on ${this.socketPath}`);
+        throw new Error(
+          `zserver-broker: something is already listening on ${this.socketPath} (a broker is already running?)`,
+        );
       }
+      log(`zserver-broker: removing stale socket ${this.socketPath}`);
       unlinkSync(this.socketPath);
     }
     this.server = createServer((socket) => this.onClient(socket));
@@ -240,6 +336,13 @@ export class ZServerBroker {
       process.umask(previousUmask);
     }
     await listening;
+    // Identity of the socket file WE created: stop() must only remove it while
+    // the path still holds this inode (a second broker may have replaced it).
+    try {
+      this.socketIno = fs.lstatSync(this.socketPath).ino;
+    } catch {
+      this.socketIno = null;
+    }
     // The broker drives a server holding credentials; a world-connectable
     // socket would hand that to any local user. Restrict to the owner.
     try {
@@ -268,10 +371,14 @@ export class ZServerBroker {
           );
           this.connection = null;
           this.spawning = null;
-          // Server-side state (subscriptions included) died with it. Clients
-          // must learn: destroy their sockets so their heal path re-attaches
-          // and re-subscribes against the respawned server.
+          // Server-side state (subscriptions included) died with it: there is
+          // nothing left to release, and stale ids must never be replayed
+          // against a respawned server. Clients must learn: destroy their
+          // sockets so their heal path re-attaches and re-subscribes.
+          this.pendingSubscribes.clear();
+          this.sharedSubscriptions.clear();
           for (const entry of this.clients.values()) {
+            entry.subscriptions.clear();
             entry.socket.destroy();
           }
           this.clients.clear();
@@ -326,6 +433,7 @@ export class ZServerBroker {
       socket,
       idByClient: new Map(),
       serverIdByClient: new Map(),
+      subscriptions: new Set(),
     };
     this.clients.set(clientId, entry);
     log(`zserver-broker: client ${clientId} attached (${this.clients.size} attached)`);
@@ -367,6 +475,12 @@ export class ZServerBroker {
           this.connection.rawSend(encodeMessage([103, serverId], undefined));
         }
       }
+      // EventDispose only stops event delivery: the server keeps every V4
+      // conversation subscription owned until unsubscribeConversationV4 names
+      // it (verified on the real server). Drop this client's hold on each one —
+      // its process may be gone (kill -9), and nobody else ever will release it.
+      for (const key of entry.subscriptions) this.dropHolder(key, entry.id);
+      entry.subscriptions.clear();
       entry.idByClient.clear();
       entry.serverIdByClient.clear();
       this.armIdleExit();
@@ -423,19 +537,16 @@ export class ZServerBroker {
     if (!verdict.ok) {
       entry.violations++;
       this.rejectedFrames++;
-      warn(
-        `zserver-broker: client ${entry.id} frame rejected (${verdict.reason}) ` +
-          `[${entry.violations}/${MAX_VIOLATIONS_PER_CLIENT}]`,
-      );
-      // A well-formed but disallowed request is ANSWERED (the client sees why
-      // instead of an opaque "socket closed" it would misread as a server
-      // death and heal against forever). Malformed frames, and clients that
-      // keep offending, are still cut off.
-      if (
-        verdict.replyTo !== undefined &&
-        entry.violations < MAX_VIOLATIONS_PER_CLIENT &&
-        !entry.socket.destroyed
-      ) {
+      if (entry.violations <= MAX_LOGGED_VIOLATIONS_PER_CLIENT) {
+        warn(`zserver-broker: client ${entry.id} frame rejected (${verdict.reason})`);
+      } else if (entry.violations === MAX_LOGGED_VIOLATIONS_PER_CLIENT + 1) {
+        warn(`zserver-broker: client ${entry.id} keeps sending rejected frames — not logging more`);
+      }
+      // A well-formed but disallowed request is ANSWERED, however often it
+      // repeats: the client sees why instead of an opaque "socket closed" it
+      // would misread as a server death (and heal against, or shut the bridge
+      // down over). Only a frame with no answerable id — malformed — is cut off.
+      if (verdict.replyTo !== undefined && !entry.socket.destroyed) {
         this.replyError(entry, verdict.replyTo, "BrokerPolicyError", verdict.reason);
         return;
       }
@@ -453,6 +564,12 @@ export class ZServerBroker {
         header[1] = serverId;
         entry.serverIdByClient.delete(clientRequestId);
         entry.idByClient.delete(serverId);
+        // A cancelled subscribe may still succeed server-side: flag it so the
+        // ack releases it instead of leaking an unreachable subscription.
+        if (type === 101) {
+          const pending = this.pendingSubscribes.get(serverId);
+          if (pending) pending.cancelled = true;
+        }
       } else {
         if (entry.idByClient.size >= maxPendingPerClient()) {
           // Resource limit, not misbehaviour: answer, don't count a violation.
@@ -465,10 +582,21 @@ export class ZServerBroker {
           );
           return;
         }
+        // A client's unsubscribe is handled HERE, never forwarded: the server keeps
+        // one subscription per (workspace, session) on the broker's single
+        // connection, so the client's own (possibly superseded) id would either be
+        // a silent no-op or, if current, cut off every other holder.
+        if (
+          type === 100 &&
+          this.handleUnsubscribeLocally(entry, clientRequestId, header, payload)
+        ) {
+          return;
+        }
         const serverId = this.nextServerId++;
         entry.idByClient.set(serverId, clientRequestId);
         entry.serverIdByClient.set(clientRequestId, serverId);
         header[1] = serverId;
+        if (type === 100) this.trackSubscribeCall(entry, serverId, header, payload);
       }
     }
     try {
@@ -483,10 +611,144 @@ export class ZServerBroker {
     }
   }
 
+  /**
+   * unsubscribeConversationV4 from a client: drop ITS hold on the shared
+   * subscription (the last holder out releases it on the server) and answer 201
+   * itself. Idempotent like the server (an unknown subscription is a no-op).
+   * Returns true when the frame was consumed.
+   */
+  private handleUnsubscribeLocally(
+    entry: ClientEntry,
+    clientRequestId: number,
+    header: unknown[],
+    payload: Buffer,
+  ): boolean {
+    if (header[2] !== "zcode-agent" || header[3] !== "unsubscribeConversationV4") return false;
+    let params: { workspacePath: string; sessionId: string } | null = null;
+    try {
+      params = subscriptionParams(decodeMessage(payload).body);
+    } catch {
+      /* undecodable body: treated as a no-op below */
+    }
+    if (params) {
+      const key = subscriptionKey(params.workspacePath, params.sessionId);
+      // A subscribe of this client still in flight is withdrawn too.
+      for (const pending of this.pendingSubscribes.values()) {
+        if (pending.clientId === entry.id && pending.key === key) pending.cancelled = true;
+      }
+      if (entry.subscriptions.delete(key)) this.dropHolder(key, entry.id);
+    }
+    this.sendToClient(entry, encodeFrame(encodeMessage([201, clientRequestId], undefined)));
+    return true;
+  }
+
+  /** Remember a forwarded subscribeConversationV4 so its ack can be attributed. */
+  private trackSubscribeCall(
+    entry: ClientEntry,
+    serverId: number,
+    header: unknown[],
+    payload: Buffer,
+  ): void {
+    if (header[2] !== "zcode-agent" || header[3] !== "subscribeConversationV4") return;
+    let params: { workspacePath: string; sessionId: string } | null = null;
+    try {
+      params = subscriptionParams(decodeMessage(payload).body);
+    } catch {
+      /* body undecodable: the server will reject it too */
+    }
+    if (!params || this.pendingSubscribes.size >= MAX_TRACKED_SUBSCRIBES) return;
+    this.pendingSubscribes.set(serverId, {
+      clientId: entry.id,
+      key: subscriptionKey(params.workspacePath, params.sessionId),
+      workspacePath: params.workspacePath,
+      sessionId: params.sessionId,
+      cancelled: false,
+    });
+  }
+
+  /**
+   * A subscribeConversationV4 ack arrived (or failed): attribute the server's
+   * subscriptionId to the holder that asked for it. The server keeps ONE
+   * subscription per (workspace, session) on the broker's connection, so a newer
+   * ack replaces the older id — remember the newest and let every holder share it.
+   */
+  private settleSubscribe(serverId: number, ok: boolean, body: unknown): void {
+    const pending = this.pendingSubscribes.get(serverId);
+    if (!pending) return;
+    this.pendingSubscribes.delete(serverId);
+    if (!ok) return;
+    const subscriptionId = (body as { ack?: { subscriptionId?: unknown } } | null)?.ack
+      ?.subscriptionId;
+    if (typeof subscriptionId !== "string") return;
+    let shared = this.sharedSubscriptions.get(pending.key);
+    if (shared) {
+      shared.subscriptionId = subscriptionId;
+    } else {
+      shared = {
+        workspacePath: pending.workspacePath,
+        sessionId: pending.sessionId,
+        subscriptionId,
+        holders: new Set(),
+      };
+      this.sharedSubscriptions.set(pending.key, shared);
+    }
+    const holder = this.clients.get(pending.clientId);
+    if (pending.cancelled || !holder) {
+      // Nobody is left to use it (cancelled, or the client vanished mid-flight).
+      if (shared.holders.size === 0) this.releaseShared(pending.key, shared);
+      return;
+    }
+    shared.holders.add(pending.clientId);
+    holder.subscriptions.add(pending.key);
+  }
+
+  /** One holder leaves; the LAST one out releases the server-side subscription. */
+  private dropHolder(key: string, clientId: number): void {
+    const shared = this.sharedSubscriptions.get(key);
+    if (!shared) return;
+    shared.holders.delete(clientId);
+    if (shared.holders.size === 0) this.releaseShared(key, shared);
+  }
+
+  private releaseShared(key: string, shared: SharedSubscription): void {
+    this.sharedSubscriptions.delete(key);
+    const connection = this.connection;
+    if (!connection) return; // the server is gone; its subscriptions went with it
+    connection
+      .channelOf("zcode-agent")
+      .call("unsubscribeConversationV4", {
+        workspacePath: shared.workspacePath,
+        sessionId: shared.sessionId,
+        subscriptionId: shared.subscriptionId,
+      })
+      .catch((error: Error) =>
+        warn(
+          `zserver-broker: releasing subscription for ${shared.sessionId} failed: ${error.message}`,
+        ),
+      );
+  }
+
+  /**
+   * Write one frame to a client, refusing to buffer for a client that does not
+   * read: Node queues unflushed writes in memory without bound, and the broker
+   * answers every rejected/limited/unsubscribed request. A client whose unread
+   * backlog passes the cap is cut off (and its holds released by the close
+   * handler) rather than letting one stuck peer grow the shared daemon forever.
+   */
+  private sendToClient(entry: ClientEntry, frame: Buffer): void {
+    if (entry.socket.destroyed) return;
+    if (entry.socket.writableLength + frame.byteLength > maxClientWriteQueueBytes()) {
+      warn(`zserver-broker: client ${entry.id} is not reading its replies — disconnecting`);
+      entry.socket.destroy();
+      return;
+    }
+    entry.socket.write(frame);
+  }
+
   /** Answer one client request with a PromiseError (202) frame. */
   private replyError(entry: ClientEntry, id: number, name: string, message: string): void {
-    if (entry.socket.destroyed) return;
-    entry.socket.write(
+    this.sendToClient(
+      entry,
       encodeFrame(encodeMessage([202, id], { message: `broker: ${message}`, name })),
     );
   }
@@ -526,6 +788,17 @@ export class ZServerBroker {
     // reuses the EventListen request id for EVERY fire — deleting it after the
     // first event would silently drop the whole rest of the stream.
     const terminal = type === 201 || type === 202 || type === 203;
+    if (terminal && this.pendingSubscribes.has(id)) {
+      let body: unknown;
+      if (type === 201) {
+        try {
+          body = decodeMessage(payload).body;
+        } catch {
+          /* undecodable ack: nothing to track */
+        }
+      }
+      this.settleSubscribe(id, type === 201, body);
+    }
     for (const entry of this.clients.values()) {
       const clientRequestId = entry.idByClient.get(id);
       if (clientRequestId === undefined) continue;
@@ -538,9 +811,7 @@ export class ZServerBroker {
         }
       }
       header[1] = clientRequestId;
-      if (!entry.socket.destroyed) {
-        entry.socket.write(encodeFrame(replaceHeader(payload, header)));
-      }
+      this.sendToClient(entry, encodeFrame(replaceHeader(payload, header)));
       return;
     }
   }
@@ -579,16 +850,50 @@ export class ZServerBroker {
     this.connection = null;
     const server = this.server;
     this.server = null;
+    // Node's server.close() unlinks the socket path BY NAME. If another broker
+    // replaced the path after we bound (the loser of a start race), that would
+    // delete the WINNER's socket and silently push every client to a direct
+    // spawn. Park a foreign socket for the duration of close() and put it back.
+    let parked: string | null = null;
+    if (server && this.socketIno !== null) {
+      let current: fs.Stats | null = null;
+      try {
+        current = fs.lstatSync(this.socketPath);
+      } catch {
+        /* nothing at the path */
+      }
+      if (current && current.ino !== this.socketIno) {
+        parked = `${this.socketPath}.parked-${process.pid}`;
+        try {
+          fs.renameSync(this.socketPath, parked);
+        } catch {
+          parked = null;
+        }
+      }
+    }
     await new Promise<void>((resolve) => {
       if (!server) return resolve();
       server.close(() => {
-        try {
-          unlinkSync(this.socketPath);
-        } catch {
-          /* already gone */
+        if (parked === null) {
+          try {
+            unlinkSync(this.socketPath);
+          } catch {
+            /* already gone */
+          }
         }
         resolve();
       });
     });
+    if (parked !== null) {
+      try {
+        fs.renameSync(parked, this.socketPath);
+      } catch (error) {
+        warn(
+          `zserver-broker: could not restore the other broker's socket at ${this.socketPath}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+    }
   }
 }

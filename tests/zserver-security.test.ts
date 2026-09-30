@@ -147,12 +147,28 @@ describe("broker header validation (confused-deputy allowlist)", () => {
     });
   });
 
-  it("cuts a client off after repeated policy violations", async () => {
+  it("keeps answering a client that is rejected over and over (a cut-off reads as server death)", async () => {
     await withBroker(async (broker, socketPath) => {
       const client = await rawClient(socketPath);
-      for (let i = 0; i < 5; i++) client.send([100, i, "terminal", "create"], []);
-      expect(await untilTrue(() => client.closed())).toBe(true);
-      expect(await untilTrue(() => broker.stats().clients === 0)).toBe(true);
+      expect(await untilTrue(() => client.frames.length > 0)).toBe(true);
+      // Far past the old 5-violation cutoff: every one must still get its own reply.
+      for (let i = 0; i < 25; i++) client.send([100, 100 + i, "terminal", "create"], []);
+      expect(
+        await untilTrue(() => client.frames.filter((f) => f.header[0] === 202).length === 25),
+      ).toBe(true);
+      const ids = client.frames.filter((f) => f.header[0] === 202).map((f) => f.header[1]);
+      expect(ids).toEqual(Array.from({ length: 25 }, (_, i) => 100 + i));
+      expect(client.closed()).toBe(false);
+      expect(broker.stats().clients).toBe(1);
+      expect(broker.stats().rejected).toBe(25);
+      // ...and a legitimate request on the same connection still works.
+      client.send([100, 900, "zcode-task", "listTasks"], undefined);
+      expect(
+        await untilTrue(() =>
+          client.frames.some((f) => f.header[0] === 201 && f.header[1] === 900),
+        ),
+      ).toBe(true);
+      client.destroy();
     });
   });
 

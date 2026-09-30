@@ -196,9 +196,9 @@ export type ZcodeInteractionResponse =
 export interface BridgeBackend {
   isDead: boolean;
   deathReason: string | null;
-  /** The backend respawns its own transport in place (restart()/next request),
-   *  so `isDead` must not make the bridge replace the instance (listeners live
-   *  on it). */
+  /** The backend respawns its own transport in place (via `restart()`), so
+   *  `isDead` must not make the bridge replace the instance (listeners live on
+   *  it). It does NOT mean an ordinary request revives a dead transport. */
   readonly healsInPlace?: boolean;
   request(
     id: number,

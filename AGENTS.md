@@ -168,9 +168,10 @@ ZCode protocol types into ACP notifications directly — always translate.
     broker. Use `Object.hasOwn` and keep a `.catch` on every fire-and-forget
     promise in the broker.
   - _Dead ≠ replace._ `ZServerBackend.healsInPlace` makes `ensureBackend()` keep
-    the instance even when `isDead` (`restart()` and the next request respawn
-    the transport in place); replacing it orphans every listener registered on
-    it.
+    the instance even when `isDead`; `restart()` respawns the transport in
+    place (an ordinary request does not revive an unexpected death — it must
+    stay observable to the heal path). Replacing the instance orphans every
+    listener registered on it.
   - _A timeout must abandon, not just stop waiting._ `request()` aborts its
     `AbortSignal`, which frees the pending response handler
     (`ChannelClient.abandon`: local only, no 101 — a `sendPrompt` must not be

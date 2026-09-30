@@ -60,10 +60,13 @@ export async function runtimeEnvWithProfile(base: NodeJS.ProcessEnv): Promise<No
 export class ZServerBackend implements BridgeBackend {
   isDead = false;
   deathReason: string | null = null;
-  /** `restart()` (the supervised heal) and `ensureConnection()` respawn the
-   *  transport in place, so a dead marker must never make the bridge replace
-   *  this instance: the turn loops' listeners live on it (server.ts
-   *  ensureBackend honours this). */
+  /** The transport is respawned IN PLACE: by `restart()` (the supervised heal)
+   *  and, after `close()`/idle recycling, lazily by the next request. An
+   *  unexpected death is deliberately NOT respawned by an ordinary request — it
+   *  must stay observable so the heal path (and a mid-turn fast-fail) sees it.
+   *  Either way the instance stays, so a dead marker must never make the bridge
+   *  replace it: the turn loops' listeners live on it (server.ts ensureBackend
+   *  honours this). */
   readonly healsInPlace = true;
 
   private connection: ZServerConnection | null = null;
@@ -80,7 +83,7 @@ export class ZServerBackend implements BridgeBackend {
    *  outcome / session events / conversation frames). Kept until the session is
    *  released or the connection dies — the success path used to drop them, so
    *  they could never be reclaimed. */
-  private readonly unsubscribersBySession = new Map<string, Array<() => void>>();
+  private readonly unsubscribersBySession = new Map<string, SessionTeardown>();
   private readonly terminalErrorBySession = new Map<string, Record<string, unknown> | undefined>();
   private spawnPromise: Promise<void> | null = null;
   private idleTimer: NodeJS.Timeout | null = null;
@@ -478,7 +481,7 @@ export class ZServerBackend implements BridgeBackend {
       deliver({ type, payload });
     });
     this.gatesBySession.set(sessionId, gate);
-    const unsubscribers: Array<() => void> = [];
+    const unsubscribers: SessionTeardown = [];
     this.unsubscribersBySession.set(sessionId, unsubscribers);
     // One attempt-scoped rollback for every way this subscription can fail (the
     // subscribe call rejected, a listen was refused, registration threw). It only
@@ -498,6 +501,9 @@ export class ZServerBackend implements BridgeBackend {
       gate.dispose();
       if (this.gatesBySession.get(sessionId) === gate) this.gatesBySession.delete(sessionId);
       this.unsubscribersBySession.delete(sessionId);
+      // A listen refusal can leave a subscription the server DID open (the
+      // subscribe call succeeded): release it or it is owned until disconnect.
+      unsubscribers.releaseServerSubscription?.();
       warn(`backend: ${reason}: ${error.message}`);
     };
     try {
@@ -569,20 +575,60 @@ export class ZServerBackend implements BridgeBackend {
       );
       throw error;
     }
+    // The server OWNS the V4 conversation subscription until
+    // unsubscribeConversationV4 names its subscriptionId — an EventDispose (103)
+    // on the frame listener only stops OUR delivery (verified on the real
+    // server: the subscription stays owned). Keep the id from the ack so
+    // release/rollback can free it.
+    let serverSubscriptionId: string | null = null;
+    let settled = false;
+    let wantsRelease = false;
+    const unsubscribeOnServer = (): void => {
+      if (serverSubscriptionId === null) return;
+      const subscriptionId = serverSubscriptionId;
+      serverSubscriptionId = null;
+      // Fire-and-forget on the LIVE connection; a dead one already dropped it.
+      if (this.connection !== connection) return;
+      connection
+        .channelOf("zcode-agent")
+        .call("unsubscribeConversationV4", { workspacePath, sessionId, subscriptionId })
+        .catch((error: Error) =>
+          warn(`backend: unsubscribeConversationV4 failed for ${sessionId}: ${error.message}`),
+        );
+    };
+    unsubscribers.releaseServerSubscription = () => {
+      if (!settled) {
+        // The subscribe call is still in flight: free it the moment its ack lands.
+        wantsRelease = true;
+        return;
+      }
+      unsubscribeOnServer();
+    };
     agentChannel
       .call("subscribeConversationV4", {
         workspacePath,
         sessionId,
         clientMode: "desktop-continuous",
       })
-      .catch((error: Error) => rollback("conversation subscribe failed", error));
+      .then((ack) => {
+        settled = true;
+        const id = (ack as { ack?: { subscriptionId?: unknown } } | null)?.ack?.subscriptionId;
+        serverSubscriptionId = typeof id === "string" ? id : null;
+        if (wantsRelease) unsubscribeOnServer();
+      })
+      .catch((error: Error) => {
+        settled = true;
+        rollback("conversation subscribe failed", error);
+      });
   }
 
   /**
-   * Release a retired session's LIVE server-side state: the three listeners
-   * (the 103 unsubscribes reach the server, or the broker synthesizes them),
-   * the completion gate and the per-row streaming counters. Without it every
-   * session ever touched kept three server subscriptions for the bridge's life.
+   * Release a retired session's LIVE state: the three event listeners (103
+   * EventDispose), the server-side V4 conversation subscription
+   * (unsubscribeConversationV4 with the subscriptionId from the subscribe ack —
+   * the 103s alone do NOT free it, verified on the real server), the completion
+   * gate and the per-row streaming counters. Without it every session ever
+   * touched stayed subscribed for the bridge's life.
    *
    * Deliberately KEPT, because retirement is not deletion (a session the editor
    * touches again must come back intact and re-subscribe lazily):
@@ -594,7 +640,8 @@ export class ZServerBackend implements BridgeBackend {
    * Idempotent.
    */
   releaseSession(sessionId: string): void {
-    for (const unsubscribe of this.unsubscribersBySession.get(sessionId) ?? []) {
+    const teardown = this.unsubscribersBySession.get(sessionId);
+    for (const unsubscribe of teardown ?? []) {
       try {
         unsubscribe();
       } catch (error) {
@@ -605,6 +652,9 @@ export class ZServerBackend implements BridgeBackend {
         );
       }
     }
+    // The 103s above only stop OUR event delivery. The server keeps the V4
+    // conversation subscription owned until unsubscribeConversationV4 names it.
+    teardown?.releaseServerSubscription?.();
     this.unsubscribersBySession.delete(sessionId);
     this.gatesBySession.get(sessionId)?.dispose();
     this.gatesBySession.delete(sessionId);
@@ -769,6 +819,10 @@ export function translateConversationDelta(
     }
   }
 }
+/** Teardown handles for one session's subscription attempt: the local listener
+ *  unsubscribers, plus the hook that releases the SERVER-side V4 subscription. */
+type SessionTeardown = Array<() => void> & { releaseServerSubscription?: () => void };
+
 /** The task-meta fields session/list consumers read (the server sends more). */
 interface TaskMeta {
   taskId?: string;

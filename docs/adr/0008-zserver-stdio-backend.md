@@ -136,12 +136,27 @@ respondElicitation / resumeTask / closeTask / deliverSessionMessage / …`；
 
 - `session/load` 的回放/tail 语义：路由直通 readSession，快照形状与
   bridge 回放 handler 的消费契合未经编辑器实测。
-- 会话状态回收：`ZServerBackend.releaseSession`（退订三个 server 端监听、
-  销毁完成门、清流式计数）已接入 remote session-close 端点；bridge 自身的
-  会话驱逐（`BACKEND_RESIDENT_TTL_MS` 过期）不会调用它——退役发生在编辑器/
-  远程关闭会话时，而非 TTL 过期时。保留 `workspaceBySession`（后续
-  send/read 只带 sessionId，靠它寻址）、`listeners`（由 handler 持有）与
-  `seqBySession`（水位不可回退）。
+- 会话状态回收：`ZServerBackend.releaseSession`（退订三个 EventListen、
+  用 subscribe ack 里的 subscriptionId 调 `unsubscribeConversationV4` 释放
+  server 端 V4 订阅、销毁完成门、清流式计数）已接入 remote session-close
+  端点；bridge 自身的会话驱逐（`BACKEND_RESIDENT_TTL_MS` 过期）不会调用它——
+  退役发生在编辑器/远程关闭会话时，而非 TTL 过期时。保留
+  `workspaceBySession`（后续 send/read 只带 sessionId，靠它寻址）、
+  `listeners`（由 handler 持有）与 `seqBySession`（水位不可回退）。
+  **更正**：上一版提交（592c65c）写成"释放 server 端订阅"，实际只发了 103
+  EventDispose——在真 server 上实测，103 只停止我方事件投递，**server 仍持有
+  V4 订阅**，只有 `unsubscribeConversationV4` 才释放（探针：订阅后
+  `resyncConversationV4` 判定 OWNED；仅 103 后仍 OWNED；调 RPC 后 NOT-OWNED）。
+  订阅归属键是 (workspace, topic, **connection**)：直连模式一个 bridge 对应一条
+  连接，随进程结束自动释放；**broker 模式所有客户端共用 broker 那一条连接**，
+  客户端异常退出（kill -9）不会有人替它退订，订阅会一直挂到共享 server 结束。
+  所以 broker 现在按 (workspace, session) 对 V4 订阅做引用计数：记录每个
+  subscribe 的 ack，客户端断开/显式退订/cancel（含 ack 还在飞时断开）都只是
+  放弃自己的持有，**最后一个持有者离开才向 server 发退订**，且用 server 当前
+  的 id（后来的 subscribe 会替换旧 id）。客户端发来的
+  `unsubscribeConversationV4` 由 broker 本地处理并自行应答 201，不盲转发——
+  盲转发要么因 id 已被替换而空转，要么在 id 恰好是当前值时切断其他持有者。
+  已用真 server 验证：kill 掉持有订阅的客户端后，修复前 OWNED、修复后 NOT-OWNED。
 - `session/send` 的 `attachments` 在 zserver 模式被丢弃；`session/list` 忽略
   workspace 过滤；broker 模式下无法按客户端传递任务级凭据。
 - 第七轮终扫无新增中等以上问题，深审循环终止（后续多视角审计仍发现新问题，
@@ -215,9 +230,21 @@ projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
   严格校验（形状、numeric id、请求类型 100..103）。
   - **拒绝语义**：格式良好但被策略拒绝的请求（如 `credential.load`）由 broker
     回一个 202 错误帧（`broker: … not allowed through the broker`，携带客户端
-    自己的 id），客户端能读到原因；同一客户端累计 5 次违规、或帧根本无法解码
-    时才断开。早期实现一律直接断 socket，客户端只能看到 "socket closed"，
-    与 server 崩溃无法区分，并会触发无意义的 heal 循环。
+    自己的 id），客户端能读到原因；**只有无法解码/没有可回复 id 的帧才断开**。
+    早期实现一律直接断 socket，客户端只能看到 "socket closed"，与 server
+    崩溃无法区分，并会触发无意义的 heal 循环。中间一版加过"累计 5 次违规即
+    断开"，二波审计实测证明它把同样的问题带回来了：第 5 次拒绝后客户端读到
+    `zcode server exited: socket closed`，`isDead` 置位，2 秒后 index.ts 的死亡
+    轮询把整个 bridge 关掉——而同 uid 的洪泛者发**被允许**的调用同样廉价，
+    上限只保护了寥寥无几却让合法客户端在白名单漂移时丢连接。现改为永不因可
+    回复的拒绝断开，同一客户端只记前 5 条日志
+    （`MAX_LOGGED_VIOLATIONS_PER_CLIENT`）。真正需要约束的是未读回复的堆积，
+    见下一条。
+  - **不读回复的客户端**：Node 对未刷出的写入无界排队，而 broker 会应答每个被
+    拒/被限/被退订的请求，并转发 server 事件。所有向客户端的写入统一走
+    `sendToClient`，未读积压超过 `ZCODE_ACP_ZSERVER_MAX_CLIENT_WRITE_QUEUE`
+    （默认 8MB）就断开该客户端（其持有的订阅由 close 处理器释放），不让一个
+    卡住的对端把共享守护进程撑大。
   - **白名单必须按自有属性查表**：表是普通对象字面量，`table["__proto__"]`/
     `constructor`/`toString` 会解析到继承成员，`?.has` 随即对非 Set 调用而抛
     `TypeError`；这条抛错逃出 `void` 掉的 promise 成为 unhandledRejection，
@@ -227,6 +254,12 @@ projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
   - **每客户端上限**：未决请求（未应答调用 + 存活订阅）默认 4096
     （`ZCODE_ACP_ZSERVER_MAX_PENDING`），超限回 `BrokerLimitError` 而不断连；
     此前未应答的调用只在客户端断开时才回收。
+  - **白名单最小权限**：只放行 ZServerBackend 在 attach 模式下真正会发的调用。
+    移除了 `closeTask`（server 不把任务绑定到创建者，附着的客户端可以关掉别人
+    的会话——实测：第二个客户端 closeTask 关掉了第一个客户端的 session；
+    ZServerBackend 从不发它，要加回须带属主检查）和
+    `onDynamicSessionRuntimePreferencesRequest`（只有 broker 自己的连接监听并
+    应答，走 rawSend 不经校验；附着客户端不该监听它）。
     注意：同一 server 连接内仍无 per-client 会话隔离（事件按 workspace 键控，
     `frameMatchesSession` 只是客户端自愿过滤）——同 workspace 的客户端互相可见，
     属已接受的个人机器语义。白名单只约束**方法名**，不约束参数（`readSession`
@@ -259,17 +292,18 @@ projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
 
 ### 环境变量一览
 
-| 变量                                    | 作用                                                              | 默认                                   |
-| --------------------------------------- | ----------------------------------------------------------------- | -------------------------------------- |
-| `ZCODE_ACP_BACKEND`                     | `zserver` 切换后端（大小写不敏感；无法识别的值会告警并用 direct） | direct                                 |
-| `ZCODE_ACP_ZSERVER_SOCKET`              | **客户端 attach 与 broker bind 共用**的 socket 路径               | `$XDG_RUNTIME_DIR/zserver-broker.sock` |
-| `ZCODE_ACP_ZSERVER_IDLE_MS`             | 无会话监听且无在途请求 N ms 后回收 server 子进程                  | 0（关闭）                              |
-| `ZCODE_ACP_ZSERVER_TURN_QUIESCE_MS`     | terminal 后等流静默的宽限                                         | 300                                    |
-| `ZCODE_ACP_ZSERVER_MAX_CLIENT_BUFFER`   | broker 每客户端入站缓冲上限（字节）                               | 8MB                                    |
-| `ZCODE_ACP_ZSERVER_MAX_PENDING`         | broker 每客户端未决请求（未应答调用 + 存活订阅）上限              | 4096                                   |
-| `ZCODE_ACP_ZSERVER_BROKER_IDLE_EXIT_MS` | broker 无客户端 N ms 后自退出                                     | 0（关闭）                              |
-| `ZCODE_ACP_ZSERVER_KILL_ESCALATION_MS`  | dispose 时 SIGTERM→SIGKILL 升级延迟                               | 5000                                   |
-| `ZCODE_SERVER_RUNTIME_ROOT`             | server 部署根（`node` + `zcode-server.cjs`）                      | `~/.zcode/server`                      |
+| 变量                                       | 作用                                                              | 默认                                   |
+| ------------------------------------------ | ----------------------------------------------------------------- | -------------------------------------- |
+| `ZCODE_ACP_BACKEND`                        | `zserver` 切换后端（大小写不敏感；无法识别的值会告警并用 direct） | direct                                 |
+| `ZCODE_ACP_ZSERVER_SOCKET`                 | **客户端 attach 与 broker bind 共用**的 socket 路径               | `$XDG_RUNTIME_DIR/zserver-broker.sock` |
+| `ZCODE_ACP_ZSERVER_IDLE_MS`                | 无会话监听且无在途请求 N ms 后回收 server 子进程                  | 0（关闭）                              |
+| `ZCODE_ACP_ZSERVER_TURN_QUIESCE_MS`        | terminal 后等流静默的宽限                                         | 300                                    |
+| `ZCODE_ACP_ZSERVER_MAX_CLIENT_BUFFER`      | broker 每客户端入站缓冲上限（字节）                               | 8MB                                    |
+| `ZCODE_ACP_ZSERVER_MAX_PENDING`            | broker 每客户端未决请求（未应答调用 + 存活订阅）上限              | 4096                                   |
+| `ZCODE_ACP_ZSERVER_MAX_CLIENT_WRITE_QUEUE` | broker 每客户端未读回复/事件积压上限（字节），超限断开该客户端    | 8MB                                    |
+| `ZCODE_ACP_ZSERVER_BROKER_IDLE_EXIT_MS`    | broker 无客户端 N ms 后自退出                                     | 0（关闭）                              |
+| `ZCODE_ACP_ZSERVER_KILL_ESCALATION_MS`     | dispose 时 SIGTERM→SIGKILL 升级延迟                               | 5000                                   |
+| `ZCODE_SERVER_RUNTIME_ROOT`                | server 部署根（`node` + `zcode-server.cjs`）                      | `~/.zcode/server`                      |
 
 本表只列生产代码读取的变量；测试夹具专用的 `ZSERVER_FAKE_*`/`ZSERVER_COALESCE`
 见 `tests/fixtures/zserver-fake-server.mjs` 文件头，不属于运行时配置面。
