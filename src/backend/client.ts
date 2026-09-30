@@ -178,7 +178,9 @@ export class ZcodeBackend implements BridgeBackend {
     const zcodePid = proc.pid;
     if (!bridgePid || !zcodePid) return;
     // Inline script: poll bridge liveness, kill zcode group on bridge death.
+    // process.title replaces the long inline script in `ps` with a short name.
     const script = `
+      process.title = 'zcode-acp-watchdog';
       const bridgePid = ${bridgePid};
       const zcodePid = ${zcodePid};
       const tick = () => {

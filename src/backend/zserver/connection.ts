@@ -446,6 +446,7 @@ export function buildWatchdogScript(ownerPid: number, pgid: number): string {
     throw new Error("watchdog requires positive integer pids");
   }
   return `
+    process.title = 'zcode-acp-zserver-watchdog';
     const ownerPid = ${ownerPid};
     const pgid = ${pgid};
     const tick = () => {
