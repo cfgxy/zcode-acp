@@ -126,12 +126,46 @@ export const BROKER_ALLOWED_CALLS: Readonly<Record<string, ReadonlySet<string>>>
     "sendPrompt",
     "subscribeConversationV4",
     "unsubscribeConversationV4",
+    "setModel",
+    "setMode",
+    "setThoughtLevel",
   ]),
   // No closeTask: ZServerBackend never closes server-side tasks, and the server
   // does not bind a task to its creator — an attached client could close (mark
   // deleted) another client's session. Add it back only with an owner check.
-  "zcode-task": new Set(["createTask", "listTasks", "stopGeneration"]),
+  "zcode-task": new Set([
+    "createTask",
+    "listTasks",
+    "stopGeneration",
+    "goalSession",
+    "compactSession",
+  ]),
 };
+
+/**
+ * Session-mutating calls the broker only forwards for the session's OWNER (see
+ * `sessionOwners`), mapped to the body field that names the session. The server
+ * binds no session to its creator, so without this check any attached client
+ * could change another live client's model/mode/goal or compact its context.
+ */
+const OWNER_GUARDED_CALLS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+  "zcode-agent": { setModel: "sessionId", setMode: "sessionId", setThoughtLevel: "sessionId" },
+  "zcode-task": { goalSession: "taskId", compactSession: "taskId" },
+};
+
+/** Session key a guarded call targets, or null when the call is not guarded / malformed. */
+function guardedSessionKey(channel: unknown, name: unknown, body: unknown): string | null {
+  if (typeof channel !== "string" || typeof name !== "string") return null;
+  // Own-property lookups: channel/name are client-controlled (see validateClientHeader).
+  if (!Object.hasOwn(OWNER_GUARDED_CALLS, channel)) return null;
+  const byName = OWNER_GUARDED_CALLS[channel]!;
+  if (!Object.hasOwn(byName, name)) return null;
+  const params = Array.isArray(body) ? (body[0] as Record<string, unknown> | undefined) : undefined;
+  const workspacePath = params?.workspacePath;
+  const sessionId = params?.[byName[name]!];
+  if (typeof workspacePath !== "string" || typeof sessionId !== "string") return "";
+  return subscriptionKey(workspacePath, sessionId);
+}
 export const BROKER_ALLOWED_EVENTS: Readonly<Record<string, ReadonlySet<string>>> = {
   // No onDynamicSessionRuntimePreferencesRequest: only the broker's OWN
   // connection listens for it (it answers, attach clients must not).
@@ -276,6 +310,8 @@ interface ClientEntry {
    *  on the BROKER's single connection, so a client that dies without
    *  unsubscribing (kill -9) would leave them owned for the shared server's life. */
   subscriptions: Set<string>;
+  /** Session keys this client owns (mirror of `sessionOwners`, for cleanup on detach). */
+  owned: Set<string>;
 }
 
 /**
@@ -307,6 +343,11 @@ export class ZServerBroker {
   private readonly pendingSubscribes = new Map<number, PendingSubscribe>();
   /** Live V4 conversation subscriptions on the shared server, by session key. */
   private readonly sharedSubscriptions = new Map<string, SharedSubscription>();
+  /** Session key → broker client id allowed to mutate it. A client claims a
+   *  session by subscribing to it while no LIVE client owns it (create and
+   *  resume both subscribe before any mutation); the claim ends when the owner
+   *  detaches, so a restarted bridge can take its sessions back. */
+  private readonly sessionOwners = new Map<string, number>();
   /** Test seam: invoked with the socket file's mode at the instant of creation. */
   onBoundForTest?: (mode: number) => void;
   /** Process exit used by the idle-exit path (replaceable so tests can observe it). */
@@ -528,6 +569,7 @@ export class ZServerBroker {
       idByClient: new Map(),
       serverIdByClient: new Map(),
       subscriptions: new Set(),
+      owned: new Set(),
     };
     this.clients.set(clientId, entry);
     log(`zserver-broker: client ${clientId} attached (${this.clients.size} attached)`);
@@ -575,6 +617,10 @@ export class ZServerBroker {
       // its process may be gone (kill -9), and nobody else ever will release it.
       for (const key of entry.subscriptions) this.dropHolder(key, entry.id);
       entry.subscriptions.clear();
+      for (const key of entry.owned) {
+        if (this.sessionOwners.get(key) === entry.id) this.sessionOwners.delete(key);
+      }
+      entry.owned.clear();
       entry.idByClient.clear();
       entry.serverIdByClient.clear();
       this.armIdleExit();
@@ -686,6 +732,9 @@ export class ZServerBroker {
         ) {
           return;
         }
+        if (type === 100 && !this.authorizeSessionCall(entry, clientRequestId, header, payload)) {
+          return;
+        }
         const serverId = this.nextServerId++;
         entry.idByClient.set(serverId, clientRequestId);
         entry.serverIdByClient.set(clientRequestId, serverId);
@@ -703,6 +752,64 @@ export class ZServerBroker {
       );
       entry.socket.destroy();
     }
+  }
+
+  /**
+   * Session ownership gate for a call about to be forwarded. A subscribe claims
+   * an unowned session for the caller; an owner-guarded mutation is answered
+   * with a policy error unless the caller owns the session. Returns false when
+   * the frame was answered (and must not be forwarded).
+   */
+  private authorizeSessionCall(
+    entry: ClientEntry,
+    clientRequestId: number,
+    header: unknown[],
+    payload: Buffer,
+  ): boolean {
+    const [, , channel, name] = header as [unknown, unknown, unknown, unknown];
+    const isSubscribe = channel === "zcode-agent" && name === "subscribeConversationV4";
+    const guarded =
+      typeof channel === "string" &&
+      typeof name === "string" &&
+      Object.hasOwn(OWNER_GUARDED_CALLS, channel) &&
+      Object.hasOwn(OWNER_GUARDED_CALLS[channel]!, name);
+    if (!isSubscribe && !guarded) return true;
+    let body: unknown;
+    try {
+      body = decodeMessage(payload).body;
+    } catch {
+      /* undecodable body: a guarded call is refused below, a subscribe fails server-side */
+    }
+    if (isSubscribe) {
+      const params = subscriptionParams(body);
+      if (!params) return true;
+      const key = subscriptionKey(params.workspacePath, params.sessionId);
+      if (
+        !this.sessionOwners.has(key) &&
+        this.sessionOwners.size < MAX_TRACKED_SUBSCRIBES * 4 &&
+        entry.owned.size < MAX_TRACKED_SUBSCRIBES
+      ) {
+        this.sessionOwners.set(key, entry.id);
+        entry.owned.add(key);
+      }
+      return true;
+    }
+    const key = guardedSessionKey(channel, name, body);
+    if (key && this.sessionOwners.get(key) === entry.id) return true;
+    entry.violations++;
+    this.rejectedFrames++;
+    if (entry.violations <= MAX_LOGGED_VIOLATIONS_PER_CLIENT) {
+      warn(
+        `zserver-broker: client ${entry.id} frame rejected (${clipDiagnostic(String(channel), 80)}.${clipDiagnostic(String(name), 80)} targets a session this client does not own)`,
+      );
+    }
+    this.replyError(
+      entry,
+      clientRequestId,
+      "BrokerPolicyError",
+      "session is not owned by this client (another live client holds it, or it was never subscribed)",
+    );
+    return false;
   }
 
   /**

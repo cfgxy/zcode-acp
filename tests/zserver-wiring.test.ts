@@ -262,11 +262,16 @@ describe("group B: broker security", () => {
         "createSession",
         "readSession",
         "sendPrompt",
+        "setMode",
+        "setModel",
+        "setThoughtLevel",
         "subscribeConversationV4",
         "unsubscribeConversationV4",
       ],
       // No closeTask: the server binds no task to its creator (cross-client close).
-      "zcode-task": ["createTask", "listTasks", "stopGeneration"],
+      // goalSession/compactSession (and setModel/setMode/setThoughtLevel above) mutate a
+      // session, so the broker only forwards them for the session's owner.
+      "zcode-task": ["compactSession", "createTask", "goalSession", "listTasks", "stopGeneration"],
     });
     expect(sorted(BROKER_ALLOWED_EVENTS)).toEqual({
       // No prefs-request event: only the broker's own connection listens for it.

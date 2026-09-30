@@ -306,6 +306,17 @@ projection/messages 形状、tool.updated 合成、busy 错误码 1308 语义。
     回复的拒绝断开，同一客户端只记前 5 条日志
     （`MAX_LOGGED_VIOLATIONS_PER_CLIENT`）。真正需要约束的是未读回复的堆积，
     见下一条。
+  - **会话属主检查（setModel/setMode/setThoughtLevel/goalSession/compactSession）**：
+    这 5 个调用会改动既有会话，server 不把会话绑定到创建者，同 uid 的另一个
+    attach 客户端本可改别人会话的模型/模式或触发压缩。白名单放行它们的同时，
+    broker 只对**会话属主**转发：客户端对某 (workspace, session) 发
+    `subscribeConversationV4` 时，若当前无存活属主即认领（create/resume 都先
+    订阅再改动）；先到先得，后来者订阅不会抢占；属主断开即释放，重启的 bridge
+    重新订阅即可认领回来。未持有的会话、缺字段或无法解码的 body 一律 202 拒绝
+    （`not owned`），不断开。属主表的 key 复用 `subscriptionKey`（长度前缀，
+    抗 NUL 拼接碰撞），渠道/方法名查表用 `Object.hasOwn`。此前 broker 模式下
+    `session/set_model` 被白名单拒绝（`setModel is not allowed through the
+    broker`），是 RUYI-318 里 set_model 失败的另一个独立原因。
   - **不读回复的客户端**：Node 对未刷出的写入无界排队，而 broker 会应答每个被
     拒/被限/被退订的请求，并转发 server 事件。所有向客户端的写入统一走
     `sendToClient`，未读积压超过 `ZCODE_ACP_ZSERVER_MAX_CLIENT_WRITE_QUEUE`

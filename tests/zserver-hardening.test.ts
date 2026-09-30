@@ -1151,9 +1151,14 @@ describe("least privilege on the broker allowlist", () => {
       ["zcode-agent", "sendPrompt"],
       ["zcode-agent", "subscribeConversationV4"],
       ["zcode-agent", "unsubscribeConversationV4"],
+      ["zcode-agent", "setModel"],
+      ["zcode-agent", "setMode"],
+      ["zcode-agent", "setThoughtLevel"],
       ["zcode-task", "createTask"],
       ["zcode-task", "listTasks"],
       ["zcode-task", "stopGeneration"],
+      ["zcode-task", "goalSession"],
+      ["zcode-task", "compactSession"],
     ] as const) {
       expect(BROKER_ALLOWED_CALLS[call[0]]!.has(call[1]), call.join(".")).toBe(true);
     }
@@ -1165,6 +1170,96 @@ describe("least privilege on the broker allowlist", () => {
       expect(BROKER_ALLOWED_EVENTS[event[0]]!.has(event[1]), event.join(".")).toBe(true);
     }
   });
+});
+
+describe("session-mutating calls are owner-guarded on the broker", () => {
+  const WS = "/tmp/ws-owner";
+
+  async function startBroker(): Promise<{ broker: ZServerBroker; socketPath: string }> {
+    const socketPath = path.join(
+      os.tmpdir(),
+      `zhard-own-${process.pid}-${Math.random().toString(36).slice(2)}.sock`,
+    );
+    cleanups.push(() => fs.rmSync(socketPath, { force: true }));
+    const broker = new ZServerBroker(socketPath, makeRoot());
+    await broker.start();
+    cleanups.push(() => broker.stop());
+    return { broker, socketPath };
+  }
+
+  const subscribe = (client: ZServerConnection, sessionId: string): Promise<unknown> =>
+    client.channelOf("zcode-agent").call("subscribeConversationV4", {
+      workspacePath: WS,
+      sessionId,
+      clientMode: "desktop-continuous",
+    });
+  const setModel = (client: ZServerConnection, sessionId: string): Promise<unknown> =>
+    client.channelOf("zcode-agent").call("setModel", {
+      workspacePath: WS,
+      sessionId,
+      model: { providerId: "p", modelId: "m" },
+    });
+  const compact = (client: ZServerConnection, sessionId: string): Promise<unknown> =>
+    client.channelOf("zcode-task").call("compactSession", { workspacePath: WS, taskId: sessionId });
+
+  it("the subscriber owns the session: its mutations pass, another client's are refused", async () => {
+    const { broker, socketPath } = await startBroker();
+    const owner = await ZServerConnection.attach({ socketPath, clientId: "owner" });
+    const other = await ZServerConnection.attach({ socketPath, clientId: "other" });
+    cleanups.push(() => owner.dispose());
+    cleanups.push(() => other.dispose());
+    await subscribe(owner, "sess-o");
+
+    await expect(setModel(owner, "sess-o")).resolves.toMatch(/^echo:setModel:/);
+    await expect(compact(owner, "sess-o")).resolves.toMatch(/^echo:compactSession:/);
+    await expect(setModel(other, "sess-o")).rejects.toThrow(/broker: .*not owned/);
+    await expect(compact(other, "sess-o")).rejects.toThrow(/broker: .*not owned/);
+    expect(broker.stats().rejected).toBe(2);
+    // The refusal is an answer, not a disconnect.
+    expect(broker.stats().clients).toBe(2);
+  }, 20000);
+
+  it("a mutation on a session nobody subscribed is refused (no implicit claim)", async () => {
+    const { socketPath } = await startBroker();
+    const client = await ZServerConnection.attach({ socketPath, clientId: "c" });
+    cleanups.push(() => client.dispose());
+    await expect(setModel(client, "sess-unsubscribed")).rejects.toThrow(/not owned/);
+  }, 20000);
+
+  it("a later subscriber does not steal a live owner's session", async () => {
+    const { socketPath } = await startBroker();
+    const owner = await ZServerConnection.attach({ socketPath, clientId: "owner" });
+    const thief = await ZServerConnection.attach({ socketPath, clientId: "thief" });
+    cleanups.push(() => owner.dispose());
+    cleanups.push(() => thief.dispose());
+    await subscribe(owner, "sess-s");
+    await subscribe(thief, "sess-s");
+    await expect(setModel(thief, "sess-s")).rejects.toThrow(/not owned/);
+    await expect(setModel(owner, "sess-s")).resolves.toBeDefined();
+  }, 20000);
+
+  it("ownership ends when the owner detaches, so a restarted bridge can reclaim it", async () => {
+    const { socketPath } = await startBroker();
+    const first = await ZServerConnection.attach({ socketPath, clientId: "first" });
+    await subscribe(first, "sess-r");
+    first.dispose();
+    await new Promise((r) => setTimeout(r, 300));
+
+    const second = await ZServerConnection.attach({ socketPath, clientId: "second" });
+    cleanups.push(() => second.dispose());
+    await expect(setModel(second, "sess-r")).rejects.toThrow(/not owned/);
+    await subscribe(second, "sess-r");
+    await expect(setModel(second, "sess-r")).resolves.toBeDefined();
+  }, 20000);
+
+  it("a malformed guarded body is refused, never forwarded", async () => {
+    const { socketPath } = await startBroker();
+    const client = await ZServerConnection.attach({ socketPath, clientId: "m" });
+    cleanups.push(() => client.dispose());
+    await expect(
+      client.channelOf("zcode-agent").call("setModel", { model: { modelId: "m" } }),
+    ).rejects.toThrow(/not owned/);
+  }, 20000);
 });
 
 describe("a client that never reads its replies cannot make the broker buffer forever", () => {
