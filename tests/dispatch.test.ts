@@ -239,6 +239,75 @@ describe("dispatchEvent", () => {
     expect(exitNotif._meta.terminal_exit.exit_code).toBe(1);
   });
 
+  it("Bash non-zero exit reports status failed even when backend says completed", async () => {
+    // The backend reports "completed" for non-zero Bash exits; the structured
+    // exit code is the real failure signal and must drive the ACP status so
+    // ACP consumers (multica task cards, editor badges) see the failure.
+    const { cx, sent } = mockContext();
+    const server = makeServer(true);
+    const ev: InternalEvent = {
+      kind: "ToolCallUpdate",
+      callId: "c1",
+      tool: "Bash",
+      status: "completed",
+      rawOutput: "cat: nope: No such file\n",
+      output: "cat: nope: No such file\n",
+      rawResult: { success: false, content: "cat: nope: No such file\n", perf: { exitCode: 3 } },
+    };
+    await dispatchEvent(server, cx, SID, ev, CHUNK);
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "c1",
+      status: "failed",
+      content: [{ type: "terminal", terminalId: "c1" }],
+      _meta: {
+        claudeCode: { toolName: "Bash" },
+        terminal_exit: { terminal_id: "c1", exit_code: 3, signal: null },
+      },
+    });
+  });
+
+  it("Bash success:false without perf.exitCode reports status failed", async () => {
+    // extractExitCode infers 1 from success:false — that failure signal must
+    // also drive the status, not only the _meta exit_code.
+    const { cx, sent } = mockContext();
+    const server = makeServer(true);
+    const ev: InternalEvent = {
+      kind: "ToolCallUpdate",
+      callId: "c1",
+      tool: "Bash",
+      status: "completed",
+      rawOutput: "boom\n",
+      output: "boom\n",
+      rawResult: { success: false, content: "boom\n" },
+    };
+    await dispatchEvent(server, cx, SID, ev, CHUNK);
+    expect(sent[1]).toMatchObject({
+      status: "failed",
+      _meta: { terminal_exit: { exit_code: 1 } },
+    });
+  });
+
+  it("Bash exit 0 keeps status completed (no regression)", async () => {
+    const { cx, sent } = mockContext();
+    const server = makeServer(true);
+    const ev: InternalEvent = {
+      kind: "ToolCallUpdate",
+      callId: "c1",
+      tool: "Bash",
+      status: "completed",
+      rawOutput: "ok\n",
+      output: "ok\n",
+      rawResult: { success: true, content: "ok\n", perf: { exitCode: 0 } },
+    };
+    await dispatchEvent(server, cx, SID, ev, CHUNK);
+    expect(sent[1]).toMatchObject({
+      status: "completed",
+      _meta: { terminal_exit: { exit_code: 0 } },
+    });
+  });
+
   it("non-Bash ToolCallUpdate emits single update with status + content", async () => {
     const { cx, sent } = mockContext();
     const server = makeServer(true); // terminal supported but tool is Read, not Bash
