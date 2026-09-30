@@ -187,3 +187,36 @@ export interface ZcodeInteractionUserInputParams {
 export type ZcodeInteractionResponse =
   | { decision: "allow" | "deny" | "escalate" | "modify"; reason?: string; modifiedInput?: unknown }
   | { action: "accept" | "decline" | "cancel"; content?: unknown; reason?: string };
+
+/**
+ * The backend surface the bridge handlers consume. `ZcodeBackend` (direct
+ * app-server subprocess) and `ZServerBackend` (zcode-server.cjs channel
+ * connection, ADR-0008) both implement it.
+ */
+export interface BridgeBackend {
+  isDead: boolean;
+  deathReason: string | null;
+  /** The backend respawns its own transport in place (via `restart()`), so
+   *  `isDead` must not make the bridge replace the instance (listeners live on
+   *  it). It does NOT mean an ordinary request revives a dead transport. */
+  readonly healsInPlace?: boolean;
+  request(
+    id: number,
+    method: string,
+    params?: Record<string, unknown>,
+    timeoutMs?: number,
+  ): Promise<ZcodeResponse>;
+  send(method: string, params?: Record<string, unknown>): void;
+  registerEventListener(zcodeSid: string, listener: EventListenerLike): void;
+  unregisterEventListener(zcodeSid: string, listener: EventListenerLike): void;
+  restart(reason: string): Promise<void> | void;
+  close(): void | Promise<void>;
+  /** Drop a retired session's per-session backend state (optional: the direct
+   *  backend keys nothing per session that outlives its process). */
+  releaseSession?(zcodeSid: string): void;
+}
+
+/** Structural mirror of client.js `EventListener` (handleEvent). */
+export interface EventListenerLike {
+  handleEvent(event: ZcodeEvent): void;
+}

@@ -11,7 +11,7 @@
  * lock-release probing.
  */
 
-import type { ZcodeBackend } from "./client.js";
+import type { BridgeBackend } from "./types.js";
 import type {
   ZcodeEvent,
   ZcodeProjection,
@@ -33,7 +33,7 @@ interface Waiter {
 }
 
 export class EventStreamListener {
-  private readonly backend: ZcodeBackend;
+  private readonly backend: BridgeBackend;
   readonly sid: string;
   /** High-watermark of consumed event sequence numbers. */
   lastSeq = 0;
@@ -41,7 +41,7 @@ export class EventStreamListener {
   private readonly queue: ZcodeEvent[] = [];
   private readonly waiters: Waiter[] = [];
 
-  constructor(backend: ZcodeBackend, zcodeSid: string) {
+  constructor(backend: BridgeBackend, zcodeSid: string) {
     this.backend = backend;
     this.sid = zcodeSid;
   }
@@ -200,11 +200,11 @@ export class EventStreamListener {
  * projection. Used in stall reconciliation and lock-release probing.
  */
 export class TurnMonitor {
-  private readonly backend: ZcodeBackend;
+  private readonly backend: BridgeBackend;
   private readonly zcodeSid: string;
   private readonly nextId: NextId;
 
-  constructor(backend: ZcodeBackend, zcodeSid: string, nextId: NextId) {
+  constructor(backend: BridgeBackend, zcodeSid: string, nextId: NextId) {
     this.backend = backend;
     this.zcodeSid = zcodeSid;
     this.nextId = nextId;

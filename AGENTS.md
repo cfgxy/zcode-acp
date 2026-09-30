@@ -35,7 +35,12 @@ src/
 │   │                     _spawn_failed — wire contract with Multica retry)
 │   ├── credentials.ts    Reads ~/.zcode/v2/config.json for GLM API key
 │   ├── listener.ts       EventStreamListener — subscribes to session/events
-│   └── types.ts          ZCode protocol types
+│   ├── types.ts          ZCode protocol types
+│   └── zserver/          zcode-server.cjs channel backend (ADR-0008):
+│                         frame/serialization/ChannelClient + connection/
+│                         broker (shared server over UDS, method allowlist,
+│                         `zcode-acp zserver-broker`) + ZServerBackend
+│                         (ZCODE_ACP_BACKEND=zserver; `healsInPlace`)
 ├── handlers/             ACP method handlers
 │   ├── session.ts        session/new, session/prompt (turn loop), load, resume
 │   ├── slash.ts          Slash-command interception (/compact, /mcp, etc.)
@@ -65,8 +70,13 @@ src/
 │   ├── file-endpoint.ts  Read-only /fs/list + /fs/file, session-root scoped (ADR-0004)
 │   └── hub-server.ts     Hub daemon: auth, discovery, byte-level proxy (ACP WS + /fs files), ?probe=1 liveness
 ├── quota/                GLM Coding Plan usage API client (/quota command)
+├── desktop-profile.ts    Desktop identity profile: capture/refresh/export
+│                         (`zcode-acp profile export|refresh`); path pins
+│                         are validated (`isTrustedPinPath`) — they decide
+│                         which config is loaded / which binary runs
 ├── cli.ts                Unified CLI entry (`zcode-acp`): subcommand dispatch
-│                         (bare invocation → REPL) (ADR-0007)
+│                         (bare invocation → REPL; `zserver-broker`,
+│                         `profile export|refresh`) (ADR-0007, ADR-0008)
 ├── repl/                 Interactive REPL (bare `zcode-acp`): Ink UI + ACP client
 │   ├── model.ts          Pure turn state machine + idle status fold (commands,
 │   │                     model/mode/thought selects, completion candidates,
@@ -150,6 +160,48 @@ ZCode protocol types into ACP notifications directly — always translate.
   per-model-request and feeds the context bar. Don't mix them; evidence lives
   in `tests/fixtures/usage-probe-events.jsonl`, re-collect with
   `scripts/usage-semantics-probe.mjs` when the backend version drifts.
+
+- **zserver backend (`src/backend/zserver/`, ADR-0008) traps**:
+  - _Never index a plain-object allowlist with client-controlled keys._
+    `table[channel]?.has(...)` throws on `"__proto__"`/`"constructor"`; inside a
+    `void`-ed promise that is an unhandledRejection that kills the shared
+    broker. Use `Object.hasOwn` and keep a `.catch` on every fire-and-forget
+    promise in the broker.
+  - _Dead ≠ replace._ `ZServerBackend.healsInPlace` makes `ensureBackend()` keep
+    the instance even when `isDead`; `restart()` respawns the transport in
+    place (an ordinary request does not revive an unexpected death — it must
+    stay observable to the heal path). Replacing the instance orphans every
+    listener registered on it.
+  - _A timeout must abandon, not just stop waiting._ `request()` aborts its
+    `AbortSignal`, which frees the pending response handler
+    (`ChannelClient.abandon`: local only, no 101 — a `sendPrompt` must not be
+    aborted). Any new multi-step route must use the request-scoped channels
+    passed to `route()`.
+  - _Async spawn failures never emit `exit`._ ENOENT/EACCES arrive as `'error'`
+    with `child.pid === undefined`; only those are permanent (`phase:"spawn"` →
+    `spawn failed:` prefix → `ERR_SPAWN_FAILED`). An `'error'` on a running
+    child is not an exit.
+  - _`process.umask` and `process.chdir` are process-global._ Change them only
+    inside one synchronous call, never across an `await`.
+  - _Broker rejections are answered, not silent._ A policy-rejected request gets
+    a 202 error frame carrying the client's own id; only repeated violations or
+    undecodable frames disconnect. A bare socket close is indistinguishable from
+    server death and triggers futile heals.
+  - _An inode number is not a file's identity._ Once the last link is gone the
+    number can be handed to the very next file created (seen on XFS: a fresh
+    socket took a stale one's number). `removeStaleSocket` compares dev + ino +
+    birth time + ctime before it unlinks; two brokers racing on one stale socket
+    both "won" in 16 of 60 fresh-process runs with the inode number alone.
+  - _`child_process.spawn` returns early on EMFILE/ENFILE_ with `stdin`/`stdout`/
+    `stderr` still `null`, and STILL emits `'error'` on the next tick. Guard the
+    streams and keep an `'error'` listener. Only ENOENT/EACCES are permanent;
+    EAGAIN and out-of-descriptors are transient.
+  - _A blank env var is unset._ `path.resolve("")` is the current directory, so
+    `ZCODE_SERVER_RUNTIME_ROOT=` must not count as set. The operator's env wins
+    over the desktop profile's pin — in the bridge AND in the broker.
+  - _Tests here are mutation-verified._ Before trusting a new regression test,
+    break the fix (backup → mutate → run → restore by copy; never
+    `git checkout`, it discards unrelated uncommitted work) and watch it fail.
 
 ## Docs to read before sensitive changes
 

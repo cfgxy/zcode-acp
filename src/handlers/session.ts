@@ -125,7 +125,7 @@ async function syncProviderRegistry(server: ZcodeAcpServer, cwd: string): Promis
         10000,
       );
     if (resp.error) {
-      if (/method not found/i.test(resp.error.message)) {
+      if (/method not found|not supported in zserver backend mode/i.test(resp.error.message)) {
         providerRegistryPushUnsupported = true;
         log(
           "provider-registry: backend removed workspace/updateProviderRegistry (zcode ≥ 0.16.9 " +
@@ -229,10 +229,7 @@ async function createBackendSessionWithHeal(
   const death = server.backend?.deathReason ?? "unknown";
   const prefix = death.startsWith("spawn failed") ? ERR_SPAWN_FAILED : ERR_BACKEND_DEAD_AFTER_RETRY;
   throw new Error(
-    classified(
-      prefix,
-      `zcode create failed after ${HEAL_ATTEMPTS} supervised restarts (${death})`,
-    ),
+    classified(prefix, `zcode create failed after ${HEAL_ATTEMPTS} supervised restarts (${death})`),
   );
 }
 
@@ -875,7 +872,9 @@ export async function prompt(
             await listener.resubscribe(() => server.nextId());
             continue;
           }
-          throw new Error(classified(ERR_BACKEND_DEAD_AFTER_RETRY, `zcode send failed: ${rawSendErr}`));
+          throw new Error(
+            classified(ERR_BACKEND_DEAD_AFTER_RETRY, `zcode send failed: ${rawSendErr}`),
+          );
         }
         const sendErrCode = sendResp.error.code;
         const sendErrMsg = (sendResp.error.message ?? "").toLowerCase();
@@ -1474,8 +1473,7 @@ async function resumeBackendSession(
     // the NEW app's identity once it is back (healBackoffMs covers the
     // restart window). Owner directive 2026-09-11: refresh, retry, and only
     // surface the error if the profile is still failing after the heal.
-    const healable =
-      isBackendDeadMessage(msg) || isDesktopProfileMissingMessage(msg);
+    const healable = isBackendDeadMessage(msg) || isDesktopProfileMissingMessage(msg);
     if (!healCtx || !healable) throw err;
     if (isDesktopProfileMissingMessage(msg)) {
       warn(
@@ -1642,7 +1640,15 @@ async function runEventTurn(
     // prompt response with it); warn and keep draining instead.
     let handled = false;
     try {
-      handled = await handleServerRequests(server, backend, cx, acpSid, turn);
+      // Interaction relaying (permission/elicitation) is ZcodeBackend-specific for
+      // now; zserver mode runs yolo-mode sessions where no server requests poll.
+      handled = await handleServerRequests(
+        server,
+        backend as import("../backend/client.js").ZcodeBackend,
+        cx,
+        acpSid,
+        turn,
+      );
     } catch (e) {
       warn(`handleServerRequests threw: ${e instanceof Error ? e.message : String(e)}`);
     }
@@ -2196,17 +2202,20 @@ export interface TurnUsageBuckets {
  * untouched rather than advertising zero-valued buckets.
  */
 export function turnUsageBuckets(
-  raw: {
-    inputTokens?: number;
-    outputTokens?: number;
-    totalTokens?: number;
-    cacheReadTokens?: number;
-    cacheWriteTokens?: number;
-    contextWindow?: number;
-  } | undefined,
+  raw:
+    | {
+        inputTokens?: number;
+        outputTokens?: number;
+        totalTokens?: number;
+        cacheReadTokens?: number;
+        cacheWriteTokens?: number;
+        contextWindow?: number;
+      }
+    | undefined,
 ): TurnUsageBuckets | null {
   if (!raw) return null;
-  const ctx = raw.contextWindow && raw.contextWindow > 0 ? { contextWindow: raw.contextWindow } : {};
+  const ctx =
+    raw.contextWindow && raw.contextWindow > 0 ? { contextWindow: raw.contextWindow } : {};
   if (typeof raw.inputTokens === "number" && typeof raw.outputTokens === "number") {
     const inputTokens = raw.inputTokens;
     const outputTokens = raw.outputTokens;

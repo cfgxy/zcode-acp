@@ -4,6 +4,7 @@ export { ZcodeBackend, type ServerRequest, type EventListener } from "./client.j
 export { EventStreamListener, TurnMonitor, type NextId } from "./listener.js";
 export { resolveZcodeCommand, withDesktopSurface } from "./resolve.js";
 export { loadZcodeCredentials, mergeEnvWithCreds, type ZcodeCredentials } from "./credentials.js";
+export type { BridgeBackend } from "./types.js";
 export {
   BACKEND_DEAD_MARKER,
   BACKEND_DEAD_TURN_CODE,

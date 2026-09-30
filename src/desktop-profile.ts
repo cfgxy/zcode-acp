@@ -26,6 +26,16 @@ export const DESKTOP_PROFILE_ENV_KEYS = [
 ] as const;
 
 const DESKTOP_PROFILE_ENV_KEY_SET = new Set<string>(DESKTOP_PROFILE_ENV_KEYS);
+/** Env keys whose values are filesystem paths that decide WHICH config file is
+ *  loaded / WHICH binary is executed by the spawned server. */
+const PATH_ENV_KEYS = new Set<string>([
+  "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE",
+  "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE",
+  "ZCODE_BFS_BINARY",
+  "ZCODE_RG_BINARY",
+  "ZCODE_UGREP_BINARY",
+  "ZCODE_SERVER_RUNTIME_ROOT",
+]);
 const URL_ENV_KEYS = new Set<string>([
   "ZCODE_BASE_URL",
   "ZAI_BUSINESS_BASE_URL",
@@ -157,8 +167,34 @@ export function buildDesktopChildEnv(
   return childEnv;
 }
 
+/**
+ * Path-valued pins must be absolute, free of `..` segments, and live under a
+ * trusted root: the user's home, or (for the desktop's AppImage-mounted tools)
+ * a `/tmp/.mount_*` prefix. A tampered profile file could otherwise point the
+ * server at an attacker-chosen provider config (credential exfiltration to an
+ * attacker endpoint) or binary. Defense in depth — a same-uid attacker already
+ * owns the account, but profiles are also persisted and re-read across runs.
+ */
+export function isTrustedPinPath(value: string, home: string = os.homedir()): boolean {
+  if (!path.isAbsolute(value)) return false;
+  if (value.split(/[\\/]+/).includes("..")) return false;
+  const normalized = path.normalize(value);
+  // A degenerate home ("" / "/" / relative — e.g. HOME=/ for a uid without a
+  // passwd entry) would make `homeRoot` "/" and trust EVERY path. Fail closed:
+  // then only the fixed roots below can match.
+  const homeUsable = path.isAbsolute(home) && path.normalize(home) !== path.sep;
+  const homeRoot = path.normalize(home + path.sep);
+  return (
+    (homeUsable && normalized.startsWith(homeRoot)) ||
+    /^\/tmp\/\.mount_[A-Za-z0-9_-]+\//.test(normalized) ||
+    normalized.startsWith("/opt/") ||
+    normalized.startsWith("/usr/")
+  );
+}
+
 function isValidEnvValue(key: string, value: string): boolean {
   if (value.length > MAX_ENV_VALUE_LENGTH || /[\0\n\r]/.test(value)) return false;
+  if (PATH_ENV_KEYS.has(key)) return isTrustedPinPath(value);
   if (!URL_ENV_KEYS.has(key)) return true;
   try {
     const parsed = new URL(value);
@@ -213,6 +249,31 @@ function processMatches(runtime: DesktopProfileRuntime, pid: number, name: strin
   return comm === name || cmdline.some((token) => path.basename(token) === name);
 }
 
+/** The deployed remote-server bundle (`~/.zcode/server/zcode-server.cjs`). */
+const SERVER_PROCESS_NAME = "zcode-server.cjs";
+/** Desktop host processes rename argv[0] to `zcode-host-local[-N]` / `zcode-host-remote[-N]`. */
+const HOST_PROCESS_NAME_PATTERN = /^zcode-host-(local|remote)(-\d+)?$/;
+
+/**
+ * Runtime-host ancestor test covering both forms that spawn zcode-cli: the
+ * remote-attached server bundle (`zcode-server.cjs`) and the desktop-local
+ * host (`zcode-host-local-1`, an Electron child with a renamed argv[0]).
+ * Linux truncates comm to 15 chars ("zcode-host-local-1" → "zcode-host-loca"),
+ * so the comm check stays prefix-based while argv keeps the full name.
+ */
+function isRuntimeHostProcess(runtime: DesktopProfileRuntime, pid: number): boolean {
+  const cmdline = read(runtime, `/proc/${pid}/cmdline`).split("\0").filter(Boolean);
+  if (cmdline.some((token) => path.basename(token) === SERVER_PROCESS_NAME)) return true;
+  // comm is truncated to 15 chars ("zcode-host-local-1" → "zcode-host-loca"),
+  // so accept only the exact truncations of the two real host names; the full
+  // name is matched exactly against argv[0] only (NOT any argv token, which
+  // let `tail -f zcode-host-local-1.log` or an editor buffer qualify).
+  const comm = read(runtime, `/proc/${pid}/comm`).trim();
+  if (comm === "zcode-host-loca" || comm === "zcode-host-remo") return true;
+  const argv0 = cmdline[0];
+  return argv0 !== undefined && HOST_PROCESS_NAME_PATTERN.test(path.basename(argv0));
+}
+
 function findServerAncestor(
   runtime: DesktopProfileRuntime,
   pid: number,
@@ -222,7 +283,7 @@ function findServerAncestor(
   for (let depth = 0; current > 1 && depth < 64 && !visited.has(current); depth++) {
     visited.add(current);
     const stat = readProcStat(runtime, current);
-    if (processMatches(runtime, current, "zcode-server.cjs")) {
+    if (isRuntimeHostProcess(runtime, current)) {
       return { pid: current, startTime: stat.startTime };
     }
     current = stat.parentPid;

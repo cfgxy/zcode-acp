@@ -9,12 +9,18 @@
 
 import type * as acp from "@agentclientprotocol/sdk";
 
-import { loadZcodeCredentials, resolveZcodeCommand, ZcodeBackend } from "./backend/index.js";
+import {
+  loadZcodeCredentials,
+  resolveZcodeCommand,
+  ZcodeBackend,
+  type BridgeBackend,
+} from "./backend/index.js";
+import { ZServerBackend } from "./backend/zserver/backend.js";
 import { loadDesktopChildEnvWithRefresh } from "./desktop-profile.js";
 import { BackgroundTaskListener } from "./handlers/background-tasks.js";
 import { enqueueSessionSend } from "./handlers/io.js";
 import { ClientRegistry } from "./remote/broadcast.js";
-import { AGENT_INFO, PROTOCOL_VERSION, log } from "./utils.js";
+import { AGENT_INFO, PROTOCOL_VERSION, log, warn } from "./utils.js";
 
 /** Client capabilities advertised in the initialize request. */
 export interface ClientCapabilities {
@@ -40,7 +46,9 @@ export interface PendingTurn {
   stallRecovered?: boolean;
 }
 
-export function loadDesktopBackendEnv(profileEnv = loadDesktopChildEnvWithRefresh()): NodeJS.ProcessEnv {
+export function loadDesktopBackendEnv(
+  profileEnv = loadDesktopChildEnvWithRefresh(),
+): NodeJS.ProcessEnv {
   // Merge both worlds. The daemon-injected process env is the base: it carries
   // the task-scoped MULTICA_* credentials (token, agent/task ids) that exist
   // nowhere else, and losing them makes agent tool shells fail their own
@@ -68,7 +76,8 @@ export const BACKEND_RESIDENT_TTL_MS = 5 * 60_000;
 
 export class ZcodeAcpServer {
   /** The ZCode subprocess client (lazy — spawned on first use). */
-  backend: ZcodeBackend | null = null;
+  /** ZcodeBackend = direct app-server; ZServerBackend = zcode-server.cjs channel (ADR-0008). */
+  backend: BridgeBackend | null = null;
   /** acp_sid → zcode session id (usually identical, but kept for clarity). */
   readonly sessionMap = new Map<string, string>();
   /**
@@ -229,8 +238,25 @@ export class ZcodeAcpServer {
   }
 
   /** Lazily spawn the zcode backend on first use (initialize doesn't need it). */
-  ensureBackend(): ZcodeBackend {
-    if (this.backend && !this.backend.isDead) return this.backend;
+  ensureBackend(): BridgeBackend {
+    // A dead marker replaces the instance — except for a backend that respawns
+    // itself: its listeners (turn loops, monitors) live on the instance, and a
+    // failed in-place respawn would otherwise split them from the replacement.
+    if (this.backend && (!this.backend.isDead || this.backend.healsInPlace)) return this.backend;
+    const backendChoice = process.env.ZCODE_ACP_BACKEND?.trim();
+    if (backendChoice && backendChoice.toLowerCase() !== "zserver" && backendChoice !== "direct") {
+      // A typo here silently flips the identity/billing path to the direct
+      // backend — say so once instead of failing open in silence.
+      warn(
+        `ZCODE_ACP_BACKEND="${backendChoice}" not recognized (zserver|direct) — using direct backend`,
+      );
+    }
+    if (backendChoice?.toLowerCase() === "zserver") {
+      this.backend = new ZServerBackend({
+        serverRoot: process.env.ZCODE_SERVER_RUNTIME_ROOT,
+      });
+      return this.backend;
+    }
     const profileEnv = loadDesktopChildEnvWithRefresh();
     const env = loadDesktopBackendEnv(profileEnv);
     const resolverEnv = {
@@ -260,7 +286,7 @@ export class ZcodeAcpServer {
    * of trusting a verification from the dead process. Callers must reload the
    * session they're operating on and re-subscribe their event listeners.
    */
-  async restartBackend(): Promise<ZcodeBackend> {
+  async restartBackend(): Promise<BridgeBackend> {
     if (!this.backend) return this.ensureBackend();
     await this.backend.restart("session-authority self-heal");
     this.backendLoadedSessions.clear();

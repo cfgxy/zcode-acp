@@ -37,12 +37,16 @@ function procRuntime(
     { env: "ZCODE_ENV=desktop\0ZCODE_BASE_URL=https://api.example.test/v1\0", pid: 200 },
   ],
   persistedProfile?: unknown,
+  host: { comm: string; cmdline: string } = {
+    comm: "node\n",
+    cmdline: "node\0/opt/ZCode/zcode-server.cjs\0",
+  },
 ): DesktopProfileRuntime {
   const files = new Map<string, string>([
     ["/proc/sys/kernel/random/boot_id", "boot-test\n"],
-    ["/proc/100/stat", procStat(100, "node", 1, "1000")],
-    ["/proc/100/cmdline", "node\0/opt/ZCode/zcode-server.cjs\0"],
-    ["/proc/100/comm", "node\n"],
+    ["/proc/100/stat", procStat(100, "host", 1, "1000")],
+    ["/proc/100/cmdline", host.cmdline],
+    ["/proc/100/comm", host.comm],
   ]);
   for (const candidate of candidateEnvs) {
     files.set(`/proc/${candidate.pid}/stat`, procStat(candidate.pid, "zcode-cli", 100, "2000"));
@@ -226,6 +230,37 @@ describe("desktop profile capture and storage", () => {
       },
       env: { ZCODE_BASE_URL: "https://api.example.test/v1", ZCODE_ENV: "desktop" },
     });
+  });
+
+  it("captures a zcode-cli under the desktop zcode-host-local process", () => {
+    const profile = captureDesktopProfile(
+      procRuntime(undefined, undefined, {
+        comm: "zcode-host-loca\n",
+        cmdline: "zcode-host-local-1\0",
+      }),
+    );
+    expect(profile.source).toMatchObject({ pid: 200, serverPid: 100 });
+  });
+
+  it("matches the desktop host via comm alone when argv keeps the electron binary", () => {
+    const profile = captureDesktopProfile(
+      procRuntime(undefined, undefined, {
+        comm: "zcode-host-loca\n",
+        cmdline: "/tmp/.mount_ZCode-6EQ0Ir/zcode\0",
+      }),
+    );
+    expect(profile.source).toMatchObject({ pid: 200, serverPid: 100 });
+  });
+
+  it("ignores a zcode-cli without a runtime-host ancestor (bridge-spawned)", () => {
+    expect(() =>
+      captureDesktopProfile(
+        procRuntime(undefined, undefined, {
+          comm: "node\n",
+          cmdline: "node\0/mnt/data/zcode-acp/dist/cli.js\0",
+        }),
+      ),
+    ).toThrowError("desktop profile missing");
   });
 
   it("fails safely when candidate allowlisted environments differ", () => {

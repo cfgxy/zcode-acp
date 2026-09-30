@@ -12,15 +12,27 @@
  * user (or editor config) actually typed.
  */
 
+import { closeSync, constants, fchmodSync, openSync, writeSync } from "node:fs";
 import { basename } from "node:path";
 import process from "node:process";
 
 import { main as runHub } from "./bin/hub.js";
 import { main as runQuota } from "./bin/quota.js";
 import { main as runServer } from "./index.js";
-import { DesktopProfileError, refreshDesktopProfile } from "./desktop-profile.js";
+import {
+  captureDesktopProfile,
+  DesktopProfileError,
+  loadDesktopProfile,
+  refreshDesktopProfile,
+} from "./desktop-profile.js";
+import {
+  ensurePersonalGlmProvider,
+  type PersonalProviderOutcome,
+  type PersonalProviderTarget,
+  resolvePersonalProviderTarget,
+} from "./config/personal-provider.js";
+import { AGENT_INFO, ZCODE_CREDS_PATH } from "./utils.js";
 import { runRepl } from "./repl/run.js";
-import { AGENT_INFO } from "./utils.js";
 
 /** What the dispatcher decided to run. `args` are the tokens after the subcommand. */
 export type Invocation =
@@ -29,6 +41,8 @@ export type Invocation =
   | { kind: "server" }
   | { kind: "hub" }
   | { kind: "profile-refresh" }
+  | { kind: "profile-export"; path?: string }
+  | { kind: "zserver-broker" }
   | { kind: "quota"; args: string[] }
   | { kind: "unknown"; sub: string };
 
@@ -56,12 +70,17 @@ export function resolveInvocation(invokedAs: string, argv: readonly string[]): I
       return { kind: "server" };
     case "hub":
       return { kind: "hub" };
+    case "zserver-broker":
+      return { kind: "zserver-broker" };
     case "quota":
       return { kind: "quota", args: argv.slice(1) };
-    case "profile":
-      return argv[1] === "refresh" && argv.length === 2
-        ? { kind: "profile-refresh" }
-        : { kind: "unknown", sub: argv.join(" ") };
+    case "profile": {
+      if (argv[1] === "refresh" && argv.length === 2) return { kind: "profile-refresh" };
+      if (argv[1] === "export" && argv.length <= 3) {
+        return { kind: "profile-export", path: argv[2] };
+      }
+      return { kind: "unknown", sub: argv.join(" ") };
+    }
     default:
       return { kind: "unknown", sub };
   }
@@ -77,9 +96,15 @@ Commands:
                       rows, arrow-key permission prompts. /exit quits.
   quota [args...]   Plan usage cards (was the zcode-quota bin): -w watch,
                     -i <sec>, -d detail, -p plain, provider glm|go.
+  zserver-broker    Keep one shared zcode-server alive for multiple
+                    zcode-acp clients (ZCODE_ACP_ZSERVER_SOCKET, ADR-0008).
   hub               Run the remote-access hub daemon (was zcode-acp-hub;
                     usually auto-spawned by bridges, rarely run by hand).
-  profile refresh   Capture the active Linux ZCode Desktop profile.
+  profile refresh   Capture the active Linux ZCode runtime-host profile
+                    (desktop zcode-host-local or remote zcode-server form).
+  profile export [file]
+                    Capture and print/save the same profile as JSON (stdout
+                    when no file is given).
   server            The editor-facing ACP bridge over stdio (was
                     zcode-acp-server; editors normally launch it via the bin
                     alias without this subcommand).
@@ -92,6 +117,7 @@ Examples:
   zcode-acp                                # chat interactively in this repo
   zcode-acp quota -w                       # live usage monitor
   zcode-acp profile refresh                # refresh desktop attachment
+  zcode-acp profile export profile.json    # snapshot identity env to a file
   zcode-acp server                         # stdio bridge (for testing)`;
 
 async function main(): Promise<void> {
@@ -125,6 +151,30 @@ async function main(): Promise<void> {
     case "hub":
       await runHub();
       return;
+    case "zserver-broker": {
+      const { ZServerBroker } = await import("./backend/zserver/broker.js");
+      const broker = new ZServerBroker();
+      await broker.start();
+      process.stdout.write(`zserver-broker: ready\n`);
+      // Stay alive until SIGINT/SIGTERM; stop() cleans the socket file.
+      const stop = (): void => {
+        // Never leave stop() failure as an unhandledRejection: log and exit
+        // non-zero so a supervisor sees the unclean shutdown.
+        broker.stop().then(
+          () => process.exit(0),
+          (error: unknown) => {
+            process.stderr.write(
+              `zserver-broker: stop failed: ${error instanceof Error ? error.message : String(error)}\n`,
+            );
+            process.exit(1);
+          },
+        );
+      };
+      process.once("SIGINT", stop);
+      process.once("SIGTERM", stop);
+      await new Promise<never>(() => undefined);
+      return;
+    }
     case "profile-refresh":
       try {
         process.stdout.write(`${refreshDesktopProfile()}\n`);
@@ -133,7 +183,12 @@ async function main(): Promise<void> {
           `zcode-acp: ${error instanceof DesktopProfileError ? error.message : "desktop profile invalid"}\n`,
         );
         process.exitCode = 1;
+        return;
       }
+      ensureGlmPersonalProviderAfterRefresh();
+      return;
+    case "profile-export":
+      exportDesktopProfile(invocation.path);
       return;
     case "quota":
       await runQuota(invocation.args);
@@ -142,6 +197,108 @@ async function main(): Promise<void> {
       process.stderr.write(`zcode-acp: unknown command '${invocation.sub}'\n\n`);
       process.stdout.write(HELP_TEXT + "\n");
       process.exit(1);
+  }
+}
+
+/**
+ * Capture the live runtime-host profile (works for both the remote-attached
+ * `zcode-server.cjs` form and the desktop `zcode-host-local` form — see
+ * desktop-profile.ts) and emit it as JSON to stdout or a 0600 file, for
+ * inspection and backup. Same capture path as refresh; only the destination
+ * differs, so refresh failures reproduce here verbatim.
+ */
+function exportDesktopProfile(filePath?: string): void {
+  let json: string;
+  try {
+    json = `${JSON.stringify(captureDesktopProfile(), null, 2)}\n`;
+  } catch (error) {
+    process.stderr.write(
+      `zcode-acp: ${error instanceof DesktopProfileError ? error.message : "desktop profile invalid"}\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  if (filePath === undefined) {
+    process.stdout.write(json);
+    return;
+  }
+  try {
+    // O_NOFOLLOW: a pre-planted symlink at the target must not redirect the
+    // write (and its truncation) onto another file; O_EXCL is deliberately NOT
+    // used so re-exporting over an earlier export still works.
+    const fd = openSync(
+      filePath,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      writeSync(fd, json);
+      // Enforce 0600 on the fd (no path race) — mode only applies at creation.
+      fchmodSync(fd, 0o600);
+    } finally {
+      closeSync(fd);
+    }
+  } catch (error) {
+    process.stderr.write(
+      `zcode-acp: cannot write profile export to ${filePath}: ${error instanceof Error ? error.message : String(error)}\n`,
+    );
+    process.exitCode = 1;
+    return;
+  }
+  process.stdout.write(`${filePath}\n`);
+}
+
+/**
+ * Post-refresh guard: the desktop provisions provider_config.json on every
+ * update/sync and drops manually-added entries, so re-ensure the GLM Coding
+ * Plan personal provider right after the profile was re-captured (the two
+ * actions share the exact same trigger: a desktop restart/update). The
+ * provider path comes from the just-refreshed profile when loadable — the
+ * capture proves the desktop is running and its pins are current. Best-effort:
+ * outcome is reported, never thrown; refresh's exit code is untouched.
+ */
+export function ensureGlmPersonalProviderAfterRefresh(
+  deps: {
+    resolveTarget?: () => PersonalProviderTarget;
+    ensure?: typeof ensurePersonalGlmProvider;
+    write?: (line: string) => void;
+  } = {},
+): void {
+  const write = deps.write ?? ((line: string) => void process.stdout.write(line));
+  const ensure = deps.ensure ?? ensurePersonalGlmProvider;
+  let target: PersonalProviderTarget;
+  try {
+    target = deps.resolveTarget
+      ? deps.resolveTarget()
+      : resolvePersonalProviderTarget(loadDesktopProfile().env);
+  } catch {
+    target = resolvePersonalProviderTarget();
+  }
+  if (target.rejectedPin !== undefined) {
+    // The backend READS the pinned file; writing the default one instead would
+    // register the entry where nothing looks while reporting success. Say so
+    // and touch nothing.
+    write(
+      `personal provider: not touched — the desktop pins ${target.rejectedPin}, which is outside ` +
+        `~/.zcode and is refused as a write target for the plan key\n`,
+    );
+    return;
+  }
+  const outcome: PersonalProviderOutcome = ensure(target.path, ZCODE_CREDS_PATH);
+  switch (outcome.status) {
+    case "added":
+      write(
+        `personal provider: GLM Coding Plan entry re-added (${outcome.providerId}) in ${target.path}\n`,
+      );
+      break;
+    case "present":
+      write(
+        `personal provider: GLM Coding Plan entry present (${outcome.providerId}) in ${target.path}\n`,
+      );
+      break;
+    case "skipped":
+      write(`personal provider: not touched — ${outcome.reason}\n`);
+      break;
   }
 }
 
