@@ -405,6 +405,235 @@ describe("dispatchEvent", () => {
     expect(sent[0]).toMatchObject({ status: "completed" });
   });
 
+  it("Bash 0.16.9 real result object via generic branch reports status failed", async () => {
+    // Verbatim bridge-level session/event payload captured by the r3 probe
+    // against real zcode 0.16.9: `success` stays TRUE for a failed command,
+    // the exit code lives at perf.detail.command.exitCode, and the backend
+    // labels the event completed — the nested structured detail is the
+    // failure signal for headless consumers.
+    const { cx, sent } = mockContext();
+    const server = makeServer(false);
+    const ev: InternalEvent = {
+      kind: "ToolCallUpdate",
+      callId: "c1",
+      tool: "Bash",
+      status: "completed",
+      rawOutput: "Exit code 3",
+      output: "Exit code 3",
+      rawResult: {
+        success: true,
+        content: "Exit code 3",
+        perf: {
+          totalMs: 2048,
+          detail: {
+            kind: "command",
+            command: {
+              runMs: 1867,
+              noOutputMs: 1867,
+              exitCode: 3,
+              timedOut: false,
+              outputBytes: 0,
+              category: "other",
+              count: 1,
+              name: "other",
+              status: "failed",
+              hash: "24688a57dbe66df2",
+            },
+          },
+        },
+        truncated: false,
+        originalBytes: 11,
+        returnedBytes: 11,
+        budgetStrategy: "artifact",
+      },
+    };
+    await dispatchEvent(server, cx, SID, ev, CHUNK);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "c1",
+      status: "failed",
+      rawOutput: "Exit code 3",
+      _meta: { claudeCode: { toolName: "Bash" } },
+    });
+    const meta = (sent[0] as { _meta?: Record<string, unknown> })._meta;
+    expect(meta?.terminal_output).toBeUndefined();
+    expect(meta?.terminal_exit).toBeUndefined();
+  });
+
+  it("Bash 0.16.9 real success result object via generic branch keeps status completed", async () => {
+    const { cx, sent } = mockContext();
+    const server = makeServer(false);
+    const ev: InternalEvent = {
+      kind: "ToolCallUpdate",
+      callId: "c1",
+      tool: "Bash",
+      status: "completed",
+      rawOutput: "ok",
+      output: "ok",
+      rawResult: {
+        success: true,
+        content: "ok",
+        perf: {
+          totalMs: 4101,
+          detail: {
+            kind: "command",
+            command: {
+              runMs: 3957,
+              noOutputMs: 3957,
+              exitCode: 0,
+              timedOut: false,
+              outputBytes: 3,
+              category: "other",
+              count: 1,
+              name: "echo",
+              status: "completed",
+              hash: "290ab66316e211b0",
+            },
+          },
+        },
+        truncated: false,
+        originalBytes: 2,
+        returnedBytes: 2,
+        budgetStrategy: "artifact",
+      },
+    };
+    await dispatchEvent(server, cx, SID, ev, CHUNK);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ status: "completed" });
+  });
+
+  it("Bash string result 'Exit code 3' via generic branch reports status failed (text fallback)", async () => {
+    // Defense-in-depth for backend version drift: if a result ever arrives
+    // as the bare sentinel string (the shape visible in ACP frames and the
+    // zcode DB part), the anchored text fallback still derives the exit
+    // code. Real 0.16.9 payloads take the structured branch above.
+    const { cx, sent } = mockContext();
+    const server = makeServer(false);
+    const ev: InternalEvent = {
+      kind: "ToolCallUpdate",
+      callId: "c1",
+      tool: "Bash",
+      status: "completed",
+      rawOutput: "Exit code 3",
+      output: "Exit code 3",
+      rawResult: "Exit code 3",
+    };
+    await dispatchEvent(server, cx, SID, ev, CHUNK);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({
+      sessionUpdate: "tool_call_update",
+      toolCallId: "c1",
+      status: "failed",
+      rawOutput: "Exit code 3",
+      _meta: { claudeCode: { toolName: "Bash" } },
+    });
+    const meta = (sent[0] as { _meta?: Record<string, unknown> })._meta;
+    expect(meta?.terminal_output).toBeUndefined();
+    expect(meta?.terminal_exit).toBeUndefined();
+  });
+
+  it("Bash 0.16.9 success string payload via generic branch keeps status completed", async () => {
+    const { cx, sent } = mockContext();
+    const server = makeServer(false);
+    const ev: InternalEvent = {
+      kind: "ToolCallUpdate",
+      callId: "c1",
+      tool: "Bash",
+      status: "completed",
+      rawOutput: "ok\n",
+      output: "ok\n",
+      rawResult: "ok\n",
+    };
+    await dispatchEvent(server, cx, SID, ev, CHUNK);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ status: "completed" });
+  });
+
+  it("anchored text match: trailing-newline sentinel echo stays completed (false-positive guard)", async () => {
+    // echo "Exit code 3" produces "Exit code 3\n" — the anchored full-string
+    // match must not read it as a non-zero exit (registered in-band boundary:
+    // only the exact bare sentinel counts).
+    const { cx, sent } = mockContext();
+    const server = makeServer(false);
+    const ev: InternalEvent = {
+      kind: "ToolCallUpdate",
+      callId: "c1",
+      tool: "Bash",
+      status: "completed",
+      rawOutput: "Exit code 3\n",
+      output: "Exit code 3\n",
+      rawResult: "Exit code 3\n",
+    };
+    await dispatchEvent(server, cx, SID, ev, CHUNK);
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ status: "completed" });
+  });
+
+  it("Bash string payload on terminal path derives exit code 3 + failed (text fallback)", async () => {
+    // The text fallback lives in the shared extractExitCode, so the terminal
+    // path inherits it without any structural change (guards untouched).
+    const { cx, sent } = mockContext();
+    const server = makeServer(true);
+    const ev: InternalEvent = {
+      kind: "ToolCallUpdate",
+      callId: "c1",
+      tool: "Bash",
+      status: "completed",
+      rawOutput: "Exit code 3",
+      output: "Exit code 3",
+      rawResult: "Exit code 3",
+    };
+    await dispatchEvent(server, cx, SID, ev, CHUNK);
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toMatchObject({
+      status: "failed",
+      _meta: { terminal_exit: { exit_code: 3 } },
+    });
+  });
+
+  it("Bash 0.16.9 real result object on terminal path derives exit_code 3 + failed", async () => {
+    const { cx, sent } = mockContext();
+    const server = makeServer(true);
+    const ev: InternalEvent = {
+      kind: "ToolCallUpdate",
+      callId: "c1",
+      tool: "Bash",
+      status: "completed",
+      rawOutput: "Exit code 3",
+      output: "Exit code 3",
+      rawResult: {
+        success: true,
+        content: "Exit code 3",
+        perf: {
+          totalMs: 2048,
+          detail: {
+            kind: "command",
+            command: {
+              exitCode: 3,
+              timedOut: false,
+              outputBytes: 0,
+              category: "other",
+              count: 1,
+              name: "other",
+              status: "failed",
+            },
+          },
+        },
+        truncated: false,
+        originalBytes: 11,
+        returnedBytes: 11,
+        budgetStrategy: "artifact",
+      },
+    };
+    await dispatchEvent(server, cx, SID, ev, CHUNK);
+    expect(sent).toHaveLength(2);
+    expect(sent[1]).toMatchObject({
+      status: "failed",
+      _meta: { terminal_exit: { exit_code: 3 } },
+    });
+  });
+
   it("non-Bash ToolCallUpdate emits single update with status + content", async () => {
     const { cx, sent } = mockContext();
     const server = makeServer(true); // terminal supported but tool is Read, not Bash
