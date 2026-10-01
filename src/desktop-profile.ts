@@ -31,7 +31,16 @@ const URL_ENV_KEYS = new Set<string>([
   "ZAI_BUSINESS_BASE_URL",
   "ZAI_OAUTH_ORIGIN",
 ]);
-const CHILD_ENV_KEYS = ["HOME", "LANG", "LC_ALL", "LOGNAME", "PATH", "SHELL", "TMPDIR", "USER"];
+export const CHILD_ENV_KEYS = [
+  "HOME",
+  "LANG",
+  "LC_ALL",
+  "LOGNAME",
+  "PATH",
+  "SHELL",
+  "TMPDIR",
+  "USER",
+];
 const MAX_ENV_VALUE_LENGTH = 4096;
 const PROFILE_SCHEMA_VERSION = 1;
 const REFRESH_LOCK_ATTEMPTS = 8;

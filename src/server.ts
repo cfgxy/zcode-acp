@@ -10,11 +10,12 @@
 import type * as acp from "@agentclientprotocol/sdk";
 
 import { loadZcodeCredentials, resolveZcodeCommand, ZcodeBackend } from "./backend/index.js";
+import { buildThinBackendEnv } from "./backend/thin-env.js";
 import { loadDesktopChildEnvWithRefresh } from "./desktop-profile.js";
 import { BackgroundTaskListener } from "./handlers/background-tasks.js";
 import { enqueueSessionSend } from "./handlers/io.js";
 import { ClientRegistry } from "./remote/broadcast.js";
-import { AGENT_INFO, PROTOCOL_VERSION, log } from "./utils.js";
+import { AGENT_INFO, PROTOCOL_VERSION, log, warn } from "./utils.js";
 
 /** Client capabilities advertised in the initialize request. */
 export interface ClientCapabilities {
@@ -40,7 +41,9 @@ export interface PendingTurn {
   stallRecovered?: boolean;
 }
 
-export function loadDesktopBackendEnv(profileEnv = loadDesktopChildEnvWithRefresh()): NodeJS.ProcessEnv {
+export function loadDesktopBackendEnv(
+  profileEnv = loadDesktopChildEnvWithRefresh(),
+): NodeJS.ProcessEnv {
   // Merge both worlds. The daemon-injected process env is the base: it carries
   // the task-scoped MULTICA_* credentials (token, agent/task ids) that exist
   // nowhere else, and losing them makes agent tool shells fail their own
@@ -231,6 +234,22 @@ export class ZcodeAcpServer {
   /** Lazily spawn the zcode backend on first use (initialize doesn't need it). */
   ensureBackend(): ZcodeBackend {
     if (this.backend && !this.backend.isDead) return this.backend;
+    const backendChoice = process.env.ZCODE_ACP_BACKEND?.trim();
+    if (backendChoice && backendChoice !== "thin" && backendChoice !== "direct") {
+      // Includes the retired "zserver": a daemon started before the removal may
+      // still carry it in its env — fall back to thin instead of failing.
+      warn(`ZCODE_ACP_BACKEND="${backendChoice}" not recognized (thin|direct) — using thin`);
+    }
+    // thin (default): spawn the app-server with zcode-acp's own env unchanged, so
+    // the daemon-injected per-task MULTICA_* credentials reach the agent shell,
+    // plus the profile/base keys derived the way zcode-server derives them.
+    if (backendChoice !== "direct") {
+      const thinEnv = buildThinBackendEnv();
+      this.backend = new ZcodeBackend(resolveZcodeCommand(thinEnv), thinEnv, () =>
+        buildThinBackendEnv(),
+      );
+      return this.backend;
+    }
     const profileEnv = loadDesktopChildEnvWithRefresh();
     const env = loadDesktopBackendEnv(profileEnv);
     const resolverEnv = {

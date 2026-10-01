@@ -18,6 +18,7 @@
 
 import { formatModelValue, parseModelValue } from "./options.js";
 import { loadDesktopProfile } from "../desktop-profile.js";
+import { personalProviderConfigPath } from "./personal-provider.js";
 import { readFileSync } from "node:fs";
 import { log, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
@@ -78,11 +79,7 @@ export async function applyModelSwitch(
   // (so no defaultLevel was attached). Retry with the observed template
   // defaults, bounded to two attempts.
   for (const level of ["max", "high"]) {
-    if (
-      !resp.error ||
-      !/reasoning level is required/i.test(resp.error.message) ||
-      ref.options
-    ) {
+    if (!resp.error || !/reasoning level is required/i.test(resp.error.message) || ref.options) {
       break;
     }
     resp = await send({ ...ref, options: { reasoningLevel: level } });
@@ -121,17 +118,36 @@ interface PersonalProviderRule {
 }
 
 /**
+ * Where provider_config.json lives. The desktop profile's pin wins when the
+ * profile is usable, but the profile goes `stale`/`missing` whenever ZCodeDesktop
+ * is closed — and the file itself does not move. Falling back to the operator's
+ * env pin / the standard ~/.zcode/v2 location keeps the personal-provider
+ * lookup working without the desktop (every non-default model switch used to
+ * fail with "Provider Registry 中不存在 Model" once the desktop was closed).
+ */
+function personalProviderConfigFile(): string {
+  let pinEnv: NodeJS.ProcessEnv = process.env;
+  try {
+    pinEnv = { ...process.env, ...loadDesktopProfile().env };
+  } catch (e) {
+    log(
+      `runtime-model: desktop profile unusable, using default provider path: ${
+        e instanceof Error ? e.message : String(e)
+      }`,
+    );
+  }
+  return personalProviderConfigPath(pinEnv);
+}
+
+/**
  * Map a modelId to the backend-registered personal provider that carries it,
- * reading the desktop's provider_config.json (path pinned by the desktop
- * profile's ZCODE_PERSONAL_PROVIDER_CONFIG_FILE). config.json's provider UUIDs
- * are desktop-legacy and unknown to the backend registry. Best-effort — null
- * when the file is missing, unreadable, or lists no match.
+ * reading provider_config.json (see `personalProviderConfigFile`). config.json's
+ * provider UUIDs are desktop-legacy and unknown to the backend registry.
+ * Best-effort — null when the file is missing, unreadable, or lists no match.
  */
 function resolvePersonalProviderId(modelId: string): string | null {
   try {
-    const profile = loadDesktopProfile();
-    const configPath = profile.env.ZCODE_PERSONAL_PROVIDER_CONFIG_FILE;
-    if (!configPath) return null;
+    const configPath = personalProviderConfigFile();
     const raw = JSON.parse(readFileSync(configPath, "utf8")) as {
       config?: { providerConfigRules?: { providerRules?: PersonalProviderRule[] } };
     };
@@ -145,7 +161,9 @@ function resolvePersonalProviderId(modelId: string): string | null {
     });
     return hit?.providerId ?? null;
   } catch (e) {
-    log(`runtime-model: personal provider map unavailable: ${e instanceof Error ? e.message : String(e)}`);
+    log(
+      `runtime-model: personal provider map unavailable: ${e instanceof Error ? e.message : String(e)}`,
+    );
     return null;
   }
 }
