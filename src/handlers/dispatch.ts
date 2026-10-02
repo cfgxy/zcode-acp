@@ -188,10 +188,26 @@ function dispatchToolCallUpdate(
     return dispatchTerminalUpdate(server, cx, acpSid, ev, toolName);
   }
 
+  // Headless ACP consumers (multica hermes, ...) never declare the
+  // terminal_output capability, so their Bash frames all take this generic
+  // branch and never reach dispatchTerminalUpdate's status derivation. Apply
+  // the same structured-failure rule here: non-zero exit or an explicit
+  // backend failure → "failed", exit 0 → "completed". Background launches
+  // stay pass-through (BackgroundTaskListener owns their completion), and
+  // non-Bash tools keep the raw status (their rawResult shape is not agreed).
+  let status = ev.status;
+  if (
+    (ev.status === "completed" || ev.status === "failed") &&
+    !ev.background &&
+    (toolName === "Bash" || toolName === "bash")
+  ) {
+    const exitCode = extractExitCode(ev.rawResult, ev.status === "failed");
+    status = exitCode !== 0 || ev.status === "failed" ? "failed" : "completed";
+  }
   const update: acp.SessionUpdate = {
     sessionUpdate: "tool_call_update",
     toolCallId: ev.callId,
-    status: ev.status,
+    status,
   };
   const meta: Record<string, unknown> = {};
   if (toolName) meta["claudeCode"] = { toolName };
@@ -294,10 +310,16 @@ async function dispatchTerminalUpdate(
   //    the rawOutput fallback — including rawOutput here duplicates every line.
   if (isResult) {
     const exitCode = extractExitCode(ev.rawResult, ev.status === "failed");
+    // Derive the ACP status from the structured failure signal: the backend
+    // reports "completed" even for non-zero Bash exits, so the pass-through
+    // status would mark real failures as success for every ACP consumer
+    // (multica task cards, editor badges). Non-zero exit code — or an
+    // explicit backend failure — means failed; exit 0 stays completed.
+    const status = exitCode !== 0 || ev.status === "failed" ? "failed" : "completed";
     const exitUpdate: acp.SessionUpdate = {
       sessionUpdate: "tool_call_update",
       toolCallId: ev.callId,
-      status: ev.status,
+      status,
       content: [{ type: "terminal", terminalId: ev.callId }],
       _meta: {
         claudeCode: { toolName },

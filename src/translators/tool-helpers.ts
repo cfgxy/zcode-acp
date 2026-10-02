@@ -99,9 +99,19 @@ export function renderToolOutput(output: unknown): string {
 }
 
 /**
- * Extract a Bash exit code from a result payload. Reads `perf.exitCode`
- * (integer); falls back to inferring 1 on `success:false`, else 0. For error
- * payloads with no usable dict, returns 1 when `isError`.
+ * Extract a Bash exit code from a result payload. Signal precedence:
+ * 1. `perf.exitCode` (legacy/flat integer shape);
+ * 2. `perf.detail.command.exitCode` — the real zcode ≥0.16.x shape. NOTE
+ *    `success` stays TRUE even for failed commands there, so it must not
+ *    shadow this branch; `status:"failed"` is the fallback when the exit
+ *    code itself is absent;
+ * 3. `success:false` (older non-Bash-style objects);
+ * 4. string payloads: the whole string is exactly "Exit code N" — anchored
+ *    so a sentinel echoed inside or after other output never reads as
+ *    failure (a command whose ENTIRE output is exactly the sentinel is
+ *    indistinguishable in-band and resolves as a failure — registered
+ *    boundary);
+ * else 1 when `isError`, 0 otherwise.
  */
 export function extractExitCode(resultPayload: unknown, isError = false): number {
   if (resultPayload && typeof resultPayload === "object" && !Array.isArray(resultPayload)) {
@@ -110,8 +120,21 @@ export function extractExitCode(resultPayload: unknown, isError = false): number
     if (perf && typeof perf["exitCode"] === "number") {
       return perf["exitCode"] as number;
     }
+    if (perf && typeof perf["detail"] === "object" && perf["detail"] !== null) {
+      const command = (perf["detail"] as Record<string, unknown>)["command"] as
+        | Record<string, unknown>
+        | undefined;
+      if (command) {
+        if (typeof command["exitCode"] === "number") return command["exitCode"] as number;
+        if (command["status"] === "failed") return 1;
+      }
+    }
     if (obj["success"] === false) return 1;
     return 0;
+  }
+  if (typeof resultPayload === "string") {
+    const m = /^Exit code (\d+)$/.exec(resultPayload);
+    if (m) return Number.parseInt(m[1] as string, 10);
   }
   if (isError) return 1;
   return 0;
