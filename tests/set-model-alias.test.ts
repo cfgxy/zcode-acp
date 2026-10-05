@@ -9,6 +9,7 @@
  */
 
 import { describe, expect, it, vi } from "vitest";
+import type * as acp from "@agentclientprotocol/sdk";
 
 import { ZCODE_CREDS_PATH } from "../src/utils.js";
 import { setModel } from "../src/handlers/extensions.js";
@@ -83,10 +84,15 @@ function makeServer(): { server: ZcodeAcpServer; backend: FakeBackend } {
   return { server, backend };
 }
 
+// RUYI-437: the handler now takes the broadcast cx and pushes a
+// config_option_update after a successful switch; these routing-contract tests
+// only need a cx that swallows the notifications.
+const noopCx = { notify: async () => {} } as unknown as acp.AgentContext;
+
 describe("setModel (session/set_model alias target)", () => {
   it("modelId without a provider prefix resolves to the builtin provider and reaches the backend overlay switch", async () => {
     const { server, backend } = makeServer();
-    await setModel(server, { sessionId: "sess_acp", modelId: "GLM-5.3" });
+    await setModel(server, { sessionId: "sess_acp", modelId: "GLM-5.3" }, noopCx);
     const call = backend.calls.find((c) => c.method === "session/setModel");
     expect(call).toBeDefined();
     expect(call?.params).toMatchObject({
@@ -112,6 +118,6 @@ describe("setModel (session/set_model alias target)", () => {
 
   it("missing modelId is rejected", async () => {
     const { server } = makeServer();
-    await expect(setModel(server, { sessionId: "sess_acp" })).rejects.toThrow(/modelId/);
+    await expect(setModel(server, { sessionId: "sess_acp" }, noopCx)).rejects.toThrow(/modelId/);
   });
 });
