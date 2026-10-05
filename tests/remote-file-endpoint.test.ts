@@ -26,6 +26,13 @@ function trackStop(stop: () => Promise<void> | void): void {
   cleanups.push(stop);
 }
 
+function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`${label} timed out`)), ms)),
+  ]);
+}
+
 afterEach(async () => {
   while (cleanups.length) {
     const stop = cleanups.pop()!;
@@ -64,6 +71,9 @@ async function spawnFixture(): Promise<Fixture> {
   const endpoint = await startRemoteEndpoint(server, app, config);
   expect(endpoint).not.toBeNull();
   trackStop(() => endpoint!.stop());
+  // The hub proxies by registered instance id; await the registration POST
+  // instead of racing the first proxied request against it.
+  await withTimeout(endpoint!.registered, 5000, "hub registration");
 
   const dir = await mkdtemp(path.join(tmpdir(), "zcode-fs-root-"));
   trackStop(() => rm(dir, { recursive: true, force: true }));

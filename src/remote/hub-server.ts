@@ -531,7 +531,8 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           up.pipe(res);
         },
       );
-      upstream.on("error", () => {
+      upstream.on("error", (e) => {
+        warn(`hub: ${url.pathname}: bridge :${entry.port} dial failed: ${e.message}`);
         if (res.headersSent) res.destroy();
         else {
           res.writeHead(502, { "Content-Type": "text/plain" });
@@ -625,7 +626,18 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           id,
           port: bridgePort,
           pid: typeof body.pid === "number" ? body.pid : 0,
-          startedAt: prev?.startedAt ?? Date.now(),
+          // First registration wins: heartbeats keep the original start
+          // anchor. An explicit payload startedAt (the bridge's own anchor)
+          // makes the newest-instance dedupe tie-break deterministic —
+          // same-millisecond registrations would otherwise tie and fall back
+          // to insertion order.
+          startedAt:
+            prev?.startedAt ??
+            (typeof body.startedAt === "number" &&
+            Number.isSafeInteger(body.startedAt) &&
+            body.startedAt >= 0
+              ? body.startedAt
+              : Date.now()),
           workspace: typeof body.workspace === "string" ? body.workspace : "",
           sessions,
           lastSeen: Date.now(),

@@ -9,7 +9,7 @@ import * as acp from "@agentclientprotocol/sdk";
 import { createServer, type Server } from "node:http";
 import { WebSocket } from "ws";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { RemoteConfig } from "../src/remote/config.js";
 import { trackConnections } from "../src/remote/broadcast.js";
@@ -107,8 +107,9 @@ describe("remote endpoint", () => {
     expect(endpoint).not.toBeNull();
     trackStop(() => endpoint!.stop());
 
-    // Registration is fired immediately; give the POST a beat to land.
-    await new Promise((r) => setTimeout(r, 250));
+    // Registration POST is fired on start; await its completion instead of
+    // sleeping past it.
+    await withTimeout(endpoint.registered, 5000, "hub registration");
     const res = await fetch(`http://127.0.0.1:${hub.port}/api/instances`, {
       headers: { Authorization: `Bearer ${TOKEN}` },
     });
@@ -172,11 +173,10 @@ describe("remote endpoint", () => {
       5000,
       "ws close",
     );
-    // Closed connections leave the registry (give the close event a beat to
-    // propagate through the hub proxy).
-    await new Promise((r) => setTimeout(r, 200));
-    expect(server.clients.size).toBe(0);
-  });
+    // Closed connections leave the registry once the close event propagates
+    // through the hub proxy — poll for it instead of guessing a fixed delay.
+    await vi.waitFor(() => expect(server.clients.size).toBe(0), { timeout: 5000 });
+  }, 10_000);
 
   it("scans to the next free port when the configured one is taken", async () => {
     const hub = await startHub({ port: 0, host: "127.0.0.1", token: TOKEN });
@@ -216,11 +216,11 @@ describe("hub version handshake (bridge side)", () => {
     trackConnections(app, server.clients);
     const endpoint = await startRemoteEndpoint(server, app, testConfig(mock.port, 18510));
     trackStop(() => endpoint!.stop());
-    await new Promise((r) => setTimeout(r, 300));
+    await withTimeout(endpoint.registered, 5000, "hub registration");
 
     expect(bodies.length).toBeGreaterThanOrEqual(1);
     expect(bodies[0]!.version).toBe(AGENT_INFO.version);
-  });
+  }, 10_000);
 
   it("re-registers after a hub answers restarting (upgrade respawn)", async () => {
     const bodies: Array<Record<string, unknown>> = [];
