@@ -81,6 +81,13 @@ vi.mock("node:fs", async () => {
   };
 });
 
+// This file covers the config.json fallback path: no backend personal registry.
+// (Without the mock the machine's real ~/.zcode/v2/provider_config.json leaks in.)
+vi.mock("../src/config/personal-models.js", () => ({
+  loadPersonalProviders: () => [],
+  personalModelContextWindow: () => 0,
+}));
+
 // Import AFTER vi.mock is set up.
 const { loadAllModels, modelContextWindow, parseModelValue, formatModelValue } = await import(
   "../src/config/options.js"

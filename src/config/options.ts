@@ -14,6 +14,7 @@ import { readFileSync } from "node:fs";
 import type * as acp from "@agentclientprotocol/sdk";
 
 import type { ZcodeReadResult } from "../backend/types.js";
+import { loadPersonalProviders, personalModelContextWindow } from "./personal-models.js";
 import { CONFIG_DISPATCH, CONFIG_META, log, ZCODE_CREDS_PATH } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { sendSessionUpdate } from "../handlers/io.js";
@@ -57,28 +58,43 @@ export interface ModelRef {
 }
 
 /**
- * Collect models from config.json for the dropdown.
+ * Collect models for the dropdown.
  *
- * Builtin providers (id prefix `builtin:`) must be `enabled: true` — they
- * reflect the plans the user activated in the ZCode desktop app. Custom
- * (third-party) providers are included UNLESS explicitly `enabled: false`:
- * the newer CLI leaves the flag unset on active third-party providers, so
- * treating "absent" as enabled keeps them in the dropdown while still
- * honoring an explicit disable.
+ * Builtin providers (id prefix `builtin:`) come from config.json and must be
+ * `enabled: true` — they reflect the plans the user activated in the ZCode
+ * desktop app.
+ *
+ * Personal (third-party) providers come from the BACKEND's registry
+ * (provider_config.json, see personal-models.ts): config.json is desktop-owned
+ * and drifts (models renamed upstream — claude-sonnet-5 → claude-sonnet-5-5 —
+ * stay listed there, and the backend then rejects them with "Provider Registry
+ * 中不存在 Model"). When that registry is readable it REPLACES config.json's
+ * custom providers; a model a builtin provider already offers is not repeated
+ * under a personal one. When it is unreadable/empty, config.json's custom
+ * providers apply as before: included UNLESS explicitly `enabled: false` (the
+ * newer CLI leaves the flag unset on active third-party providers).
  */
 export function loadAllModels(): ModelRef[] {
   try {
     const cfg = readConfig() as ConfigShape;
+    const personal = loadPersonalProviders();
     const out: ModelRef[] = [];
     for (const [pid, p] of Object.entries(cfg.provider ?? {})) {
       if (isBuiltinProvider(pid)) {
         if (p?.enabled !== true) continue;
-      } else if (p?.enabled === false) {
+      } else if (personal.length > 0 || p?.enabled === false) {
         continue;
       }
       const providerName = p.name ?? pid;
       for (const modelId of Object.keys(p.models ?? {})) {
         out.push({ providerId: pid, providerName, modelId });
+      }
+    }
+    const builtinIds = new Set(out.map((m) => m.modelId.toLowerCase()));
+    for (const p of personal) {
+      for (const modelId of p.modelIds) {
+        if (builtinIds.has(modelId.toLowerCase())) continue;
+        out.push({ providerId: p.providerId, providerName: p.providerName, modelId });
       }
     }
     if (out.length === 0) {
@@ -120,10 +136,13 @@ export function modelContextWindow(providerId: string, modelId: string): number 
     const cfg = readConfig() as ConfigShape;
     const models = cfg.provider?.[providerId]?.models ?? {};
     const entry = models[modelId];
-    return entry?.limit?.context ?? 0;
+    const fromConfig = entry?.limit?.context ?? 0;
+    if (fromConfig) return fromConfig;
   } catch {
-    return 0;
+    // config.json unreadable — the backend registry below may still know it
   }
+  // Personal providers carry backend-registry ids config.json has never heard of.
+  return personalModelContextWindow(providerId, modelId);
 }
 
 /** Builtin providerIds are prefixed with `builtin:` (e.g. `builtin:bigmodel`). */
@@ -223,6 +242,9 @@ export async function buildConfigOptions(
   // session/read thoughtLevel arrives.
   let currentThought = "max";
   let thoughtOptions: Array<{ value: string; name: string }> | null = null;
+  // Lower-cased modelIds the live backend offers for the builtin account
+  // (session/read settings.model.available). Null until a read succeeds.
+  let backendModelIds: Set<string> | null = null;
   if (zcodeSid === null) {
     // Pending session — no backend to read yet, but the thought vocabulary
     // is per model and the runtime's own source of truth is the enabled
@@ -273,6 +295,11 @@ export async function buildConfigOptions(
       const cur = (modelSet.current as { providerId?: string; modelId?: string }) ?? {};
       if (cur.providerId) currentProviderId = cur.providerId;
       if (cur.modelId) currentModelId = cur.modelId;
+      const avail = Array.isArray(modelSet.available)
+        ? (modelSet.available as Array<{ ref?: { modelId?: string } }>)
+        : [];
+      const ids = avail.flatMap((m) => (m?.ref?.modelId ? [m.ref.modelId.toLowerCase()] : []));
+      if (ids.length > 0) backendModelIds = new Set(ids);
       const tlSet = (settings.thoughtLevel as Record<string, unknown>) ?? {};
       // `current` is absent right after session/create — fall back to the
       // backend's defaultLevel (the level the session actually runs at).
@@ -297,10 +324,27 @@ export async function buildConfigOptions(
   // Model options: config.json enabled providers are authoritative. Builtin
   // models show as the bare modelId (clean dropdown for the common case);
   // third-party models prefix the provider name so they're distinguishable.
-  let modelOptions = loadAllModels().map((m) => ({
-    value: formatModelValue(m.providerId, m.modelId),
-    name: isBuiltinProvider(m.providerId) ? m.modelId : `${m.providerName} › ${m.modelId}`,
-  }));
+  // config.json lists what a builtin plan COULD have; the backend knows what
+  // this account HAS (GLM-5.2 / GLM-4.7 linger in config.json after the plan
+  // moved on, and selecting them only errors). With a live read, keep a builtin
+  // model only when the backend's `available` or its personal registry lists it.
+  // `available` alone is too narrow (GLM-5.3-Flash is switchable yet absent).
+  const personalIds = new Set(
+    loadPersonalProviders().flatMap((p) => p.modelIds.map((m) => m.toLowerCase())),
+  );
+  const known = backendModelIds;
+  let modelOptions = loadAllModels()
+    .filter(
+      (m) =>
+        !known ||
+        !isBuiltinProvider(m.providerId) ||
+        known.has(m.modelId.toLowerCase()) ||
+        personalIds.has(m.modelId.toLowerCase()),
+    )
+    .map((m) => ({
+      value: formatModelValue(m.providerId, m.modelId),
+      name: isBuiltinProvider(m.providerId) ? m.modelId : `${m.providerName} › ${m.modelId}`,
+    }));
   if (!modelOptions.some((o) => o.value === currentModel)) {
     // The current model isn't from an enabled provider (e.g. the session was
     // created with a now-disabled provider). Append it so the dropdown still
