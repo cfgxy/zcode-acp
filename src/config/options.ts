@@ -245,6 +245,30 @@ export async function buildConfigOptions(
   // Lower-cased modelIds the live backend offers for the builtin account
   // (session/read settings.model.available). Null until a read succeeds.
   let backendModelIds: Set<string> | null = null;
+  const allModels = loadAllModels();
+  const personalIds = new Set(
+    loadPersonalProviders().flatMap((p) => p.modelIds.map((m) => m.toLowerCase())),
+  );
+  // Builtin models follow the backend registry: config.json lists what a
+  // builtin plan COULD have (GLM-5.2 / GLM-4.7 linger after the plan moved
+  // on, and selecting them only errors), the registry knows what this account
+  // HAS. With a live read: available ∪ personal union (a read that failed or
+  // carries no available list keeps the full list — RUYI-434). A pending
+  // session never reads, so there the personal registry alone filters (its
+  // ids are what the backend's registry accepts); a missing/empty registry
+  // keeps the full list — never blank the dropdown.
+  const filterBuiltin = (known: Set<string> | null): ModelRef[] =>
+    allModels.filter((m) => {
+      if (!isBuiltinProvider(m.providerId)) return true;
+      if (known !== null) {
+        return known.has(m.modelId.toLowerCase()) || personalIds.has(m.modelId.toLowerCase());
+      }
+      // Live read without an available list → keep the full list (RUYI-434).
+      // Pending: filter by the personal registry, but a missing/empty one
+      // (fresh machine before `profile refresh`) keeps the full list.
+      if (zcodeSid !== null) return true;
+      return personalIds.size === 0 || personalIds.has(m.modelId.toLowerCase());
+    });
   if (zcodeSid === null) {
     // Pending session — no backend to read yet, but the thought vocabulary
     // is per model and the runtime's own source of truth is the enabled
@@ -253,14 +277,16 @@ export async function buildConfigOptions(
     // relays the options into a picker (Multica's effort selector) would
     // otherwise offer tokens the runtime rejects ("nothink" was fiction,
     // "low" was missing).
-    const cur = loadAllModels()[0];
+    const cur = filterBuiltin(null)[0];
     if (cur) {
       // The advertised current model follows the dropdown's leading entry
-      // (the enabled provider's first model — what the runtime actually
-      // starts sessions with) rather than the legacy hardcoded "GLM-5.2".
+      // (the registry-filtered first model — what the runtime actually
+      // starts with) rather than the legacy hardcoded "GLM-5.2".
       // ACP clients skip a requested model switch when it equals the
       // advertised current value, so a stale fiction silently pinned the
-      // wrong model whenever the requested id happened to match it.
+      // wrong model whenever the requested id happened to match it. Taking
+      // the FILTERED leader also keeps the pre-pend branch below from
+      // resurrecting a model the registry has dropped.
       currentProviderId = cur.providerId;
       currentModelId = cur.modelId;
       try {
@@ -317,34 +343,17 @@ export async function buildConfigOptions(
   // right provider (and its apiKey). Fall back to the first enabled provider
   // when settings omits providerId (legacy sessions).
   const currentModel = formatModelValue(
-    currentProviderId || loadAllModels()[0]?.providerId || DEFAULT_PROVIDER_ID,
+    currentProviderId || allModels[0]?.providerId || DEFAULT_PROVIDER_ID,
     currentModelId,
   );
 
   // Model options: config.json enabled providers are authoritative. Builtin
   // models show as the bare modelId (clean dropdown for the common case);
   // third-party models prefix the provider name so they're distinguishable.
-  // config.json lists what a builtin plan COULD have; the backend knows what
-  // this account HAS (GLM-5.2 / GLM-4.7 linger in config.json after the plan
-  // moved on, and selecting them only errors). With a live read, keep a builtin
-  // model only when the backend's `available` or its personal registry lists it.
-  // `available` alone is too narrow (GLM-5.3-Flash is switchable yet absent).
-  const personalIds = new Set(
-    loadPersonalProviders().flatMap((p) => p.modelIds.map((m) => m.toLowerCase())),
-  );
-  const known = backendModelIds;
-  let modelOptions = loadAllModels()
-    .filter(
-      (m) =>
-        !known ||
-        !isBuiltinProvider(m.providerId) ||
-        known.has(m.modelId.toLowerCase()) ||
-        personalIds.has(m.modelId.toLowerCase()),
-    )
-    .map((m) => ({
-      value: formatModelValue(m.providerId, m.modelId),
-      name: isBuiltinProvider(m.providerId) ? m.modelId : `${m.providerName} › ${m.modelId}`,
-    }));
+  let modelOptions = filterBuiltin(backendModelIds).map((m) => ({
+    value: formatModelValue(m.providerId, m.modelId),
+    name: isBuiltinProvider(m.providerId) ? m.modelId : `${m.providerName} › ${m.modelId}`,
+  }));
   if (!modelOptions.some((o) => o.value === currentModel)) {
     // The current model isn't from an enabled provider (e.g. the session was
     // created with a now-disabled provider). Append it so the dropdown still

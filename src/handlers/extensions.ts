@@ -17,7 +17,7 @@ import type * as acp from "@agentclientprotocol/sdk";
 
 import { emitInitialUsage } from "../config/model-cache.js";
 import { applyModelSwitch } from "../config/runtime-model.js";
-import { buildConfigOptions, buildModes } from "../config/options.js";
+import { buildConfigOptions, buildModes, emitConfigOptionUpdate } from "../config/options.js";
 import { ProjectionDiffer } from "../translators/projection-differ.js";
 import { log, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
@@ -197,7 +197,9 @@ export async function setThoughtLevel(
 export async function updateRuntimeModelConfig(
   server: ZcodeAcpServer,
   params: ExtensionParams,
+  cx: acp.AgentContext,
 ): Promise<Result> {
+  const acpSid = params.sessionId;
   const zcodeSid = await resolveSidOrThrow(server, params);
   const overlay = params.runtimeModel as
     | { model?: { providerId?: string; modelId?: string } }
@@ -215,19 +217,36 @@ export async function updateRuntimeModelConfig(
   const ok = await applyModelSwitch(server, zcodeSid, providerRef);
   if (!ok) throw new Error("updateRuntimeModelConfig failed (model switch rejected)");
   log(`session/updateRuntimeModelConfig → model switch ${providerRef}`);
+  await emitConfigOptionUpdate(server, cx, acpSid, zcodeSid, "model");
   return {};
 }
 
 /** session/setModel → applyModelSwitch (runtime overlay, not persistence). */
-export async function setModel(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result> {
+export async function setModel(
+  server: ZcodeAcpServer,
+  params: ExtensionParams,
+  cx: acp.AgentContext,
+): Promise<Result> {
+  const acpSid = params.sessionId;
   const zcodeSid = await resolveSidOrThrow(server, params);
   const modelId = params.modelId as string;
   if (!modelId) throw new Error("setModel requires modelId");
   const ok = await applyModelSwitch(server, zcodeSid, modelId);
   if (!ok) throw new Error("setModel failed (model switch rejected)");
   log(`session/setModel → ${modelId} (updateRuntimeModelConfig)`);
+  await emitConfigOptionUpdate(server, cx, acpSid, zcodeSid, "model");
   return {};
 }
+
+/**
+ * Post-switch dropdown push, shared by setModel / updateRuntimeModelConfig.
+ *
+ * The backend sends no state.updated on a model switch (RUYI-434 QA
+ * evidence), so — exactly like the setMode handler — the bridge rebuilds the
+ * configOptions itself and emits config_option_update (+ usage_update for the
+ * new model's context window). Failure paths above throw before reaching
+ * this, so a rejected switch pushes nothing.
+ */
 
 /** session/setMode → zcode session/setMode + emit config_option/current_mode updates. */
 export async function setMode(
