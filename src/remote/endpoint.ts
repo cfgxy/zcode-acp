@@ -52,6 +52,13 @@ const MAX_PORT_PROBES = 100;
 export interface RemoteEndpointHandle {
   /** Actual loopback port the endpoint bound (may differ from config). */
   port: number;
+  /**
+   * Resolves when the first hub registration attempt completes — success,
+   * auth rejection, or unreachable-hub fallback (never rejects). Callers that
+   * care about hub visibility can await it instead of sleeping past the
+   * fire-and-forget POST.
+   */
+  registered: Promise<void>;
   /** Stop the endpoint and unregister from the hub (best-effort). */
   stop(): Promise<void>;
 }
@@ -355,12 +362,14 @@ export async function startRemoteEndpoint(
     }
   };
 
-  void registerOnce();
+  // First registration attempt, surfaced on the handle (see registered).
+  const registered = registerOnce();
   const heartbeat = setInterval(() => void registerOnce(), HEARTBEAT_MS);
   heartbeat.unref();
 
   return {
     port,
+    registered,
     async stop(): Promise<void> {
       stopped = true;
       clearInterval(heartbeat);
