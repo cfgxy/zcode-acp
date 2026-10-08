@@ -135,12 +135,24 @@ export function withDesktopSurface(argv: string[]): string[] {
   return result;
 }
 
+/**
+ * Each bridge session runs exactly one model loop; the engine's Agent tool
+ * would fan out parallel subagents that each open their own GLM request
+ * stream and share the account-level rate limit (RUYI-577).
+ */
+const BRIDGE_DISALLOWED_TOOLS = ["Agent"];
+
+/** Disable the Agent tool so the engine cannot spawn parallel subagents. */
+export function withDisallowedTools(argv: string[]): string[] {
+  return [...argv, "--disallowedTools", BRIDGE_DISALLOWED_TOOLS.join(",")];
+}
+
 /** Resolve the full argv to launch `zcode app-server --stdio --surface desktop`. */
 export function resolveZcodeCommand(env: NodeJS.ProcessEnv = process.env): string[] {
   const zcodeBin = env.ZCODE_BIN ?? discoverZcodeBin(env) ?? "zcode";
   // Non-JS bin (e.g. a `zcode` command or wrapper) → use as-is, rely on its own shebang.
   if (!/\.(cjs|mjs|js)$/.test(zcodeBin)) {
-    return withDesktopSurface([zcodeBin, "app-server", "--stdio"]);
+    return withDisallowedTools(withDesktopSurface([zcodeBin, "app-server", "--stdio"]));
   }
   // JS file → launch with an explicit sqlite-capable Node to bypass the shebang.
   for (const nodeBin of candidateNodeBinaries(env)) {
@@ -157,12 +169,12 @@ export function resolveZcodeCommand(env: NodeJS.ProcessEnv = process.env): strin
         // keep "?"
       }
       log(`resolve: launching zcode with node ${nodeBin} (${ver})`);
-      return withDesktopSurface([nodeBin, zcodeBin, "app-server", "--stdio"]);
+      return withDisallowedTools(withDesktopSurface([nodeBin, zcodeBin, "app-server", "--stdio"]));
     }
   }
   log(
     "resolve: no sqlite-capable node found; falling back to PATH-resolved zcode shebang " +
       "(may fail under GUI launch)",
   );
-  return withDesktopSurface([zcodeBin, "app-server", "--stdio"]);
+  return withDisallowedTools(withDesktopSurface([zcodeBin, "app-server", "--stdio"]));
 }
