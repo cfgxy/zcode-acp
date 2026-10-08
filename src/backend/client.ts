@@ -178,6 +178,7 @@ export class ZcodeBackend {
     if (!bridgePid || !zcodePid) return;
     // Inline script: poll bridge liveness, kill zcode group on bridge death.
     const script = `
+      process.title = 'zcode-acp-watchdog'; // ps/可读性：避免整段 -e 脚本暴露在命令行
       const bridgePid = ${bridgePid};
       const zcodePid = ${zcodePid};
       const tick = () => {
