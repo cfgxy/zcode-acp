@@ -21,6 +21,7 @@ import process from "node:process";
 
 import { log, warn } from "../utils.js";
 import { BACKEND_RESTARTING_MARKER } from "./supervise.js";
+import { watchdogSpawnArgv } from "./watchdog.js";
 import type {
   ZcodeEvent,
   ZcodeInbound,
@@ -176,26 +177,15 @@ export class ZcodeBackend {
     const bridgePid = process.pid;
     const zcodePid = proc.pid;
     if (!bridgePid || !zcodePid) return;
-    // Inline script: poll bridge liveness, kill zcode group on bridge death.
-    const script = `
-      process.title = 'zcode-acp-watchdog'; // ps/可读性：避免整段 -e 脚本暴露在命令行
-      const bridgePid = ${bridgePid};
-      const zcodePid = ${zcodePid};
-      const tick = () => {
-        // Bridge gone? → reap the whole zcode process group, then exit.
-        try { process.kill(bridgePid, 0); }
-        catch {
-          try { process.kill(-zcodePid, 'SIGKILL'); } catch {}
-          process.exit(0);
-        }
-        // zcode already exited? → watchdog has no job left.
-        try { process.kill(-zcodePid, 0); }
-        catch { process.exit(0); }
-      };
-      setInterval(tick, 2000);
-      tick();
-    `;
-    this.watchdog = spawn(process.execPath, ["-e", script], {
+    // Hidden-subcommand form: `node <this cli.js> __zcode-watchdog <pids>` keeps
+    // the child cmdline short (RUYI-584); behavior lives in backend/watchdog.ts
+    // and `process.title` still reads zcode-acp-watchdog (e1671c4).
+    const entry = process.argv[1];
+    if (!entry) {
+      warn("backend: argv[1] missing — cannot spawn __zcode-watchdog, skipping watchdog");
+      return;
+    }
+    this.watchdog = spawn(process.execPath, watchdogSpawnArgv(entry, bridgePid, zcodePid), {
       stdio: "ignore",
       detached: true, // own process group, not part of the zcode group
       env: {},

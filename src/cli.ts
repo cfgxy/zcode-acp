@@ -25,6 +25,7 @@ import {
   type PersonalProviderOutcome,
 } from "./config/personal-provider.js";
 import { AGENT_INFO, ZCODE_CREDS_PATH } from "./utils.js";
+import { runWatchdog } from "./backend/watchdog.js";
 import { runRepl } from "./repl/run.js";
 
 /** What the dispatcher decided to run. `args` are the tokens after the subcommand. */
@@ -35,6 +36,7 @@ export type Invocation =
   | { kind: "hub" }
   | { kind: "profile-refresh" }
   | { kind: "quota"; args: string[] }
+  | { kind: "watchdog"; args: string[] }
   | { kind: "unknown"; sub: string };
 
 /**
@@ -56,6 +58,10 @@ export function resolveInvocation(invokedAs: string, argv: readonly string[]): I
   // command name (Multica's `<cmd> acp` convention); extra argv is dropped
   // exactly as for `server`.
   if (sub === "acp") return { kind: "server" };
+  // Hidden subcommand: the backend watchdog runs as `cli.js __zcode-watchdog`
+  // so its cmdline stays short (engine `__zcode-plugin-host` pattern). Not
+  // listed in HELP_TEXT — internal surface, not user-facing.
+  if (sub === "__zcode-watchdog") return { kind: "watchdog", args: argv.slice(1) };
   switch (sub) {
     case "server":
       return { kind: "server" };
@@ -144,6 +150,10 @@ async function main(): Promise<void> {
       return;
     case "quota":
       await runQuota(invocation.args);
+      return;
+    case "watchdog":
+      // Runs until the bridge or zcode group dies; never returns normally.
+      runWatchdog(invocation.args);
       return;
     case "unknown":
       process.stderr.write(`zcode-acp: unknown command '${invocation.sub}'\n\n`);
