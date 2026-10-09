@@ -9,6 +9,7 @@ import {
   buildDiffContent,
   extractExitCode,
   extractLocations,
+  formatTurnError,
   parseSubagentMetadata,
   renderToolOutput,
 } from "../src/translators/tool-helpers.js";
@@ -270,5 +271,63 @@ describe("parseSubagentMetadata", () => {
     // agentId keyword but not the agent_xxx id shape → still matched by regex,
     // but here only the usage keyword with a malformed body → no match.
     expect(parseSubagentMetadata("agentId: something_else")).toBeNull();
+  });
+});
+
+describe("formatTurnError", () => {
+  it("maps the GLM rate-limit class to human copy without raw payload", () => {
+    // Raw GLM 1302 payload carries the Chinese packet and an account phone
+    // fragment — neither may reach the user.
+    const err = {
+      code: "UNKNOWN_ERROR",
+      message: "Turn execution failed",
+      cause: {
+        message: "您的账户已达到速率限制, 请稍后再试 ( potentially the account 13812345678 )",
+        detail: "stack: model_request_failed at provider.send",
+      },
+    };
+    expect(formatTurnError(err)).toBe("GLM 账户达到速率限制，建议降低并行或稍后重发");
+    expect(formatTurnError(err)).not.toContain("13812345678");
+    expect(formatTurnError(err)).not.toContain("stack");
+  });
+
+  it("maps the GLM quota class to human copy without raw payload", () => {
+    const err = {
+      code: "UNKNOWN_ERROR",
+      message: "Turn execution failed",
+      cause: {
+        message: "您已达到每周/每月使用上限, 如需更多额度请升级套餐 ( account 13812345678 )",
+      },
+    };
+    expect(formatTurnError(err)).toBe("GLM 周/月配额耗尽，需等待重置或升级");
+    expect(formatTurnError(err)).not.toContain("13812345678");
+    expect(formatTurnError(err)).not.toContain("升级套餐");
+  });
+
+  it("maps the bare top-level rate-limit shape the same way", () => {
+    expect(formatTurnError({ code: "-32603", message: "您的账户已达到速率限制" })).toBe(
+      "GLM 账户达到速率限制，建议降低并行或稍后重发",
+    );
+  });
+
+  it("passes non-rate-limit errors through unchanged", () => {
+    expect(formatTurnError({ code: "UNKNOWN_ERROR", message: "Turn execution failed" })).toBe(
+      "UNKNOWN_ERROR Turn execution failed",
+    );
+    // Pre-existing behavior, preserved: formatTurnError reads top-level
+    // fields only, so a cause-nested payload renders as "".
+    expect(
+      formatTurnError({
+        cause: { code: "model_request_failed", message: "Network connection failed." },
+      }),
+    ).toBe("");
+  });
+
+  it("returns empty string for empty / malformed input", () => {
+    expect(formatTurnError(null)).toBe("");
+    expect(formatTurnError(undefined)).toBe("");
+    expect(formatTurnError("err")).toBe("");
+    expect(formatTurnError([])).toBe("");
+    expect(formatTurnError({})).toBe("");
   });
 });
