@@ -46,7 +46,7 @@ import {
   EventTranslator,
   extractLocations,
   formatTurnError,
-  isTransientTurnError,
+  isRetryableTurnError,
   ProjectionDiffer,
 } from "../translators/index.js";
 import type { InternalEvent } from "../translators/index.js";
@@ -952,14 +952,16 @@ export async function prompt(
           lastTurnError = e.turnError;
           continue;
         }
-        // Only a transient TurnFailedError is retryable; everything else (send
-        // failures, non-transient turn errors, exhausted retries, cancellation)
-        // propagates to the caller.
+        // Only a transient TurnFailedError outside the rate-limit/quota class
+        // is retryable; everything else (send failures, rate limits — the GLM
+        // limit recovers on minute scales so fast backoff just stacks more
+        // requests — non-transient turn errors, exhausted retries,
+        // cancellation) propagates to the caller immediately.
         if (
           e instanceof TurnFailedError &&
           attempt < MAX_TURN_ATTEMPTS &&
           !turn.cancelled &&
-          isTransientTurnError(e.turnError)
+          isRetryableTurnError(e.turnError)
         ) {
           lastTurnError = e.turnError;
           continue;

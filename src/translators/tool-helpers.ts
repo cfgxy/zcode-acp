@@ -373,6 +373,13 @@ export function parseSubagentMetadata(rawContent: unknown): SubagentMetadata | n
 /** Render a turn.failed error object into a readable single-line string. */
 export function formatTurnError(error: unknown): string {
   if (!error || typeof error !== "object" || Array.isArray(error)) return "";
+  // Rate-limit/quota failures get mapped human copy instead of the raw
+  // provider packet: the raw GLM message embeds account identifiers (phone
+  // fragments) that must not surface to the user or logs.
+  const cls = classifyTurnError(error);
+  if (cls === "rate_limit") return RATE_LIMIT_USER_MESSAGE;
+  if (cls === "quota") return QUOTA_USER_MESSAGE;
+
   const e = error as Record<string, unknown>;
   const code = String(e["code"] ?? "").trim();
   const message = String(e["message"] ?? "").trim();
@@ -406,7 +413,9 @@ const TRANSIENT_CAUSE_CODES = new Set([
   "model_request_failed",
   "invalid_model_request", // provider rejected the request — often plan/quota or brief provider-side rejection
   "provider_not_configured",
-  "rate_limit",
+  // "rate_limit" deliberately absent: rate-limit/quota errors form their own
+  // fail-fast class (see classifyTurnError) — retrying them only stacks
+  // requests against a limit that recovers on minute scales.
   "timeout",
   "ECONNRESET",
   "ETIMEDOUT",
@@ -460,4 +469,62 @@ function matchesTransient(node: unknown): boolean {
   const message = String(n["message"] ?? n["detail"] ?? "").toLowerCase();
   if (message && TRANSIENT_MSG_KEYWORDS.some((kw) => message.includes(kw))) return true;
   return false;
+}
+
+/**
+ * User-facing copy for the GLM rate-limit/quota class. Deliberately excludes
+ * the raw provider packet: the original Chinese message embeds account
+ * identifiers (phone fragments) that must not surface in editors or logs.
+ */
+export const RATE_LIMIT_USER_MESSAGE = "GLM 账户达到速率限制，建议降低并行或稍后重发";
+export const QUOTA_USER_MESSAGE = "GLM 周/月配额耗尽，需等待重置或升级";
+
+/**
+ * Rate-limit/quota class of turn.failed errors: `"rate_limit"` (account hit
+ * its concurrency cap) or `"quota"` (weekly/monthly usage cap), null when the
+ * error belongs to no such class.
+ */
+export type TurnErrorClass = "rate_limit" | "quota";
+
+/**
+ * Message keywords that identify the GLM rate-limit/quota class. GLM surfaces
+ * these errors as raw Chinese text only — runtime `error_code` is always NULL,
+ * so no structured numeric code (1302/1310) is available to match on.
+ */
+const RATE_LIMIT_MSG_KEYWORDS = ["速率限制"];
+const QUOTA_MSG_KEYWORDS = ["使用上限"];
+
+function classifyRateLimitNode(node: unknown): TurnErrorClass | null {
+  if (!node || typeof node !== "object" || Array.isArray(node)) return null;
+  const n = node as Record<string, unknown>;
+  const code = String(n["code"] ?? n["type"] ?? "").trim();
+  if (code === "rate_limit") return "rate_limit";
+  const message = String(n["message"] ?? n["detail"] ?? "");
+  if (!message) return null;
+  if (RATE_LIMIT_MSG_KEYWORDS.some((kw) => message.includes(kw))) return "rate_limit";
+  if (QUOTA_MSG_KEYWORDS.some((kw) => message.includes(kw))) return "quota";
+  return null;
+}
+
+/**
+ * Whether a `turn.failed` error object belongs to the GLM rate-limit/quota
+ * class. Inspects `error.cause` first (the structured root cause), then falls
+ * back to the top-level fields only when no cause object is present — the
+ * same traversal as `isTransientTurnError`.
+ */
+export function classifyTurnError(error: unknown): TurnErrorClass | null {
+  if (!error || typeof error !== "object" || Array.isArray(error)) return null;
+  const e = error as Record<string, unknown>;
+  const cause = e["cause"];
+  return classifyRateLimitNode(cause) ?? (cause === undefined ? classifyRateLimitNode(e) : null);
+}
+
+/**
+ * The predicate the `prompt` retry loop consumes: an error is re-sent only
+ * when it is transient AND outside the rate-limit/quota class. Rate limits
+ * recover on minute scales, so the bridge fails fast at attempt 1 instead of
+ * stacking 1s/2s/4s backoff retries against the very limit that tripped.
+ */
+export function isRetryableTurnError(error: unknown): boolean {
+  return isTransientTurnError(error) && classifyTurnError(error) === null;
 }

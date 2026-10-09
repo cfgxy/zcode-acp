@@ -12,7 +12,12 @@ export {
   extractLocations,
   formatTurnError,
   isTransientTurnError,
+  isRetryableTurnError,
+  classifyTurnError,
+  RATE_LIMIT_USER_MESSAGE,
+  QUOTA_USER_MESSAGE,
 } from "./tool-helpers.js";
+export type { TurnErrorClass } from "./tool-helpers.js";
 export type {
   InternalEvent,
   ToolCallNewEvent,
