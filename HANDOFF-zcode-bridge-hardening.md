@@ -1,6 +1,6 @@
 # Handoff：zcode-acp 桥侧加固（记账正确化 + 后端韧性）
 
-> 更新：2026-08-29。写给接手 zcode-acp 桥改造的人。**Owner 已裁决（2026-08-29）：现阶段不动 multica 服务端代码**，所有问题在桥侧补齐。因此本文档范围仅限 `/home/guxy/Codes/offcial/zcode-acp` 仓库 + 服务器环境；multica 侧的正名方案勘察成果压缩保存在 §6 附录（已冻结，勿实施，勿删除——将来解冻时直接用）。
+> 更新：2026-08-29（2026-10-09 路径注记：仓库目录已全局更名 offcial → official，见 RUYI-584）。写给接手 zcode-acp 桥改造的人。**Owner 已裁决（2026-08-29）：现阶段不动 multica 服务端代码**，所有问题在桥侧补齐。因此本文档范围仅限 `/home/guxy/Codes/official/zcode-acp` 仓库 + 服务器环境；multica 侧的正名方案勘察成果压缩保存在 §6 附录（已冻结，勿实施，勿删除——将来解冻时直接用）。
 >
 > 前置必读：同目录 `HANDOFF-multica.md`（借壳 kimi 方案现状、桥的 3 个既有 commit、服务器环境变更清单）。两份文档关系：那篇讲"怎么接进来的"，这篇讲"接进来之后发现的坑怎么在桥内修掉"。
 
@@ -83,7 +83,7 @@
 
 | 项 | 路径 |
 |---|---|
-| 桥仓库 | `/home/guxy/Codes/offcial/zcode-acp`，分支 `feat/acp-subcommand-alias`，5 commits（`ad5d20f`/`ea77129`/`3900670`/`f216426`/`46237a9`，后两个为文档） |
+| 桥仓库 | `/home/guxy/Codes/official/zcode-acp`，分支 `feat/acp-subcommand-alias`，5 commits（`ad5d20f`/`ea77129`/`3900670`/`f216426`/`46237a9`，后两个为文档） |
 | 记账核心 | `src/handlers/session.ts` `turnUsageBuckets()`（真实分桶优先 + degraded fallback）；桶捕获 `src/translators/event-translator.ts`（session.updated 逐调用 / turn.completed 当轮聚合） |
 | 语义证据 | `tests/fixtures/usage-probe-events.jsonl`（zcode 0.16.5 原始采集）；再采集用 `scripts/usage-semantics-probe.mjs`；仪表开关 `ZACP_USAGE_DEBUG=<path>`（`src/translators/usage-debug.ts`） |
 | 监督自愈 | `src/backend/supervise.ts`（分类器+前缀）；`src/backend/client.ts` `restart()`；`src/handlers/session.ts` `healBackendAndReload()` / `createBackendSessionWithHeal()`；`src/index.ts` 死亡轮询器（`server.backendHealing` 门控）；测试 `tests/backend-heal.test.ts` |
@@ -107,7 +107,7 @@
 - 2026-08-29 — **M1 记账修正完成**：`turnUsageBuckets` 优先转发 turn.completed 的真实分桶（in/out/total/cacheRead/cacheWrite，total=in+out 满足 multica 归一化约定）；仅在后端不提供 output 桶时退回旧推导（标注 degraded）。上下文条改用占用值（session.updated 的 inputTokens），不再被 gross 总量撑爆 ~n×。`tests/turn-usage.test.ts` 用真实采集数值做 fixture（含 2 调用轮聚合、上下文条占用、降级路径）。真实后端复验：3 轮会话响应 usage 均为真实分桶（工具轮 `in=39768/out=102/cacheRead=29952`，修复前该轮会报 out≈19900）。
 - 2026-08-29 — **M2 后端监督自愈完成**：`ZcodeBackend.restart()` 就地重启（listener/monitor 引用不失效）+ `healBackendAndReload()`（退避 1s/4s/16s 型、3 次；重启→重推 provider registry→session/resume 重载→模型修复）+ 稳定错误前缀 `zcode_backend_dead_after_retry` / `zcode_session_lost`（Session not found 实测分类，不重试）/ `zcode_spawn_failed`。接入四路径：ACP resume/load、lazy create（P4）、prompt send、**turn 进行中死亡**（500ms 内探测 → heal → 重发，走既有 transient 重试环）。过程中修掉三个真问题（各有 smoke 失败为证）：① `runEventTurn` 开头 `ensureBackend()` 会在死亡后抢答拉新进程、掩盖死亡（正是 P3 拖 120s 的行为）；② `index.ts` 的 2s 死亡轮询器直接关停整桥，与自愈竞态——已加 `server.backendHealing` 门控（heal 彻底失败才允许关停）；③ heal 重载后未重推 provider registry，重发报"历史任务使用的模型已不可用"。复现用例 `tests/backend-heal.test.ts`（5 个）：①kill -9 式死亡→heal→任务完成；②session 真丢失→`zcode_session_lost` 前缀且不重启；③重启后丢失→同前缀；④create 死亡→重启重试；⑤heal 耗尽→`zcode_backend_dead_after_retry`。
 - 2026-08-29 — **M3 smoke 扩展完成并真实跑通**：`scripts/acp-handshake-smoke.mjs` 新增断言——连续两轮 total≥in、out<total、trivial 轮 out 不超 in、total=in+out 不变式；kill -9 zcode 后端（工具轮进行中）→ 桥自愈 → 任务 `end_turn` 完成（实测响应 `in=41548/out=47`，为两次发送的真实聚合）；kill 后 `session/resume` 正常。无外部依赖单文件。
-- 当前状态：**814/814 测试全绿**（基线 803 + 11 新增），lint/typecheck/build 绿。本机即 multica 服务器（`/home/guxy/Codes/offcial/zcode-acp` 是指向本仓库的软链），`pnpm build` 后 daemon 每任务新拉进程，**修复已对生产生效**。
+- 当前状态：**814/814 测试全绿**（基线 803 + 11 新增），lint/typecheck/build 绿。本机即 multica 服务器（`/home/guxy/Codes/official/zcode-acp` 是指向本仓库的软链），`pnpm build` 后 daemon 每任务新拉进程，**修复已对生产生效**。
 - 下一步：① 下一个真实 multica 任务完成后用 `multica issue runs <KEY> --output json` 对照 output 列（应回落到百级/千级，cache 列若被读取应非零）；② 观察 kimi.go 重试启发式对 `zcode_*` 前缀的实际消费（§3 决策树分支）；③ M4（最小 skills 部署）仍等 Owner 裁决，不阻塞。
 
 ## §6 附录：multica 正名方案（已冻结，勿实施）
